@@ -37,7 +37,7 @@ async def on_message_buffer_and_schedule_action_selection(message: Message, serv
     services.message_buffer.append(message, user=user)
 
     async def send_action_selection() -> None:
-        messages = services.message_buffer.get(user)
+        messages = services.message_buffer.peek(user)
         video_messages = [m for m in messages if m.video is not None]
 
         if not video_messages:

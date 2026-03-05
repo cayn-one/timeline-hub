@@ -80,8 +80,8 @@ class MessageBuffer:
     def append(self, message: Message, *, user: User) -> None:
         self._messages.setdefault(user.id, []).append(message)
 
-    def get(self, user: User) -> Messages:
-        return self._messages.get(user.id, [])
+    def peek(self, user: User) -> Messages:
+        return list(self._messages.get(user.id, []))
 
     def flush(self, user: User) -> Messages:
         return self._messages.pop(user.id, [])
