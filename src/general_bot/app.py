@@ -25,7 +25,10 @@ async def _main() -> None:
     @dp.update.middleware()
     async def enforce_allowlist(handler: Handler, update: Update, data: MiddlewareData) -> Any:
         user: User | None = data.get('event_from_user')
-        if user is None or user.id not in config.allowlist:
+        if user is None:
+            return None
+        if user.id not in config.allowlist:
+            logger.info('User {} (@{} {!r}) attempting to use bot', user.id, user.username or '', user.full_name)
             return None
         return await handler(update, data)
 
