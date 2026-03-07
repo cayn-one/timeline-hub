@@ -89,6 +89,7 @@ async def on_message_buffer_and_schedule_action_selection(message: Message, serv
         clip_messages = [m for m in messages if m.video is not None]
 
         if not clip_messages:
+            services.message_buffer.flush(user)
             await message.answer('No clips received')
             return
 
