@@ -24,57 +24,6 @@ class ClipCallbackData(CallbackData, prefix='clip'):
     action: ClipAction
 
 
-def _create_clip_action_button(action: ClipAction) -> InlineKeyboardButton:
-    return InlineKeyboardButton(
-        text=action.title(),
-        callback_data=ClipCallbackData(action=action).pack(),
-    )
-
-
-async def _resend_message_group(
-    bot: Bot,
-    chat_id: ChatId,
-    message_group: Sequence[Message],
-    replacement_videos: Sequence[bytes | None] | None = None,
-) -> None:
-    if not message_group:
-        raise ValueError('`message_group` must not be empty')
-    if replacement_videos is None:
-        replacement_videos = [None] * len(message_group)
-    if len(replacement_videos) != len(message_group):
-        raise ValueError('`replacement_videos` must have the same length as `message_group`')
-
-    # Case #1: Text message
-    if len(message_group) == 1 and message_group[0].video is None:
-        await bot.copy_message(
-            chat_id=chat_id,
-            from_chat_id=message_group[0].chat.id,
-            message_id=message_group[0].message_id,
-        )
-        return
-
-    # Case #2: Video message
-    if any(message.video is None for message in message_group):
-        raise ValueError('Message group must contain only videos')
-
-    media = []
-    for message, replacement_video in zip(message_group, replacement_videos, strict=True):
-        media.append(
-            InputMediaVideo(
-                media=(
-                    message.video.file_id
-                    if replacement_video is None else
-                    BufferedInputFile(replacement_video, filename=message.video.file_name)
-                ),
-                caption=message.caption,
-                caption_entities=message.caption_entities,
-            )
-        )
-
-    # HACK: Allowed media length is 2-10, but it also works for 1. May break in the future
-    await bot.send_media_group(chat_id=chat_id, media=media)
-
-
 @router.message()
 async def on_message_buffer_and_schedule_action_selection(message: Message, services: Services) -> None:
     # Channel or chat may also send a message
@@ -155,3 +104,54 @@ async def on_clip_action(callback: CallbackQuery, callback_data: ClipCallbackDat
         case ClipAction.CANCEL:
             services.message_buffer.flush(user)
             await callback.message.answer('Canceled')
+
+
+async def _resend_message_group(
+    bot: Bot,
+    chat_id: ChatId,
+    message_group: Sequence[Message],
+    replacement_videos: Sequence[bytes | None] | None = None,
+) -> None:
+    if not message_group:
+        raise ValueError('`message_group` must not be empty')
+    if replacement_videos is None:
+        replacement_videos = [None] * len(message_group)
+    if len(replacement_videos) != len(message_group):
+        raise ValueError('`replacement_videos` must have the same length as `message_group`')
+
+    # Case #1: Text message
+    if len(message_group) == 1 and message_group[0].video is None:
+        await bot.copy_message(
+            chat_id=chat_id,
+            from_chat_id=message_group[0].chat.id,
+            message_id=message_group[0].message_id,
+        )
+        return
+
+    # Case #2: Video message
+    if any(message.video is None for message in message_group):
+        raise ValueError('Message group must contain only videos')
+
+    media = []
+    for message, replacement_video in zip(message_group, replacement_videos, strict=True):
+        media.append(
+            InputMediaVideo(
+                media=(
+                    message.video.file_id
+                    if replacement_video is None else
+                    BufferedInputFile(replacement_video, filename=message.video.file_name)
+                ),
+                caption=message.caption,
+                caption_entities=message.caption_entities,
+            )
+        )
+
+    # HACK: Allowed media length is 2-10, but it also works for 1. May break in the future
+    await bot.send_media_group(chat_id=chat_id, media=media)
+
+
+def _create_clip_action_button(action: ClipAction) -> InlineKeyboardButton:
+    return InlineKeyboardButton(
+        text=action.title(),
+        callback_data=ClipCallbackData(action=action).pack(),
+    )
