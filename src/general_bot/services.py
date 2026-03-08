@@ -12,6 +12,8 @@ from general_bot.types import UserId
 type Job = Callable[[], Awaitable[None]]
 
 type Messages = list[Message]
+type MessageGroup = tuple[Message, ...]
+type MessageGroups = list[MessageGroup]
 
 
 class TaskScheduler:
@@ -85,11 +87,11 @@ class MessageBuffer:
     def flush(self, user: User) -> Messages:
         return self._messages.pop(user.id, [])
 
-    def flush_grouped(self, user: User) -> list[Messages]:
+    def flush_grouped(self, user: User) -> MessageGroups:
         return self._group(self.flush(user))
 
     @staticmethod
-    def _group(messages: Messages) -> list[Messages]:
+    def _group(messages: Messages) -> MessageGroups:
         groups: list[Messages] = []
         ordered_messages = sorted(messages, key=lambda m: m.message_id)
 
@@ -102,7 +104,7 @@ class MessageBuffer:
             else:
                 groups.append([message])
 
-        return groups
+        return [tuple(group) for group in groups]
 
 
 @dataclass(frozen=True, slots=True)
