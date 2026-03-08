@@ -7,7 +7,7 @@ from aiogram import Bot, Router
 from aiogram.filters.callback_data import CallbackData
 from aiogram.types import BufferedInputFile, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaVideo, Message
 
-from general_bot.config import config
+from general_bot.settings import settings
 from general_bot.domain import normalize_video_volume
 from general_bot.services import Services
 from general_bot.types import ChatId
@@ -55,7 +55,7 @@ async def on_message_buffer_and_schedule_action_selection(message: Message, serv
     services.task_scheduler.schedule(
         send_action_selection,
         user=user,
-        delay=config.forward_batch_timeout,
+        delay=settings.forward_batch_timeout,
     )
 
 
@@ -92,7 +92,7 @@ async def on_clip_action(callback: CallbackQuery, callback_data: ClipCallbackDat
 
                 # Limit concurrent CPU-bound video processing to avoid overloading the constrained runtime
                 async with cpu_semaphore:
-                    return await normalize_video_volume(video_bytes, loudness=config.normalization_loudness)
+                    return await normalize_video_volume(video_bytes, loudness=settings.normalization_loudness)
 
             for message_group in message_groups:
                 replacement_videos = await asyncio.wait_for(

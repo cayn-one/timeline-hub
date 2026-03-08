@@ -7,8 +7,8 @@ from aiogram.types import Update, User
 from loguru import logger
 
 from general_bot import handlers
-from general_bot.config import config
 from general_bot.services import Services
+from general_bot.settings import settings
 from general_bot.types import Handler, MiddlewareData
 
 
@@ -27,12 +27,12 @@ async def _main() -> None:
         user: User | None = data.get('event_from_user')
         if user is None:
             return None
-        if user.id not in config.allowlist:
+        if user.id not in settings.allowlist:
             logger.info('User {} (@{} {!r}) attempting to use bot', user.id, user.username or '', user.full_name)
             return None
         return await handler(update, data)
 
-    async with Bot(config.bot_token) as bot:
+    async with Bot(settings.bot_token) as bot:
         await dp.start_polling(bot, polling_timeout=30)
 
 

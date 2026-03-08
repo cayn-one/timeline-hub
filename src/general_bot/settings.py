@@ -3,7 +3,7 @@ from datetime import timedelta
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
-class Config(BaseSettings):
+class Settings(BaseSettings):
     bot_token: str
     allowlist: list[int]
 
@@ -16,4 +16,4 @@ class Config(BaseSettings):
     )
 
 
-config = Config()  # type: ignore[call-arg]
+settings = Settings()  # type: ignore[call-arg]
