@@ -64,8 +64,8 @@ class TaskScheduler:
         if self._generation.get(user_id) != generation:
             return
 
-        # noinspection PyAsyncCall
-        self._tasks.pop(user_id, None)
+        # Once real task started, it can't be canceled. So remove it from scheduler
+        _ = self._tasks.pop(user_id, None)
         try:
             await asyncio.shield(job())
         except asyncio.CancelledError:
