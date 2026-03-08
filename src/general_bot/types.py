@@ -3,8 +3,8 @@ from typing import Any, Callable
 
 from aiogram.types import TelegramObject
 
-MiddlewareData = dict[str, Any]
-Handler = Callable[[TelegramObject, dict[str, Any]], Awaitable[Any]]
+type MiddlewareData = dict[str, Any]
+type Handler = Callable[[TelegramObject, dict[str, Any]], Awaitable[Any]]
 
-ChatId = int
-UserId = int
+type ChatId = int
+type UserId = int
