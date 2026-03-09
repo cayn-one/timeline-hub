@@ -1,6 +1,6 @@
 [project]
 name = "general-bot"
-version = "0.1.0"
+version = "0.0.0"
 requires-python = ">=3.13"
 dependencies = [
     "aiogram==3.26.0",
@@ -12,3 +12,6 @@ dependencies = [
 dev = [
     "ipykernel==7.2.0",
 ]
+
+[tool.uv]
+package = false
