@@ -1,7 +1,16 @@
-.venv/
-__pycache__/
-*.pyc
+# IDE
 .idea/
 
-dev/
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+
+# Virtual environments
+.venv/
+
+# Environment variables
 .env
+
+# Local project folders
+dev/

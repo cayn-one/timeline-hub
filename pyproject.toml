@@ -8,10 +8,13 @@ dependencies = [
     "pydantic-settings==2.13.1",
 ]
 
-[project.optional-dependencies]
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[dependency-groups]
 dev = [
     "ipykernel==7.2.0",
+    "pytest==9.0.2",
+    "pytest-asyncio==1.3.0",
 ]
-
-[tool.uv]
-package = false
