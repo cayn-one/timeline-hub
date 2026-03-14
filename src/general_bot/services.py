@@ -20,28 +20,14 @@ type MessageGroups = list[MessageGroup]
 class TaskScheduler:
     """Per-user delayed task scheduler with debounce semantics.
 
-    Each user can have at most one pending timer. Calling `schedule()` cancels
-    the previous timer and starts a new one that will run `job()` after `delay`.
-    This is typically used to trigger work only after a period of inactivity
-    (e.g. buffering incoming messages and acting once the user stops sending).
+    Each user may have at most one pending timer. Calling `schedule()` cancels
+    the previous timer and schedules `job()` to run after `delay`.
 
-    A generation counter is used to prevent stale timers from executing.
-    Cancellation in asyncio is cooperative and may race with the completion of
-    `asyncio.sleep()`: a timer that was just canceled can still wake up and
-    continue execution. To guard against this, each scheduled timer captures
-    the current generation number for the user. When the timer wakes up, it
-    compares the stored generation with the latest one; if they differ, the
-    timer is obsolete and exits without running the job.
+    If scheduling occurs again before the delay elapses, the previous timer is
+    discarded and only the most recent job will run.
 
-    Once the delay has elapsed and the timer is confirmed to be current, the
-    job is executed under `asyncio.shield()`. This ensures that rescheduling or
-    cancelling the timer does not interrupt the job after it has started. In
-    other words:
-        - while the delay is pending, the timer may be freely canceled
-        - once the job starts, it is allowed to run to completion
-
-    Only `CancelledError` is suppressed. Any other exception raised by `job()`
-    propagates normally.
+    Once the job starts executing it is shielded from cancellation and allowed
+    to run to completion.
     """
 
     def __init__(self, task_supervisor: TaskSupervisor) -> None:
