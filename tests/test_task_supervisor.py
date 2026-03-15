@@ -4,7 +4,7 @@ from collections.abc import Iterator
 import pytest
 from loguru import logger
 
-from general_bot.task_supervisor import TaskFailure, TaskSupervisor
+from general_bot.infra.tasks import TaskFailure, TaskSupervisor
 
 
 @pytest.fixture

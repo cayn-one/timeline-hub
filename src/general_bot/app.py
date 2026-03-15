@@ -9,9 +9,9 @@ from aiogram.types import Update, User
 from loguru import logger
 
 from general_bot import handlers
-from general_bot.services import ChatMessageBuffer, Services, TaskScheduler
+from general_bot.infra.tasks import TaskFailure, TaskScheduler, TaskSupervisor
+from general_bot.services import ChatMessageBuffer, Services
 from general_bot.settings import Settings
-from general_bot.task_supervisor import TaskFailure, TaskSupervisor
 from general_bot.types import Data, Handler
 
 

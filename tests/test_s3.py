@@ -5,8 +5,8 @@ from typing import Self
 import pytest
 from botocore.exceptions import ClientError
 
-import general_bot.s3 as s3_module
-from general_bot.s3 import S3Config, S3ObjectNotFoundError, S3Client
+import general_bot.infra.s3 as s3_module
+from general_bot.infra.s3 import S3Config, S3ObjectNotFoundError, S3Client
 
 
 def _client_error(code: str, operation: str) -> ClientError:
