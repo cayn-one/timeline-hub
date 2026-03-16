@@ -12,7 +12,7 @@ from general_bot import handlers
 from general_bot.infra.tasks import TaskFailure, TaskScheduler, TaskSupervisor
 from general_bot.services import ChatMessageBuffer, Services
 from general_bot.settings import Settings
-from general_bot.types import Data, Handler
+from general_bot.types import Data, Handler, UserId
 
 
 def run() -> None:
@@ -25,30 +25,56 @@ def run() -> None:
 async def _main(settings: Settings) -> None:
     dp = Dispatcher()
 
-    def on_failure(_: TaskFailure):
-        return dp.stop_polling()
-
-    dp['services'] = Services(
-        task_scheduler=TaskScheduler(task_supervisor=TaskSupervisor(on_failure=on_failure)),
-        chat_message_buffer=ChatMessageBuffer(),
-    )
-    dp['settings'] = settings
-    dp.include_router(handlers.router)
-
-    @dp.update.middleware()
-    async def enforce_allowlist(handler: Handler, update: Update, data: Data) -> Any:
-        user: User | None = data.get('event_from_user')
-        if user is None:
-            return None
-        if user.id not in settings.user_allowlist:
-            logger.info('User {} (@{} {!r}) attempting to use bot', user.id, user.username or '', user.full_name)
-            return None
-        return await handler(update, data)
-
     async with Bot(settings.bot_token) as bot:
-        logger.info('Starting bot polling')
+        async def on_failure_stop(_: TaskFailure | None = None) -> None:
+            await _notify_superusers_and_stop_polling(
+                bot=bot,
+                dispatcher=dp,
+                superuser_ids=settings.superuser_ids,
+            )
+
+        dp['services'] = Services(
+            task_scheduler=TaskScheduler(task_supervisor=TaskSupervisor(on_failure=on_failure_stop)),
+            chat_message_buffer=ChatMessageBuffer(),
+        )
+        dp['settings'] = settings
+        dp['on_failure'] = on_failure_stop
+        dp.include_router(handlers.router)
+
+        @dp.update.middleware()
+        async def enforce_allowlist(handler: Handler, update: Update, data: Data) -> Any:
+            user: User | None = data.get('event_from_user')
+            if user is None:
+                return None
+            if user.id not in settings.user_ids:
+                logger.info(
+                    'User {} (@{} {!r}) attempting to use bot',
+                    user.id,
+                    user.username or '',
+                    user.full_name,
+                )
+                return None
+            return await handler(update, data)
+
+        logger.info('Starting bot')
         await dp.start_polling(bot, polling_timeout=30)
-        logger.info('Bot polling stopped')
+        logger.info('Bot stopped')
+
+
+async def _notify_superusers_and_stop_polling(
+    *,
+    bot: Bot,
+    dispatcher: Dispatcher,
+    superuser_ids: set[UserId],
+) -> None:
+    try:
+        for superuser_id in superuser_ids:
+            try:
+                await bot.send_message(chat_id=superuser_id, text='Stopping bot due to error')
+            except Exception:
+                logger.exception('Failed to notify superuser {} about shutdown', superuser_id)
+    finally:
+        await dispatcher.stop_polling()
 
 
 def _configure_logging() -> None:

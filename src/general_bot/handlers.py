@@ -1,5 +1,5 @@
 import asyncio
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from enum import StrEnum, auto
 from textwrap import dedent
 
@@ -27,9 +27,9 @@ class ClipCallbackData(CallbackData, prefix='clip'):
 
 
 @router.error()
-async def on_error_shutdown(_: ErrorEvent, dispatcher: Dispatcher) -> None:
+async def on_error_shutdown(_: ErrorEvent, on_failure: Callable[[], Awaitable[None]]) -> None:
     logger.exception('Handler exception')
-    await dispatcher.stop_polling()
+    await on_failure()
 
 
 @router.message(F.chat.type == ChatType.PRIVATE)
@@ -41,7 +41,7 @@ async def on_message_buffer_and_schedule_clip_action_selection(
     chat_id = message.chat.id
     services.chat_message_buffer.append(message, chat_id=chat_id)
 
-    async def send_action_selection() -> None:
+    async def send_clip_action_selection() -> None:
         messages = services.chat_message_buffer.peek(chat_id)
         clip_messages = [m for m in messages if m.video is not None]
 
@@ -64,7 +64,7 @@ async def on_message_buffer_and_schedule_clip_action_selection(
         )
 
     services.task_scheduler.schedule(
-        send_action_selection,
+        send_clip_action_selection,
         key=chat_id,
         delay=settings.forward_batch_timeout,
     )

@@ -1,6 +1,7 @@
 from datetime import timedelta
-from typing import Self
+from typing import Any, Self
 
+from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from general_bot.types import UserId
@@ -23,8 +24,11 @@ class Settings(BaseSettings):
     # Telegram Bot API token used to authenticate the bot with Telegram
     bot_token: str
 
-    # Telegram user IDs allowed to interact with the bot
-    user_allowlist: list[UserId]
+    # Telegram user IDs with elevated privileges
+    superuser_ids: set[UserId]
+
+    # Telegram user IDs allowed to interact with the bot. Includes superusers
+    user_ids: set[UserId]
 
     # Delay used to batch forwarded messages before responding
     forward_batch_timeout: timedelta = timedelta(seconds=0.25)
@@ -45,3 +49,10 @@ class Settings(BaseSettings):
         return cls(
             bot_token=bts.bot_token_dev if is_dev else bts.bot_token,
         )  # type: ignore[call-arg]  # pydantic-settings fills remaining fields from env at runtime; static checker false positive
+
+    @model_validator(mode='before')
+    @classmethod
+    def add_superusers_to_users(cls, data: Any) -> Any:
+        if isinstance(data, dict) and ('user_ids' in data or 'superuser_ids' in data):
+            data['user_ids'] = set(data.get('user_ids', [])) | set(data.get('superuser_ids', []))
+        return data
