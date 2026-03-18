@@ -347,8 +347,8 @@ async def test_put_and_get_stream_roundtrip(monkeypatch: pytest.MonkeyPatch) -> 
 
     storage = S3Client(_config())
     await storage.open()
-    await storage._put_stream('x', stream)
-    written = await storage._get_stream('x', out)
+    await storage.put_stream('x', stream)
+    written = await storage.get_stream('x', out)
     await storage.close()
 
     assert written == 7

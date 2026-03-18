@@ -1,5 +1,6 @@
 import tempfile
 from dataclasses import dataclass, field
+from enum import StrEnum
 from pathlib import Path
 from types import TracebackType
 from typing import Any, BinaryIO, Self
@@ -38,6 +39,30 @@ class S3Config:
     def __post_init__(self) -> None:
         if not self.endpoint_url.startswith(('http://', 'https://')):
             raise ValueError('S3 endpoint_url must include scheme, e.g. https://...')
+
+
+class S3ContentType(StrEnum):
+    """Common content types for S3 objects."""
+
+    JSON = 'application/json'  # Structured data (APIs, manifests)
+    PARQUET = 'application/vnd.apache.parquet'  # Columnar analytics format
+    OCTET_STREAM = 'application/octet-stream'  # Generic binary fallback
+    ZIP = 'application/zip'  # Compressed archive
+
+    MP4 = 'video/mp4'  # Standard MP4 video container
+    WEBM = 'video/webm'  # Web-optimized video format
+
+    MP3 = 'audio/mpeg'  # Common compressed audio format
+    WAV = 'audio/wav'  # Uncompressed audio format
+
+    PNG = 'image/png'  # Lossless image format
+    JPEG = 'image/jpeg'  # Compressed image format (photos)
+    WEBP = 'image/webp'  # Modern efficient image format
+    GIF = 'image/gif'  # Animated or simple images
+
+    HTML = 'text/html'  # Web pages
+    PLAIN = 'text/plain'  # Plain text
+    CSV = 'text/csv'  # Tabular data
 
 
 class S3Client:
@@ -106,7 +131,13 @@ class S3Client:
         self._client_cm = None
         self._client = None
 
-    async def put_bytes(self, key: Key, data: bytes, *, content_type: str | None = None) -> None:
+    async def put_bytes(
+        self,
+        key: Key,
+        data: bytes,
+        *,
+        content_type: S3ContentType | str | None = None,
+    ) -> None:
         """Store in-memory bytes as a single object."""
         kwargs: dict[str, object] = {
             'Bucket': self._config.bucket,
@@ -121,7 +152,7 @@ class S3Client:
         """Load an object into memory.
 
         Raises:
-            ObjectNotFoundError: If the object key does not exist.
+            S3ObjectNotFoundError: If the object key does not exist.
         """
         try:
             response = await self._require_client().get_object(Bucket=self._config.bucket, Key=key)
@@ -132,17 +163,23 @@ class S3Client:
         async with response['Body'] as stream:
             return await stream.read()
 
-    async def put_file(self, key: Key, path: Path) -> None:
+    async def put_file(
+        self,
+        key: Key,
+        path: Path,
+        *,
+        content_type: S3ContentType | str | None = None,
+    ) -> None:
         """Store a local file."""
         with path.open('rb') as file:
-            await self._put_stream(key, file)
+            await self.put_stream(key, file, content_type=content_type)
 
     async def get_file(self, key: Key, path: Path, *, overwrite: bool = False) -> None:
         """Load an object into a local file path.
 
         Raises:
             FileExistsError: If the target path exists and overwrite is False.
-            ObjectNotFoundError: If the object key does not exist.
+            S3ObjectNotFoundError: If the object key does not exist.
         """
         if path.exists() and not overwrite:
             raise FileExistsError(path)
@@ -154,11 +191,56 @@ class S3Client:
 
         try:
             with tmp_path.open('wb') as file:
-                await self._get_stream(key, file)
+                await self.get_stream(key, file)
             tmp_path.replace(path)
         except Exception:
             tmp_path.unlink(missing_ok=True)
             raise
+
+    async def put_stream(
+        self, key: Key,
+        stream: BinaryIO,
+        *,
+        content_type: S3ContentType | str | None = None,
+    ) -> None:
+        """Store data from a binary stream as a single object."""
+        kwargs: dict[str, object] = {
+            'Bucket': self._config.bucket,
+            'Key': key,
+            'Body': stream,
+        }
+        if content_type is not None:
+            kwargs['ContentType'] = content_type
+        await self._require_client().put_object(**kwargs)
+
+    async def get_stream(self, key: Key, stream: BinaryIO) -> int:
+        """Stream an object into a writable binary stream.
+
+        Returns:
+            Number of bytes written to the stream.
+
+        Raises:
+            S3ObjectNotFoundError: If the object key does not exist.
+        """
+        try:
+            response = await self._require_client().get_object(Bucket=self._config.bucket, Key=key)
+        except ClientError as e:
+            self._raise_if_not_found(e, key)
+            raise
+
+        bytes_written = 0
+        async with response['Body'] as body:
+            while chunk := await body.read(64 * 1024):
+                chunk_view = memoryview(chunk)
+                while chunk_view:
+                    written = stream.write(chunk_view)
+                    if written is None:
+                        raise RuntimeError('Writable binary stream returned None from write().')
+                    if written == 0:
+                        raise RuntimeError('Writable binary stream made no progress while writing.')
+                    chunk_view = chunk_view[written:]
+                    bytes_written += written
+        return bytes_written
 
     async def exists(self, key: Key) -> bool:
         """Check whether an object key exists."""
@@ -276,29 +358,14 @@ class S3Client:
         """Join path-like segments with the S3 key delimiter."""
         return _DELIMITER.join(segment.strip(_DELIMITER) for segment in segments if segment)
 
-    async def _put_stream(self, key: Key, stream: BinaryIO, *, content_type: str | None = None) -> None:
-        kwargs: dict[str, object] = {
-            'Bucket': self._config.bucket,
-            'Key': key,
-            'Body': stream,
-        }
-        if content_type is not None:
-            kwargs['ContentType'] = content_type
-        await self._require_client().put_object(**kwargs)
+    @staticmethod
+    def split(key: str) -> list[str]:
+        """Split an S3 key into path-like segments.
 
-    async def _get_stream(self, key: Key, stream: BinaryIO) -> int:
-        try:
-            response = await self._require_client().get_object(Bucket=self._config.bucket, Key=key)
-        except ClientError as e:
-            self._raise_if_not_found(e, key)
-            raise
-
-        bytes_written = 0
-        async with response['Body'] as body:
-            while chunk := await body.read(64 * 1024):
-                bytes_written += len(chunk)
-                stream.write(chunk)
-        return bytes_written
+        Empty segments are ignored, so leading, trailing, or repeated
+        delimiters do not produce empty elements.
+        """
+        return [segment for segment in key.split(_DELIMITER) if segment]
 
     async def _delete_batch(self, keys: list[Key]) -> int:
         objects = [{'Key': key} for key in keys]
