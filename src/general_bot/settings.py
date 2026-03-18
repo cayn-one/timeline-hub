@@ -1,53 +1,61 @@
 from datetime import timedelta
 from typing import Any, Self
 
-from pydantic import model_validator
+from pydantic import BaseModel, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from general_bot.types import UserId
 
-_CONFIG = SettingsConfigDict(
-    env_file='.env',
-    frozen=True,
-    extra='ignore',
-)
-
 
 class _BotTokenSettings(BaseSettings):
-    bot_token: str
-    bot_token_dev: str | None = None
+    bot_token: SecretStr
+    bot_token_dev: SecretStr | None = None
 
-    model_config = _CONFIG
+    model_config = SettingsConfigDict(
+        env_file='.env',
+        frozen=True,
+        extra='ignore',
+    )
+
+
+class S3Settings(BaseModel):
+    endpoint_url: str
+    region: str
+    bucket: str
+    access_key_id: str
+    secret_access_key: SecretStr
 
 
 class Settings(BaseSettings):
-    # Telegram Bot API token used to authenticate the bot with Telegram
-    bot_token: str
-
-    # Telegram user IDs with elevated privileges
+    # Telegram bot
+    bot_token: SecretStr
     superuser_ids: set[UserId]
-
-    # Telegram user IDs allowed to interact with the bot. Includes superusers
     user_ids: set[UserId]
+
+    # S3-compatible storage
+    s3: S3Settings
 
     # Delay used to batch forwarded messages before responding
     forward_batch_timeout: timedelta = timedelta(seconds=0.25)
 
-    # Target loudness for normalized clips (LUFS)
+    # Audio normalization (LUFS target and bitrate)
     normalization_loudness: float = -14
-
-    # Output bitrate for normalized clips (kbps)
     normalization_bitrate: int = 128
 
-    model_config = _CONFIG
+    model_config = SettingsConfigDict(
+        env_file='.env',
+        frozen=True,
+        extra='ignore',
+        env_nested_delimiter='__',
+    )
 
     @classmethod
     def load(cls, is_dev: bool) -> Self:
-        bts = _BotTokenSettings()
-        if is_dev and bts.bot_token_dev is None:
+        bot_token_settings = _BotTokenSettings()
+        if is_dev and bot_token_settings.bot_token_dev is None:
             raise ValueError('`BOT_TOKEN_DEV` is required in `.env` in dev mode')
         return cls(
-            bot_token=bts.bot_token_dev if is_dev else bts.bot_token,
+            bot_token=bot_token_settings.bot_token_dev if is_dev else bot_token_settings.bot_token,
         )  # type: ignore[call-arg]  # pydantic-settings fills remaining fields from env at runtime; static checker false positive
 
     @model_validator(mode='before')

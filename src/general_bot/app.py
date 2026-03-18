@@ -25,7 +25,7 @@ def run() -> None:
 async def _main(settings: Settings) -> None:
     dp = Dispatcher()
 
-    async with Bot(settings.bot_token) as bot:
+    async with Bot(settings.bot_token.get_secret_value()) as bot:
         async def on_failure_stop(_: TaskFailure | None = None) -> None:
             await _notify_superusers_and_stop_polling(
                 bot=bot,
