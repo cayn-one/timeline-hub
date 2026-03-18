@@ -1,7 +1,7 @@
 [project]
 name = "general-bot"
 version = "0.0.0"
-requires-python = ">=3.13"
+requires-python = ">=3.14"
 dependencies = [
     "aiobotocore==3.2.1",
     "aiogram==3.26.0",
