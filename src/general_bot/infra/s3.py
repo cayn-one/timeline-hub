@@ -280,14 +280,21 @@ class S3Client:
 
         return keys
 
-    async def list_prefixes(self, prefix: Prefix | None = None) -> list[Prefix]:
+    async def list_subprefixes(self, prefix: Prefix | None = None) -> list[Prefix]:
         """List immediate subprefixes under an optional prefix.
 
         Uses one S3 list request per page. Each request returns up to 1000
         entries, so large results may require multiple backend requests.
+
+        If `prefix` is provided, it is treated as a logical parent prefix:
+        a trailing delimiter is added automatically if missing.
         """
         prefixes: list[Prefix] = []
         token: str | None = None
+
+        # Normalize prefix to behave like a directory root
+        if prefix and not prefix.endswith(_DELIMITER):
+            prefix = prefix + _DELIMITER
 
         while True:
             kwargs: dict[str, object] = {
@@ -308,6 +315,13 @@ class S3Client:
             token = response.get('NextContinuationToken')
 
         return prefixes
+
+    async def list_prefixes(self, prefix: Prefix | None = None) -> list[Prefix]:
+        """List immediate subprefixes under an optional prefix.
+
+        Backward-compatible alias for `list_subprefixes`.
+        """
+        return await self.list_subprefixes(prefix)
 
     async def delete_key(self, key: Key) -> None:
         """Delete a single object by exact key."""

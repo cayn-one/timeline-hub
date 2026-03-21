@@ -203,6 +203,30 @@ async def test_list_prefixes_without_prefix_lists_bucket_root(
 
 
 @pytest.mark.asyncio
+async def test_list_subprefixes_normalizes_parent_prefix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Client:
+        async def list_objects_v2(self, **kwargs):
+            assert kwargs['Bucket'] == 'bucket'
+            assert kwargs['Delimiter'] == '/'
+            assert kwargs['Prefix'] == 'a/'
+            return {
+                'CommonPrefixes': [{'Prefix': 'a/1/'}, {'Prefix': 'a/2/'}],
+                'IsTruncated': False,
+            }
+
+    monkeypatch.setattr(s3_module, 'get_session', lambda: _FakeSession(_Client()))
+
+    storage = S3Client(_config())
+    await storage.open()
+    prefixes = await storage.list_subprefixes('a')
+    await storage.close()
+
+    assert prefixes == ['a/1/', 'a/2/']
+
+
+@pytest.mark.asyncio
 async def test_delete_prefix_batches_and_counts_deleted_objects(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
