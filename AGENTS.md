@@ -265,6 +265,8 @@ The UI layer is a projection, not a source of truth.
 - Prefer current language features over legacy compatibility patterns.
 - Do not introduce backward-compatibility constructs unless explicitly required.
 - Prefer explicit code over clever abstractions.
+- Do not introduce code that violates Ruff rules.
+- Run `uv run ruff check --fix` and `uv run ruff format` before committing changes.
 
 Imports:
 
