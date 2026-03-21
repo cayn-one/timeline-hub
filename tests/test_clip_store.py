@@ -3,8 +3,8 @@ import uuid
 
 import pytest
 
-import general_bot.clip_store as clip_store_module
-from general_bot.clip_store import (
+import general_bot.services.clip_store as clip_store_module
+from general_bot.services.clip_store import (
     Clip,
     ClipGroup,
     ClipGroupNotFoundError,

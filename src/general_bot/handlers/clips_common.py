@@ -8,7 +8,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from aiogram.utils.formatting import Bold, Text
 
-from general_bot.clip_store import Scope, Season, StoreResult, SubSeason, Universe
+from general_bot.services.clip_store import Scope, Season, StoreResult, SubSeason, Universe
 
 FLOW_FETCH = 'fetch'
 FLOW_STORE = 'store'

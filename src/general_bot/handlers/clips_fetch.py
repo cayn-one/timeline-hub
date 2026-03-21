@@ -8,7 +8,16 @@ from aiogram.filters.callback_data import CallbackData
 from aiogram.fsm.context import FSMContext
 from aiogram.types import BufferedInputFile, CallbackQuery, InlineKeyboardButton, InputMediaVideo, Message
 
-from general_bot.clip_store import Clip, ClipGroup, ClipGroupNotFoundError, ClipSubGroup, Scope, Season, SubSeason, Universe
+from general_bot.services.clip_store import (
+    Clip,
+    ClipGroup,
+    ClipGroupNotFoundError,
+    ClipSubGroup,
+    Scope,
+    Season,
+    SubSeason,
+    Universe,
+)
 from general_bot.handlers.clips_common import (
     ALL_SCOPES_CALLBACK_VALUE,
     BACK_CALLBACK_VALUE,
@@ -40,8 +49,8 @@ from general_bot.handlers.clips_common import (
     validate_flow_state,
     width_reserved_text,
 )
-from general_bot.services import Services
 from general_bot.settings import Settings
+from general_bot.services.container import Services
 from general_bot.types import ChatId
 
 router = Router()

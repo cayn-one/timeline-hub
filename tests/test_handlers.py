@@ -8,7 +8,6 @@ from aiogram.utils.formatting import Bold, Text
 
 import general_bot.handlers.clips_fetch as clips_fetch_module
 import general_bot.handlers.clips_store as clips_store_module
-from general_bot.clip_store import Clip, ClipGroup, ClipSubGroup, Scope, Season, StoreResult, SubSeason, Universe
 from general_bot.handlers.clips_common import (
     ALL_SCOPES_CALLBACK_VALUE,
     DUMMY_BUTTON_TEXT,
@@ -48,7 +47,9 @@ from general_bot.handlers.clips_store import (
     on_message_buffer_and_schedule_clip_action_selection,
     on_store_menu,
 )
-from general_bot.services import ChatMessageBuffer, Services
+from general_bot.services.clip_store import Clip, ClipGroup, ClipSubGroup, Scope, Season, StoreResult, SubSeason, Universe
+from general_bot.services.container import Services
+from general_bot.services.message_buffer import ChatMessageBuffer
 
 
 class _FakeState:

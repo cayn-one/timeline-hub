@@ -9,12 +9,13 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import BotCommand, Update, User
 from loguru import logger
 
-from general_bot.clip_store import ClipStore
 from general_bot.handlers.router import router as handlers_router
 from general_bot.infra.s3 import S3Client, S3Config
 from general_bot.infra.tasks import TaskFailure, TaskScheduler, TaskSupervisor
-from general_bot.services import ChatMessageBuffer, Services
 from general_bot.settings import Settings
+from general_bot.services.clip_store import ClipStore
+from general_bot.services.container import Services
+from general_bot.services.message_buffer import ChatMessageBuffer
 from general_bot.types import Data, Handler, UserId
 
 
