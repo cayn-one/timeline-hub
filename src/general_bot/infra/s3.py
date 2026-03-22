@@ -328,16 +328,24 @@ class S3Client:
         """Delete a single object by exact key."""
         await self._require_client().delete_object(Bucket=self._config.bucket, Key=key)
 
-    async def delete_prefix(self, prefix: Prefix) -> int:
+    async def delete_prefix(self, prefix: Prefix, *, allow_root: bool = False) -> int:
         """Delete all objects under prefix and return number of deleted keys.
 
         Uses paginated list requests plus batched delete requests. Listing uses
         one request per 1000 keys, and deletion uses one delete request per
         batch of up to 1000 keys.
 
+        Args:
+            prefix: Key prefix to delete under. Must be non-empty unless allow_root=True.
+            allow_root: Explicit opt-in to allow deleting the entire bucket.
+
         Raises:
+            ValueError: If prefix is empty and allow_root is False.
             RuntimeError: If the backend reports partial delete failures.
         """
+        if not prefix and not allow_root:
+            raise ValueError('Refusing to delete entire bucket without allow_root=True')
+
         deleted = 0
         batch: list[Key] = []
         token: str | None = None
@@ -346,13 +354,18 @@ class S3Client:
             kwargs: dict[str, object] = {
                 'Bucket': self._config.bucket,
                 'MaxKeys': _LIST_MAX_KEYS,
-                'Prefix': prefix,
             }
+
+            # Only include Prefix if non-empty; otherwise we intentionally target the whole bucket.
+            if prefix:
+                kwargs['Prefix'] = prefix
+
             if token is not None:
                 kwargs['ContinuationToken'] = token
 
             response = await self._require_client().list_objects_v2(**kwargs)
             contents = response.get('Contents', [])
+
             for obj in contents:
                 batch.append(obj['Key'])
                 if len(batch) >= _DELETE_MAX_OBJECTS:
@@ -361,6 +374,7 @@ class S3Client:
 
             if not response.get('IsTruncated'):
                 break
+
             token = response.get('NextContinuationToken')
 
         if batch:
