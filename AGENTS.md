@@ -1,3 +1,5 @@
+# Project Overview
+
 ## Telegram UI invariants
 
 These rules apply only to messages that include inline keyboards. Plain text messages must remain unmodified and must not be padded or height-normalized.
@@ -252,12 +254,31 @@ The UI layer is a projection, not a source of truth.
 
 ## Tooling
 
+### Environment & workflow
+
 - Use `uv` for dependency management and running commands.
 - Pin exact versions when adding dependencies.
 - Install the development environment with `uv sync --dev`.
 - Repository uses a `src/` layout; tests must import the installed package.
 - Do not modify `sys.path` in tests or use pytest/pythonpath hacks.
+
+### Testing
+
 - Run tests with `uv run pytest`.
+
+### Pre-commit (enforcement)
+
+Pre-commit is the final gate before commits and enforces all tooling rules.
+
+Rules:
+- Commits must pass all pre-commit hooks.
+- Do not bypass hooks (`--no-verify` is forbidden).
+- If hooks fail, fix the issues before committing.
+
+Notes:
+- Ruff may auto-fix issues during pre-commit.
+- Pyright must pass without errors before commit.
+- Do not rely on manual runs of Ruff or Pyright; pre-commit is the source of truth.
 
 ## Code Style
 
@@ -470,19 +491,60 @@ feat(infra): add fail-fast detached task supervision
 Introduce `TaskSupervisor` for detached asyncio tasks with centralized
 exception handling and a one-shot failure hook.
 
+### Core rule
+
+The commit message must describe the **actual system change**.
+
+Do not describe:
+- the tool used
+- the complaint being fixed
+- the file operation performed
+- the mechanical diff
+
+Do not name:
+- the checker complaint (`resolve pyright issues`)
+- the cleanup target (`apply ruff`)
+- the container shape (`add module`, `add package`) when the real change is a capability
+
+Prefer:
+- resulting behavior
+- resulting capability
+- resulting contract change
+- resulting architectural change
+
+Bad:
+- `fix: resolve pyright issues`
+- `chore: apply ruff`
+- `docs: compress AGENTS.md`
+
+Good:
+- `refactor: tighten runtime typing across app, handlers, and settings`
+- `chore: apply ruff formatting and lint cleanups`
+- `docs: reorganize AGENTS.md and add project overview`
+
+---
+
 ### Types
 
 Allowed types:
 
 - feat — new capability or user-visible behavior
-- fix — bug fix
-- refactor — internal restructuring without behavior change
-- perf — performance improvement without behavior change
+- fix — bug fix or behavior correction
+- refactor — internal restructuring without intended behavior change
+- perf — performance improvement without intended behavior change
 - test — tests added or updated
 - docs — documentation-only changes
-- chore — repository maintenance, tooling, or runtime requirement changes
+- chore — repository maintenance, tooling, formatting, or runtime requirement changes
 
-Choose the type that reflects the **intent of the change**, not the file modified.  
+Choose the type that reflects the **intent of the change**, not the file modified.
+
+Rules:
+- Use `feat` when the system gains a new capability.
+- Use `fix` when runtime behavior, validation, routing, config behavior, or API behavior is corrected.
+- Use `refactor` only when there is **no intended externally observable behavior change**.
+- Use `docs` for comments, docstrings, inline explanations, `AGENTS.md`, `README.md`, and other documentation-only edits, even when they are inside `src/`.
+- Use `chore` for tooling, formatting, dependency management, repo maintenance, and runtime-version bumps.
+
 Do not invent new types.
 
 Examples:
@@ -490,6 +552,8 @@ Examples:
 - chore: update `.gitignore`
 - chore(deps): bump `httpx` to 0.28.0
 - chore!: bump python to 3.14
+
+---
 
 ### Breaking changes
 
@@ -520,8 +584,10 @@ feat!: add superuser-aware shutdown notifications
 
 BREAKING CHANGE: replace `USER_ALLOWLIST` with `SUPERUSER_IDS` and `USER_IDS`.
 
-Configuration or settings contract changes should be assumed breaking
-unless proven otherwise.
+Configuration, settings, env-var, and runtime-version contract changes
+should be assumed breaking unless clearly proven otherwise.
+
+---
 
 ### Subject rules
 
@@ -530,19 +596,77 @@ Subjects must:
 - be lowercase
 - use imperative mood
 - be ≤72 characters
-- describe the system-level behavior change
+- describe the system-level change
+- be understandable without reading the diff
 
-Avoid vague subjects such as:
+Prefer concise, action-oriented phrasing.
 
-- "update rules"
-- "improve system"
+Prefer naming:
+- the new capability
+- the corrected behavior
+- the new boundary
+- the new contract
 
-Prefer concise, action-oriented phrasing:
+Avoid vague or low-signal subjects such as:
 
-- use "bump" for version updates (e.g. python, dependencies)
-- avoid overly abstract or policy-like wording
+- `update rules`
+- `improve system`
+- `resolve issues`
+- `apply ruff`
+- `compress AGENTS.md`
+- `add module`
+- `add flows`
 
-Implementation details should appear in the commit body.
+Avoid filler nouns unless paired with a concrete system effect:
+- `module`
+- `flow`
+- `rules`
+- `issues`
+
+For large commits, name the actual subsystem capability or behavior,
+not the container shape.
+
+Examples:
+
+Bad:
+- `fix: resolve pyright issues across app, handlers, and services`
+
+Better:
+- `refactor: tighten runtime typing across app, handlers, and settings`
+
+Bad:
+- `feat: add clip store domain module`
+
+Better:
+- `feat(services): add s3-backed clip store with manifest deduplication`
+
+Bad:
+- `refactor(handlers): scope handlers to private chats`
+
+Better:
+- `fix(handlers): restrict clip flows to private chats`
+
+Implementation details should appear in the commit body, not the subject.
+
+---
+
+### Tooling-related subjects
+
+When a commit is triggered by a tool (`ruff`, `pyright`, formatter, etc.),
+do not make the tool name the main subject unless the commit is genuinely
+about adopting/configuring that tool.
+
+Rules:
+- Tool adoption/configuration → `chore(deps): add and configure ruff`
+- Pure mechanical formatting/lint cleanup → `chore: apply ruff formatting and lint cleanups`
+- Type-driven code improvements → describe the resulting code change, not “pyright issues”
+- When onboarding a new tool and establishing its baseline config or workflow, name both adoption and configuration in the subject
+
+Examples:
+- `chore(deps): add and configure ruff`
+- `chore(deps): add pyright and baseline type-check config`
+
+---
 
 ### Referencing code entities
 
@@ -551,6 +675,8 @@ Wrap file names, modules, classes, and functions in backticks.
 Example:
 
 Rename `MessageBuffer` to `ChatMessageBuffer`.
+
+---
 
 ### Shell safety for commit messages
 
@@ -577,6 +703,8 @@ Agents must:
 - avoid backticks inside double-quoted commit messages
 - use single quotes or heredocs when backticks appear
 
+---
+
 ### Referencing canonical repository files
 
 When a commit primarily modifies a well-known document such as:
@@ -587,20 +715,30 @@ When a commit primarily modifies a well-known document such as:
 
 mention it directly in the subject when helpful.
 
-Example:
+Examples:
 
-docs: expand `AGENTS.md` commit guidelines
+- docs: expand `AGENTS.md` commit guidelines
+- docs: reorganize `AGENTS.md` and add project overview
+
+---
 
 ### Commit body guidance
 
 Add a body when reasoning is important, for example when:
 
 - multiple subsystems are affected
-- a refactor changes conceptual structure
-- a rename clarifies an abstraction
 - the reason is not obvious from the subject
+- a refactor changes conceptual structure
+- a contract or behavior change needs context
+- a tool-driven cleanup has one or two important non-mechanical consequences
 
 The body should explain **why**, not list the diff.
+
+Do not add a body when the subject already fully explains a small and obvious change.
+
+For breaking changes, the body or footer must make migration obvious.
+
+---
 
 ### Scope discipline
 
@@ -610,12 +748,18 @@ Valid scopes:
 
 - app — runtime bootstrap and wiring
 - handlers — Telegram routing and handlers
-- services — application services/state containers
+- services — application services/state containers and domain-facing service modules
 - infra — shared infrastructure utilities
 - settings — configuration loading and validation
-- deps — dependency updates
+- deps — dependency and tooling setup
 
-Avoid choosing scope based only on a single touched file.
+Rules:
+- Use a scope when the change clearly belongs to one subsystem.
+- Omit scope only when the change is genuinely cross-cutting or repository-level.
+- If a change spans multiple subsystems and no single subsystem clearly dominates, omit the scope rather than choosing a misleading narrow one.
+- Do not choose scope based only on one touched file; choose it based on the primary system intent.
+
+---
 
 ### Root-level files
 
@@ -623,10 +767,12 @@ Commits affecting repository-level files usually omit scope.
 
 Examples:
 
-docs: update `README.md`  
-chore: update `.gitignore`
+- docs: update `README.md`
+- chore: update `.gitignore`
 
-Use `deps` only for dependency changes.
+Use `deps` only for dependency and tooling changes.
+
+---
 
 ### Generic infrastructure
 
@@ -636,6 +782,8 @@ Example:
 
 feat(infra): add fail-fast task supervisor
 
+---
+
 ### When scope is unclear
 
 If a change does not clearly belong to a subsystem, omit the scope.
@@ -644,9 +792,18 @@ Example:
 
 feat: add task supervisor utility
 
+---
+
 ### Commit coherence
 
 Commits should remain conceptually coherent by subsystem and intent.
 
-Do not combine unrelated changes in a single commit.  
+Do not combine unrelated changes in a single commit.
+
+Split commits when:
+- runtime behavior and tooling changes are both substantial
+- dependency/tooling onboarding and application logic both change materially
+- formatting/mechanical cleanup would obscure logic changes
+- a contract rename and unrelated polish happen together
+
 If unrelated local modifications exist, commit only the files relevant to the requested change.
