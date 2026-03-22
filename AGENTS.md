@@ -265,8 +265,35 @@ The UI layer is a projection, not a source of truth.
 - Prefer current language features over legacy compatibility patterns.
 - Do not introduce backward-compatibility constructs unless explicitly required.
 - Prefer explicit code over clever abstractions.
+- Prefer public and documented library APIs over private/internal ones.
+- Do not rely on private attributes or methods (for example names prefixed with `_`) unless explicitly requested or there is no viable public alternative.
+
+- Ruff is the source of truth for code style.
 - Do not introduce code that violates Ruff rules.
 - Run `uv run ruff check --fix` and `uv run ruff format` before committing changes.
+
+- Pyright is used for static type checking.
+- Do not introduce code that fails Pyright type checking.
+- Before finalizing changes, run `uv run pyright` and resolve type errors.
+
+- Prefer fixing root causes over using `Any`, `cast`, suppressions, or fragile library internals.
+- Prefer explicit None checks and proper type narrowing over unsafe assumptions.
+
+- When a library intentionally relies on dynamic runtime behavior that static analysis cannot model
+  (for example `pydantic-settings` loading values from environment variables),
+  do not distort the architecture just to satisfy the type checker.
+
+- In such cases, prefer a narrow and well-documented suppression over:
+  - duplicating schemas or models
+  - introducing parallel representations of the same data
+  - using private/internal library APIs
+  - significantly increasing code complexity
+
+- Suppressions are allowed only when:
+  - runtime behavior is correct and intentional
+  - the limitation comes from the type checker, not from a real bug
+  - the suppression is minimal in scope (prefer line-level over file-level when possible)
+  - the suppression includes a short explanatory comment
 
 Imports:
 
