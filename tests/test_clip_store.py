@@ -62,9 +62,9 @@ class _FakeS3Client:
         self.put_calls: list[tuple[str, bytes, str | None]] = []
         self.deleted_keys: list[str] = []
 
-    async def put_bytes(self, key: str, data: bytes, *, content_type: str | None = None) -> None:
-        self.objects[key] = data
-        self.put_calls.append((key, data, content_type))
+    async def put_bytes(self, key: str, *, bytes_: bytes, content_type: str | None = None) -> None:
+        self.objects[key] = bytes_
+        self.put_calls.append((key, bytes_, content_type))
 
     async def get_bytes(self, key: str) -> bytes:
         self.get_calls.append(key)

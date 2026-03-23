@@ -16,6 +16,7 @@ _DELIMITER = '/'
 _LIST_MAX_KEYS = 1000
 _DELETE_MAX_OBJECTS = 1000
 _NOT_FOUND_CODES = frozenset({'404', 'NoSuchKey', 'NotFound'})
+_STREAM_READ_SIZE = 64 * 1024
 
 
 class S3ObjectNotFoundError(Exception):
@@ -134,15 +135,15 @@ class S3Client:
     async def put_bytes(
         self,
         key: Key,
-        data: bytes,
         *,
+        bytes_: bytes,
         content_type: S3ContentType | str | None = None,
     ) -> None:
         """Store in-memory bytes as a single object."""
         kwargs: dict[str, object] = {
             'Bucket': self._config.bucket,
             'Key': key,
-            'Body': data,
+            'Body': bytes_,
         }
         if content_type is not None:
             kwargs['ContentType'] = content_type
@@ -156,12 +157,12 @@ class S3Client:
         """
         try:
             response = await self._require_client().get_object(Bucket=self._config.bucket, Key=key)
-        except ClientError as e:
-            self._raise_if_not_found(e, key)
+        except ClientError as error:
+            self._raise_if_not_found(error, key)
             raise
 
-        async with response['Body'] as stream:
-            return await stream.read()
+        async with response['Body'] as body:
+            return await body.read()
 
     async def put_file(
         self,
@@ -214,7 +215,7 @@ class S3Client:
             kwargs['ContentType'] = content_type
         await self._require_client().put_object(**kwargs)
 
-    async def get_stream(self, key: Key, stream: BinaryIO) -> int:
+    async def get_stream(self, key: Key, target: BinaryIO) -> int:
         """Stream an object into a writable binary stream.
 
         Returns:
@@ -225,22 +226,23 @@ class S3Client:
         """
         try:
             response = await self._require_client().get_object(Bucket=self._config.bucket, Key=key)
-        except ClientError as e:
-            self._raise_if_not_found(e, key)
+        except ClientError as error:
+            self._raise_if_not_found(error, key)
             raise
 
         bytes_written = 0
         async with response['Body'] as body:
-            while chunk := await body.read(64 * 1024):
+            while chunk := await body.read(_STREAM_READ_SIZE):
                 chunk_view = memoryview(chunk)
                 while chunk_view:
-                    written = stream.write(chunk_view)
+                    written = target.write(chunk_view)
                     if written is None:
                         raise RuntimeError('Writable binary stream returned None from write().')
                     if written == 0:
                         raise RuntimeError('Writable binary stream made no progress while writing.')
                     chunk_view = chunk_view[written:]
                     bytes_written += written
+
         return bytes_written
 
     async def exists(self, key: Key) -> bool:
@@ -248,8 +250,8 @@ class S3Client:
         try:
             await self._require_client().head_object(Bucket=self._config.bucket, Key=key)
             return True
-        except ClientError as e:
-            if self._is_not_found(e):
+        except ClientError as error:
+            if self._is_not_found(error):
                 return False
             raise
 
@@ -277,6 +279,7 @@ class S3Client:
 
             if not response.get('IsTruncated'):
                 break
+
             token = response.get('NextContinuationToken')
 
         return keys
@@ -293,7 +296,6 @@ class S3Client:
         prefixes: list[Prefix] = []
         token: str | None = None
 
-        # Normalize prefix to behave like a directory root
         if prefix and not prefix.endswith(_DELIMITER):
             prefix = prefix + _DELIMITER
 
@@ -313,6 +315,7 @@ class S3Client:
 
             if not response.get('IsTruncated'):
                 break
+
             token = response.get('NextContinuationToken')
 
         return prefixes
@@ -355,11 +358,8 @@ class S3Client:
                 'Bucket': self._config.bucket,
                 'MaxKeys': _LIST_MAX_KEYS,
             }
-
-            # Only include Prefix if non-empty; otherwise we intentionally target the whole bucket.
             if prefix:
                 kwargs['Prefix'] = prefix
-
             if token is not None:
                 kwargs['ContinuationToken'] = token
 
