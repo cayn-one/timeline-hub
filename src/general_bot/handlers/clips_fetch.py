@@ -695,50 +695,6 @@ async def _fetch_sub_groups(
         return None
 
 
-def _fetch_year_options(groups: Sequence[ClipGroup]) -> list[int]:
-    return available_group_years(groups)
-
-
-def _fetch_season_options(
-    groups: Sequence[ClipGroup],
-    *,
-    year: int,
-) -> list[Season]:
-    return available_group_seasons(groups, year=year)
-
-
-def _fetch_universe_options(
-    groups: Sequence[ClipGroup],
-    *,
-    year: int,
-    season: Season,
-) -> list[Universe]:
-    return available_group_universes(groups, year=year, season=season)
-
-
-def _fetch_sub_season_options(sub_groups: Sequence[ClipSubGroup]) -> list[SubSeason]:
-    return available_sub_seasons(sub_groups)
-
-
-def _fetch_scope_options(
-    sub_groups: Sequence[ClipSubGroup],
-    sub_season: SubSeason,
-) -> list[Scope]:
-    return available_scopes(sub_groups, sub_season)
-
-
-def _fetch_year_universe(settings: Settings) -> list[int]:
-    return year_option_universe(current_year=date.today().year, min_year=settings.min_clip_year)
-
-
-def _fetch_season_universe(year: int) -> list[Season]:
-    return list(Season)
-
-
-def _fetch_store_allowed_seasons(year: int) -> list[Season]:
-    return store_allowed_seasons(year=year, today=date.today())
-
-
 def _fetch_entry_reply_markup():
     return stacked_keyboard(
         buttons=[

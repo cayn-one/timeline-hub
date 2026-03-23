@@ -487,45 +487,6 @@ def _snake_rows(buttons: Sequence[InlineKeyboardButton]) -> _TwoRowButtons:
     )
 
 
-def _split_standard_buttons(buttons: Sequence[InlineKeyboardButton]) -> _TwoRowButtons:
-    button_list = list(buttons)
-    top_row_size, _ = _two_row_sizes(len(button_list))
-    return _TwoRowButtons(
-        top_row=button_list[:top_row_size],
-        bottom_row=button_list[top_row_size:],
-    )
-
-
-def split_year_buttons(buttons: Sequence[InlineKeyboardButton]) -> _TwoRowButtons:
-    button_list = list(buttons)
-    top_row_size, bottom_row_size = _two_row_sizes(len(button_list))
-    top_row_newest_first: list[InlineKeyboardButton] = []
-    bottom_row_newest_first: list[InlineKeyboardButton] = []
-    remaining_top = top_row_size
-    remaining_bottom = bottom_row_size
-    place_in_top = True
-
-    for button in reversed(button_list):
-        if place_in_top and remaining_top > 0:
-            top_row_newest_first.append(button)
-            remaining_top -= 1
-        elif not place_in_top and remaining_bottom > 0:
-            bottom_row_newest_first.append(button)
-            remaining_bottom -= 1
-        elif remaining_top > 0:
-            top_row_newest_first.append(button)
-            remaining_top -= 1
-        else:
-            bottom_row_newest_first.append(button)
-            remaining_bottom -= 1
-        place_in_top = not place_in_top
-
-    return _TwoRowButtons(
-        top_row=list(reversed(top_row_newest_first)),
-        bottom_row=list(reversed(bottom_row_newest_first)),
-    )
-
-
 def _button_message_text(
     *,
     real_lines: Sequence[str | Text],
