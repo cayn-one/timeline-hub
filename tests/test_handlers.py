@@ -961,7 +961,8 @@ async def test_store_scope_selection_aggregates_results_and_sends_exact_summary(
                 StoreResult(stored_count=1, duplicate_count=0),
                 StoreResult(stored_count=2, duplicate_count=2),
             ]
-        )
+        ),
+        compact=AsyncMock(),
     )
     services = _services(clip_store=clip_store, buffer=buffer)
 
@@ -995,6 +996,7 @@ async def test_store_scope_selection_aggregates_results_and_sends_exact_summary(
     assert clip_store.store.await_args_list[0].kwargs['clip_sub_group'] == expected_sub_group
     assert clip_store.store.await_args_list[1].kwargs['clip_group'] == expected_group
     assert clip_store.store.await_args_list[1].kwargs['clip_sub_group'] == expected_sub_group
+    clip_store.compact.assert_not_awaited()
     message.answer.assert_awaited_once_with(
         **Text(
             'Stored: ',
@@ -1005,6 +1007,97 @@ async def test_store_scope_selection_aggregates_results_and_sends_exact_summary(
         ).as_kwargs()
     )
     assert state.current_state is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('scope', [Scope.EXTRA, Scope.SOURCE])
+async def test_store_scope_selection_compacts_extra_and_source_batches(scope: Scope) -> None:
+    message = _fake_message(text='Select scope:', chat_id=77, message_id=51)
+    callback = _fake_callback(message)
+    state = _FakeState()
+    await state.set_state(StoreClipFlow.scope)
+    await state.update_data(
+        mode='store',
+        menu_message_id=51,
+        year=2025,
+        season=Season.S1,
+        universe=Universe.WEST,
+        sub_season=SubSeason.NONE,
+    )
+
+    buffer = ChatMessageBuffer()
+    buffer.append(
+        _fake_message(chat_id=77, message_id=1, video=_fake_video(file_id='f1', file_name='one.mp4')),
+        chat_id=77,
+    )
+
+    clip_store = SimpleNamespace(
+        store=AsyncMock(return_value=StoreResult(stored_count=1, duplicate_count=0)),
+        compact=AsyncMock(),
+    )
+    services = _services(clip_store=clip_store, buffer=buffer)
+
+    bot = AsyncMock()
+    bot.get_file.return_value = SimpleNamespace(file_path='path-1')
+    bot.download_file.return_value = BytesIO(b'one')
+
+    await on_store_menu(
+        callback,
+        StoreCallbackData(action=MenuAction.SELECT, step=MenuStep.SCOPE, value=scope.value),
+        bot,
+        services,
+        _settings(),
+        state,
+    )
+
+    clip_store.compact.assert_awaited_once_with(
+        clip_group=ClipGroup(year=2025, season=Season.S1, universe=Universe.WEST),
+        clip_sub_group=ClipSubGroup(sub_season=SubSeason.NONE, scope=scope),
+        batch_size=clips_store_module._TELEGRAM_MEDIA_GROUP_LIMIT,
+    )
+
+
+@pytest.mark.asyncio
+async def test_store_scope_selection_does_not_compact_when_everything_is_duplicate() -> None:
+    message = _fake_message(text='Select scope:', chat_id=77, message_id=52)
+    callback = _fake_callback(message)
+    state = _FakeState()
+    await state.set_state(StoreClipFlow.scope)
+    await state.update_data(
+        mode='store',
+        menu_message_id=52,
+        year=2025,
+        season=Season.S1,
+        universe=Universe.WEST,
+        sub_season=SubSeason.NONE,
+    )
+
+    buffer = ChatMessageBuffer()
+    buffer.append(
+        _fake_message(chat_id=77, message_id=1, video=_fake_video(file_id='f1', file_name='one.mp4')),
+        chat_id=77,
+    )
+
+    clip_store = SimpleNamespace(
+        store=AsyncMock(return_value=StoreResult(stored_count=0, duplicate_count=1)),
+        compact=AsyncMock(),
+    )
+    services = _services(clip_store=clip_store, buffer=buffer)
+
+    bot = AsyncMock()
+    bot.get_file.return_value = SimpleNamespace(file_path='path-1')
+    bot.download_file.return_value = BytesIO(b'one')
+
+    await on_store_menu(
+        callback,
+        StoreCallbackData(action=MenuAction.SELECT, step=MenuStep.SCOPE, value=Scope.EXTRA.value),
+        bot,
+        services,
+        _settings(),
+        state,
+    )
+
+    clip_store.compact.assert_not_awaited()
 
 
 @pytest.mark.asyncio

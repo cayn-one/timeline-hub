@@ -441,6 +441,98 @@ class ClipStore:
             duplicate_count=duplicate_count,
         )
 
+    async def compact(
+        self,
+        *,
+        clip_group: ClipGroup,
+        clip_sub_group: ClipSubGroup,
+        batch_size: int,
+    ) -> None:
+        """Compact one clip sub-group by rewriting manifest batch metadata only.
+
+        Compaction preserves the exact subgroup-local relative order defined by
+        `(batch, order)` and rewrites only batching for the specified
+        `ClipSubGroup`. Clip objects are never downloaded, rewritten, or
+        re-uploaded. After compaction, target batch numbering is dense,
+        starts at `1`, and uses local `order` values `1..N` within each batch.
+
+        Raises:
+            ValueError: If `batch_size` is less than `1`.
+            ClipGroupNotFoundError: If the requested clip group or sub-group has no clips.
+            ManifestCorruptedError: If the clip-group manifest exists but is malformed.
+        """
+        if batch_size < 1:
+            raise ValueError('`batch_size` must be >= 1')
+
+        clip_group_prefix = self._clip_group_prefix(
+            year=clip_group.year,
+            season=clip_group.season,
+            universe=clip_group.universe,
+        )
+        try:
+            manifest = await self._load_manifest_for_read(clip_group_prefix)
+        except S3ObjectNotFoundError as error:
+            raise ClipGroupNotFoundError(
+                year=clip_group.year,
+                season=clip_group.season,
+                universe=clip_group.universe,
+                sub_season=None,
+                scope=None,
+            ) from error
+
+        target_entries = self._sorted_sub_group_entries(manifest, clip_sub_group)
+        if not target_entries:
+            raise ClipGroupNotFoundError(
+                year=clip_group.year,
+                season=clip_group.season,
+                universe=clip_group.universe,
+                sub_season=clip_sub_group.sub_season,
+                scope=clip_sub_group.scope,
+            )
+
+        compacted_positions: dict[str, tuple[int, int]] = {}
+        changed = False
+        for index, entry in enumerate(target_entries, start=1):
+            compacted_batch = ((index - 1) // batch_size) + 1
+            compacted_order = ((index - 1) % batch_size) + 1
+            compacted_positions[entry.id] = (compacted_batch, compacted_order)
+            if (entry.batch, entry.order) != (compacted_batch, compacted_order):
+                changed = True
+
+        if not changed:
+            return
+
+        rewritten_entries: list[ManifestEntry] = []
+        for entry in manifest:
+            if entry.scope is clip_sub_group.scope and entry.sub_season is clip_sub_group.sub_season:
+                compacted_batch, compacted_order = compacted_positions[entry.id]
+                rewritten_entries.append(
+                    ManifestEntry(
+                        id=entry.id,
+                        video_hash=entry.video_hash,
+                        sub_season=entry.sub_season,
+                        scope=entry.scope,
+                        batch=compacted_batch,
+                        order=compacted_order,
+                    )
+                )
+            else:
+                rewritten_entries.append(entry)
+
+        rewritten_manifest = Manifest(rewritten_entries)
+        manifest_key = self._manifest_key(clip_group_prefix)
+        manifest_payload = json.dumps(rewritten_manifest.to_list(), separators=(',', ':')).encode('utf-8')
+
+        # Compaction is manifest-only; clip objects stay untouched.
+        await self._s3_client.put_bytes(
+            manifest_key,
+            manifest_payload,
+            content_type=S3ContentType.JSON,
+        )
+
+        # Keep the manifest cache synchronized with the rewritten manifest.
+        self._manifest_cache[clip_group_prefix] = rewritten_manifest
+
     async def fetch(
         self,
         *,
@@ -473,14 +565,7 @@ class ClipStore:
                 scope=None,
             ) from error
 
-        matching_entries = sorted(
-            (
-                entry
-                for entry in manifest
-                if entry.scope is clip_sub_group.scope and entry.sub_season is clip_sub_group.sub_season
-            ),
-            key=lambda entry: (entry.batch, entry.order),
-        )
+        matching_entries = self._sorted_sub_group_entries(manifest, clip_sub_group)
         if not matching_entries:
             raise ClipGroupNotFoundError(
                 year=clip_group.year,
@@ -533,6 +618,18 @@ class ClipStore:
                 _sub_season_order(sub_group.sub_season),
                 sub_group.scope.value,
             ),
+        )
+
+    @staticmethod
+    def _sorted_sub_group_entries(manifest: Manifest, clip_sub_group: ClipSubGroup) -> list[ManifestEntry]:
+        """Return sub-group entries in canonical `(batch, order)` order."""
+        return sorted(
+            (
+                entry
+                for entry in manifest
+                if entry.scope is clip_sub_group.scope and entry.sub_season is clip_sub_group.sub_season
+            ),
+            key=lambda entry: (entry.batch, entry.order),
         )
 
     def _clip_group_prefix(self, *, year: int, season: Season, universe: Universe) -> Prefix:

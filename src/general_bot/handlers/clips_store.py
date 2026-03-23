@@ -10,6 +10,7 @@ from aiogram.filters.callback_data import CallbackData
 from aiogram.fsm.context import FSMContext
 from aiogram.types import BufferedInputFile, CallbackQuery, InlineKeyboardButton, InputMediaVideo, Message
 from aiogram.utils.formatting import Bold, Text
+from loguru import logger
 
 from general_bot.domain import normalize_video_volume
 from general_bot.handlers.clips_common import (
@@ -63,6 +64,7 @@ from general_bot.settings import Settings
 from general_bot.types import ChatId
 
 router = Router()
+_TELEGRAM_MEDIA_GROUP_LIMIT = 10
 
 
 class ClipAction(StrEnum):
@@ -406,6 +408,8 @@ async def _on_store_select(
                 await handle_stale_selection(message=message, state=state)
                 return
             year, season, universe, sub_season = selection
+            clip_group = ClipGroup(year=year, season=season, universe=universe)
+            clip_sub_group = ClipSubGroup(sub_season=sub_season, scope=scope)
 
             await message.edit_text(
                 **selection_text(
@@ -420,18 +424,32 @@ async def _on_store_select(
                 ),
                 reply_markup=None,
             )
+
             result = await _store_buffered_clips(
                 bot=bot,
                 chat_id=message.chat.id,
                 services=services,
-                year=year,
-                season=season,
-                universe=universe,
-                sub_season=sub_season,
-                scope=scope,
+                clip_group=clip_group,
+                clip_sub_group=clip_sub_group,
             )
+
             await state.clear()
             await message.answer(**_store_summary_kwargs(result))
+
+            if result.stored_count > 0 and scope in {Scope.EXTRA, Scope.SOURCE}:
+                try:
+                    await services.clip_store.compact(
+                        clip_group=clip_group,
+                        clip_sub_group=clip_sub_group,
+                        batch_size=_TELEGRAM_MEDIA_GROUP_LIMIT,
+                    )
+                except Exception:
+                    logger.exception(
+                        'Post-store clip compaction failed for {} {}',
+                        clip_group,
+                        clip_sub_group,
+                    )
+                    raise
 
 
 async def _show_store_year_menu(
@@ -572,15 +590,10 @@ async def _store_buffered_clips(
     bot: Bot,
     chat_id: ChatId,
     services: Services,
-    year: int,
-    season: Season,
-    universe: Universe,
-    sub_season: SubSeason,
-    scope: Scope,
+    clip_group: ClipGroup,
+    clip_sub_group: ClipSubGroup,
 ) -> StoreResult:
     result = StoreResult(stored_count=0, duplicate_count=0)
-    clip_group = ClipGroup(year=year, season=season, universe=universe)
-    clip_sub_group = ClipSubGroup(sub_season=sub_season, scope=scope)
     message_groups = services.chat_message_buffer.flush_grouped(chat_id)
 
     for message_group in message_groups:
