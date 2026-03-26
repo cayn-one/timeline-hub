@@ -1,4 +1,6 @@
-from collections.abc import Awaitable, Callable
+import asyncio
+from collections.abc import Awaitable, Callable, Sequence
+from dataclasses import dataclass
 from datetime import date
 from enum import StrEnum, auto
 from typing import Any
@@ -30,8 +32,9 @@ from general_bot.handlers.clips.common import (
     parse_universe,
     parse_year,
     selected_text,
+    selection_keyboard,
+    selection_labels,
     selection_text,
-    stacked_keyboard,
 )
 from general_bot.handlers.clips.flow import (
     FlowMenuDefinition,
@@ -76,6 +79,7 @@ type IntakeShowMenu = Callable[..., Awaitable[bool]]
 class IntakeAction(StrEnum):
     CANCEL = auto()
     RECONCILE = auto()
+    ROUTE = auto()
     STORE = auto()
 
 
@@ -87,6 +91,20 @@ class IntakeCallbackData(CallbackData, prefix='clip_intake'):
     action: MenuAction
     step: MenuStep
     value: str
+
+
+@dataclass(slots=True)
+class _RouteBatch:
+    clip_group: ClipGroup
+    messages: list[Message]
+
+
+@dataclass(slots=True)
+class _RouteResult:
+    selection_groups: list[ClipGroup]
+    store_result: StoreResult
+    compact_groups: list[ClipGroup]
+    error_text: str | None = None
 
 
 def _pack_intake_menu_callback(action: MenuAction, step: MenuStep, value: str) -> str:
@@ -224,6 +242,48 @@ async def on_intake_action(
                 settings=settings,
                 flow=_STORE_FLOW,
             )
+
+        case IntakeAction.ROUTE:
+            await state.clear()
+            # Route is a single-shot action: flush at entry, validate after flush,
+            # never restore the buffer on failure. This is intentional to keep the
+            # UI stateless and simple; users must resend clips if validation fails.
+            route_batches, error_text = _plan_route_batches(
+                services.chat_message_buffer.flush_grouped(message.chat.id),
+                settings=settings,
+            )
+            if error_text is not None:
+                await message.edit_text(error_text, reply_markup=None)
+                return
+            if not route_batches:
+                await message.edit_text('No clips received', reply_markup=None)
+                return
+
+            route_result = await _store_route_batches(
+                bot=bot,
+                services=services,
+                route_batches=route_batches,
+            )
+            await message.edit_text(
+                **_route_selection_kwargs(route_result.selection_groups),
+                reply_markup=None,
+            )
+            await message.answer(**_store_summary_kwargs(route_result.store_result))
+
+            for clip_group in route_result.compact_groups:
+                try:
+                    await services.clip_store.compact(
+                        clip_group=clip_group,
+                        clip_sub_group=ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.SOURCE),
+                        batch_size=_TELEGRAM_MEDIA_GROUP_LIMIT,
+                    )
+                except Exception:
+                    logger.exception(
+                        'Post-store clip compaction failed for {} {}',
+                        clip_group,
+                        ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.SOURCE),
+                    )
+                    raise
 
 
 @router.callback_query(
@@ -813,6 +873,81 @@ async def _store_buffered_clips(
     return result
 
 
+def _plan_route_batches(
+    message_groups: Sequence[MessageGroup],
+    *,
+    settings: Settings,
+) -> tuple[list[_RouteBatch], str | None]:
+    batches: list[_RouteBatch] = []
+    current_route: ClipGroup | None = None
+    today = date.today()
+    allowed_years = set(
+        year_option_universe(
+            current_year=today.year,
+            min_year=settings.min_clip_year,
+        )
+    )
+
+    for message_group in message_groups:
+        for message in message_group:
+            # Route intentionally operates on video-only input. Mixed-media albums
+            # are not supported here, so non-video messages never provide route
+            # context and are skipped on purpose.
+            if message.video is None:
+                continue
+
+            caption = message.caption
+            if caption is None:
+                if current_route is None:
+                    return [], 'Missing route text'
+                next_route = current_route
+            else:
+                next_route = parse_route_text(caption)
+                if next_route is None:
+                    return [], 'Invalid route text'
+                if next_route.year not in allowed_years:
+                    return [], 'Invalid route text'
+                if next_route.season not in store_allowed_seasons(year=next_route.year, today=today):
+                    return [], 'Invalid route text'
+
+            if not batches or batches[-1].clip_group != next_route:
+                batches.append(_RouteBatch(clip_group=next_route, messages=[message]))
+            else:
+                batches[-1].messages.append(message)
+            current_route = next_route
+
+    return batches, None
+
+
+async def _store_route_batches(
+    *,
+    bot: Bot,
+    services: Services,
+    route_batches: Sequence[_RouteBatch],
+) -> _RouteResult:
+    result = StoreResult(stored_count=0, duplicate_count=0)
+    compact_groups: list[ClipGroup] = []
+    compact_group_set: set[ClipGroup] = set()
+    clip_sub_group = ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.SOURCE)
+
+    for route_batch in route_batches:
+        batch_result = await services.clip_store.store(
+            await _video_messages_to_clips(bot=bot, messages=route_batch.messages),
+            clip_group=route_batch.clip_group,
+            clip_sub_group=clip_sub_group,
+        )
+        result += batch_result
+        if batch_result.stored_count > 0 and route_batch.clip_group not in compact_group_set:
+            compact_groups.append(route_batch.clip_group)
+            compact_group_set.add(route_batch.clip_group)
+
+    return _RouteResult(
+        selection_groups=[route_batch.clip_group for route_batch in route_batches],
+        store_result=result,
+        compact_groups=compact_groups,
+    )
+
+
 async def _message_group_to_clips(
     *,
     bot: Bot,
@@ -831,6 +966,26 @@ async def _message_group_to_clips(
         )
 
     return clips
+
+
+async def _video_messages_to_clips(
+    *,
+    bot: Bot,
+    messages: Sequence[Message],
+) -> list[Clip]:
+    async def to_clip(message: Message) -> Clip:
+        if message.video is None:
+            raise ValueError('Route batches must contain only video messages')
+        return Clip(
+            filename=_telegram_clip_filename(message),
+            bytes=await download_video_bytes(bot, file_id=message.video.file_id),
+        )
+
+    # This personal bot assumes route segments stay practically small
+    # (roughly tens of clips), so downloading a whole segment at once is fine.
+    # `gather()` preserves input order, which keeps the stored clip order aligned
+    # with the original buffered message order.
+    return list(await asyncio.gather(*(to_clip(message) for message in messages)))
 
 
 def _message_group_to_filenames(message_group: MessageGroup) -> list[str]:
@@ -872,6 +1027,33 @@ def _store_season_options(*, year: int, today: date) -> list[Season]:
     return store_allowed_seasons(year=year, today=today)
 
 
+def parse_route_text(text: str) -> ClipGroup | None:
+    normalized = text.strip()
+    if len(normalized) != 4:
+        return None
+
+    year_suffix = normalized[:2]
+    season_text = normalized[2]
+    universe_text = normalized[3].lower()
+
+    if not year_suffix.isdigit() or not season_text.isdigit():
+        return None
+
+    try:
+        season = Season(int(season_text))
+    except ValueError:
+        return None
+
+    if universe_text == 'w':
+        universe = Universe.WEST
+    elif universe_text == 'e':
+        universe = Universe.EAST
+    else:
+        return None
+
+    return ClipGroup(year=2000 + int(year_suffix), season=season, universe=universe)
+
+
 def _telegram_clip_filename(message: Message) -> str:
     if message.video is not None and message.video.file_name:
         return message.video.file_name
@@ -901,14 +1083,42 @@ def _intake_action_menu_kwargs(
             '\n',
             'Select action:',
         ).as_kwargs(),
-        'reply_markup': stacked_keyboard(
+        'reply_markup': selection_keyboard(
             buttons=[
                 _create_intake_action_button(IntakeAction.STORE),
                 _create_intake_action_button(IntakeAction.RECONCILE),
-                _create_intake_action_button(IntakeAction.CANCEL),
-            ]
+                _create_intake_action_button(IntakeAction.ROUTE),
+            ],
+            back_button=_create_intake_action_button(IntakeAction.CANCEL),
         ),
     }
+
+
+def _route_selection_kwargs(route_groups: Sequence[ClipGroup]) -> dict[str, Any]:
+    parts: list[object] = []
+
+    for index, clip_group in enumerate(route_groups):
+        if index > 0:
+            parts.append('\n')
+
+        line_parts: list[object] = ['Selected: ', Bold('Route')]
+        for value in selection_labels(
+            year=clip_group.year,
+            season=clip_group.season,
+            universe=clip_group.universe,
+            scope=Scope.SOURCE,
+        ):
+            line_parts.extend([' → ', Bold(value)])
+        parts.append(Text(*line_parts))
+
+    return Text(*parts).as_kwargs()
+
+
+def _create_intake_action_button(action: IntakeAction) -> InlineKeyboardButton:
+    return InlineKeyboardButton(
+        text=action.title(),
+        callback_data=IntakeActionCallbackData(action=action).pack(),
+    )
 
 
 async def _show_intake_action_menu(
@@ -934,13 +1144,6 @@ async def _show_intake_action_menu(
         await message.edit_text('No clips received', reply_markup=None)
         return
     await message.edit_text(**kwargs)
-
-
-def _create_intake_action_button(action: IntakeAction) -> InlineKeyboardButton:
-    return InlineKeyboardButton(
-        text=action.title(),
-        callback_data=IntakeActionCallbackData(action=action).pack(),
-    )
 
 
 def _store_summary_kwargs(result: StoreResult) -> dict[str, Any]:

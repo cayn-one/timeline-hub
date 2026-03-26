@@ -1,7 +1,7 @@
 from datetime import date, timedelta
 from io import BytesIO
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock, call
 
 import pytest
 from aiogram.utils.formatting import Bold, Text
@@ -49,6 +49,7 @@ from general_bot.handlers.clips.intake import (
     on_buffered_clip_message,
     on_intake_action,
     on_intake_menu,
+    parse_route_text,
 )
 from general_bot.handlers.router import on_dummy_button
 from general_bot.services.clip_store import (
@@ -183,6 +184,7 @@ def _fake_message(
     chat_id: int = 1,
     message_id: int = 1,
     text: str | None = None,
+    caption: str | None = None,
     video=None,
     media_group_id: str | None = None,
 ):
@@ -192,7 +194,7 @@ def _fake_message(
         text=text,
         video=video,
         media_group_id=media_group_id,
-        caption=None,
+        caption=caption,
         caption_entities=None,
     )
     message.answer = AsyncMock()
@@ -256,6 +258,20 @@ def _selected_kwargs(*values: str, prompt: str | None = None, message_width: int
         '\n',
         prompt,
     ).as_kwargs()
+
+
+def _route_selected_kwargs(*routes: tuple[str, ...]) -> dict[str, object]:
+    parts: list[object] = []
+
+    for index, route in enumerate(routes):
+        if index > 0:
+            parts.append('\n')
+        line_parts: list[object] = ['Selected: ', Bold('Route')]
+        for value in route:
+            line_parts.extend([' → ', Bold(value)])
+        parts.append(Text(*line_parts))
+
+    return Text(*parts).as_kwargs()
 
 
 def test_create_padding_line_returns_two_visible_anchors_for_minimum_width() -> None:
@@ -340,6 +356,20 @@ def test_reconcile_summary_omits_zero_value_lines(
     expected: dict[str, object],
 ) -> None:
     assert _reconcile_summary_kwargs(result) == expected
+
+
+@pytest.mark.parametrize(
+    ('text', 'expected'),
+    [
+        ('242W', ClipGroup(year=2024, season=Season.S2, universe=Universe.WEST)),
+        ('215E', ClipGroup(year=2021, season=Season.S5, universe=Universe.EAST)),
+    ],
+)
+def test_parse_route_text_accepts_case_insensitive_universe(
+    text: str,
+    expected: ClipGroup,
+) -> None:
+    assert parse_route_text(text) == expected
 
 
 @pytest.mark.asyncio
@@ -466,7 +496,500 @@ async def test_clip_action_selection_includes_store_button() -> None:
     )
     reply_markup = message.answer.await_args.kwargs['reply_markup']
     _assert_three_rows(reply_markup)
-    assert _keyboard_rows(reply_markup) == [['Store'], ['Reconcile'], ['Cancel']]
+    assert _keyboard_rows(reply_markup) == [['Store'], ['Route', 'Reconcile'], ['Cancel']]
+
+
+@pytest.mark.asyncio
+async def test_route_action_stores_clips_in_caption_route_order_across_message_groups() -> None:
+    message = _fake_message(text='Select action:', chat_id=77, message_id=70)
+    callback = _fake_callback(message)
+    state = _FakeState()
+    buffer = ChatMessageBuffer()
+    buffer.append(
+        _fake_message(
+            chat_id=77,
+            message_id=1,
+            caption='251w',
+            video=_fake_video(file_id='f1', file_name='one.mp4'),
+            media_group_id='g1',
+        ),
+        chat_id=77,
+    )
+    buffer.append(_fake_message(chat_id=77, message_id=2, text='ignore me'), chat_id=77)
+    buffer.append(
+        _fake_message(
+            chat_id=77,
+            message_id=3,
+            video=_fake_video(file_id='f2', file_name='two.mp4'),
+        ),
+        chat_id=77,
+    )
+    buffer.append(_fake_message(chat_id=77, message_id=4, text='still ignored', media_group_id='g2'), chat_id=77)
+    buffer.append(
+        _fake_message(
+            chat_id=77,
+            message_id=5,
+            video=_fake_video(file_id='f3', file_name='three.mp4'),
+            media_group_id='g2',
+        ),
+        chat_id=77,
+    )
+    buffer.flush_grouped = Mock(wraps=buffer.flush_grouped)
+
+    clip_store = SimpleNamespace(
+        store=AsyncMock(return_value=StoreResult(stored_count=3, duplicate_count=0)),
+        compact=AsyncMock(),
+    )
+    services = _services(clip_store=clip_store, buffer=buffer)
+
+    bot = AsyncMock()
+    bot.get_file.side_effect = [
+        SimpleNamespace(file_path='path-1'),
+        SimpleNamespace(file_path='path-2'),
+        SimpleNamespace(file_path='path-3'),
+    ]
+    bot.download_file.side_effect = [BytesIO(b'one'), BytesIO(b'two'), BytesIO(b'three')]
+
+    await on_intake_action(
+        callback,
+        SimpleNamespace(action=IntakeAction.ROUTE),
+        bot,
+        services,
+        _settings(),
+        state,
+    )
+
+    callback.answer.assert_awaited_once()
+    buffer.flush_grouped.assert_called_once_with(77)
+    assert services.chat_message_buffer.peek(77) == []
+    clip_store.store.assert_awaited_once()
+    stored_clips = clip_store.store.await_args.args[0]
+    assert [clip.filename for clip in stored_clips] == ['one.mp4', 'two.mp4', 'three.mp4']
+    assert clip_store.store.await_args.kwargs['clip_group'] == ClipGroup(
+        year=2025,
+        season=Season.S1,
+        universe=Universe.WEST,
+    )
+    assert clip_store.store.await_args.kwargs['clip_sub_group'] == ClipSubGroup(
+        sub_season=SubSeason.NONE,
+        scope=Scope.SOURCE,
+    )
+    _assert_format_kwargs(
+        message.edit_text.await_args.kwargs,
+        _route_selected_kwargs(('2025', '1', 'West', 'Source')),
+    )
+    message.answer.assert_awaited_once_with(**Text('Stored: ', Bold('3')).as_kwargs())
+    clip_store.compact.assert_awaited_once_with(
+        clip_group=ClipGroup(year=2025, season=Season.S1, universe=Universe.WEST),
+        clip_sub_group=ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.SOURCE),
+        batch_size=intake_module._TELEGRAM_MEDIA_GROUP_LIMIT,
+    )
+    assert state.current_state is None
+    assert state.clear_count == 1
+
+
+@pytest.mark.asyncio
+async def test_route_action_splits_store_calls_when_caption_route_overrides() -> None:
+    message = _fake_message(text='Select action:', chat_id=77, message_id=71)
+    callback = _fake_callback(message)
+    state = _FakeState()
+    buffer = ChatMessageBuffer()
+    for buffered_message in [
+        _fake_message(
+            chat_id=77,
+            message_id=1,
+            caption='251w',
+            video=_fake_video(file_id='f1', file_name='one.mp4'),
+            media_group_id='g1',
+        ),
+        _fake_message(
+            chat_id=77,
+            message_id=2,
+            video=_fake_video(file_id='f2', file_name='two.mp4'),
+            media_group_id='g1',
+        ),
+        _fake_message(
+            chat_id=77,
+            message_id=3,
+            caption='242E',
+            video=_fake_video(file_id='f3', file_name='three.mp4'),
+            media_group_id='g1',
+        ),
+        _fake_message(
+            chat_id=77,
+            message_id=4,
+            video=_fake_video(file_id='f4', file_name='four.mp4'),
+            media_group_id='g1',
+        ),
+    ]:
+        buffer.append(buffered_message, chat_id=77)
+
+    clip_store = SimpleNamespace(
+        store=AsyncMock(
+            side_effect=[
+                StoreResult(stored_count=2, duplicate_count=1),
+                StoreResult(stored_count=2, duplicate_count=0),
+            ]
+        ),
+        compact=AsyncMock(),
+    )
+    services = _services(clip_store=clip_store, buffer=buffer)
+
+    bot = AsyncMock()
+    bot.get_file.side_effect = [
+        SimpleNamespace(file_path='path-1'),
+        SimpleNamespace(file_path='path-2'),
+        SimpleNamespace(file_path='path-3'),
+        SimpleNamespace(file_path='path-4'),
+    ]
+    bot.download_file.side_effect = [BytesIO(b'one'), BytesIO(b'two'), BytesIO(b'three'), BytesIO(b'four')]
+
+    await on_intake_action(
+        callback,
+        SimpleNamespace(action=IntakeAction.ROUTE),
+        bot,
+        services,
+        _settings(),
+        state,
+    )
+
+    assert clip_store.store.await_count == 2
+    first_batch = clip_store.store.await_args_list[0].args[0]
+    second_batch = clip_store.store.await_args_list[1].args[0]
+    assert [clip.filename for clip in first_batch] == ['one.mp4', 'two.mp4']
+    assert [clip.filename for clip in second_batch] == ['three.mp4', 'four.mp4']
+    assert clip_store.store.await_args_list[0].kwargs['clip_group'] == ClipGroup(
+        year=2025,
+        season=Season.S1,
+        universe=Universe.WEST,
+    )
+    assert clip_store.store.await_args_list[1].kwargs['clip_group'] == ClipGroup(
+        year=2024,
+        season=Season.S2,
+        universe=Universe.EAST,
+    )
+    assert all(
+        call.kwargs['clip_sub_group'] == ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.SOURCE)
+        for call in clip_store.store.await_args_list
+    )
+    _assert_format_kwargs(
+        message.edit_text.await_args.kwargs,
+        _route_selected_kwargs(
+            ('2025', '1', 'West', 'Source'),
+            ('2024', '2', 'East', 'Source'),
+        ),
+    )
+    message.answer.assert_awaited_once_with(
+        **Text(
+            'Stored: ',
+            Bold('4'),
+            '\n',
+            'Deduplicated: ',
+            Bold('1'),
+        ).as_kwargs()
+    )
+    assert clip_store.compact.await_args_list == [
+        call(
+            clip_group=ClipGroup(year=2025, season=Season.S1, universe=Universe.WEST),
+            clip_sub_group=ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.SOURCE),
+            batch_size=intake_module._TELEGRAM_MEDIA_GROUP_LIMIT,
+        ),
+        call(
+            clip_group=ClipGroup(year=2024, season=Season.S2, universe=Universe.EAST),
+            clip_sub_group=ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.SOURCE),
+            batch_size=intake_module._TELEGRAM_MEDIA_GROUP_LIMIT,
+        ),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_route_action_edits_missing_route_when_first_video_has_no_caption() -> None:
+    message = _fake_message(text='Select action:', chat_id=77, message_id=72)
+    callback = _fake_callback(message)
+    state = _FakeState()
+    buffer = ChatMessageBuffer()
+    buffer.append(
+        _fake_message(chat_id=77, message_id=1, video=_fake_video(file_id='f1', file_name='one.mp4')),
+        chat_id=77,
+    )
+
+    clip_store = SimpleNamespace(store=AsyncMock(), compact=AsyncMock())
+    services = _services(clip_store=clip_store, buffer=buffer)
+
+    await on_intake_action(
+        callback,
+        SimpleNamespace(action=IntakeAction.ROUTE),
+        AsyncMock(),
+        services,
+        _settings(),
+        state,
+    )
+
+    message.edit_text.assert_awaited_once_with('Missing route text', reply_markup=None)
+    message.answer.assert_not_awaited()
+    clip_store.store.assert_not_awaited()
+    clip_store.compact.assert_not_awaited()
+    # Intentional UX: Route flushes once at entry and does not restore buffered clips on failure.
+    assert services.chat_message_buffer.peek(77) == []
+
+
+@pytest.mark.asyncio
+async def test_route_action_edits_invalid_route_when_first_video_caption_is_invalid() -> None:
+    message = _fake_message(text='Select action:', chat_id=77, message_id=73)
+    callback = _fake_callback(message)
+    state = _FakeState()
+    buffer = ChatMessageBuffer()
+    buffer.append(
+        _fake_message(
+            chat_id=77,
+            message_id=1,
+            caption='bad',
+            video=_fake_video(file_id='f1', file_name='one.mp4'),
+        ),
+        chat_id=77,
+    )
+
+    clip_store = SimpleNamespace(store=AsyncMock(), compact=AsyncMock())
+    services = _services(clip_store=clip_store, buffer=buffer)
+
+    await on_intake_action(
+        callback,
+        SimpleNamespace(action=IntakeAction.ROUTE),
+        AsyncMock(),
+        services,
+        _settings(),
+        state,
+    )
+
+    message.edit_text.assert_awaited_once_with('Invalid route text', reply_markup=None)
+    message.answer.assert_not_awaited()
+    clip_store.store.assert_not_awaited()
+    clip_store.compact.assert_not_awaited()
+    assert services.chat_message_buffer.peek(77) == []
+
+
+@pytest.mark.asyncio
+async def test_route_action_ignores_standalone_text_for_routing_context() -> None:
+    message = _fake_message(text='Select action:', chat_id=77, message_id=74)
+    callback = _fake_callback(message)
+    state = _FakeState()
+    buffer = ChatMessageBuffer()
+    buffer.append(_fake_message(chat_id=77, message_id=1, text='251w'), chat_id=77)
+    buffer.append(
+        _fake_message(chat_id=77, message_id=2, video=_fake_video(file_id='f1', file_name='one.mp4')),
+        chat_id=77,
+    )
+    buffer.append(
+        _fake_message(
+            chat_id=77,
+            message_id=3,
+            text='242e',
+            media_group_id='g1',
+        ),
+        chat_id=77,
+    )
+
+    clip_store = SimpleNamespace(store=AsyncMock(), compact=AsyncMock())
+    services = _services(clip_store=clip_store, buffer=buffer)
+
+    await on_intake_action(
+        callback,
+        SimpleNamespace(action=IntakeAction.ROUTE),
+        AsyncMock(),
+        services,
+        _settings(),
+        state,
+    )
+
+    message.edit_text.assert_awaited_once_with('Missing route text', reply_markup=None)
+    message.answer.assert_not_awaited()
+    clip_store.store.assert_not_awaited()
+    clip_store.compact.assert_not_awaited()
+    assert services.chat_message_buffer.peek(77) == []
+
+
+@pytest.mark.asyncio
+async def test_route_action_fails_before_execution_when_later_video_caption_is_invalid() -> None:
+    message = _fake_message(text='Select action:', chat_id=77, message_id=75)
+    callback = _fake_callback(message)
+    state = _FakeState()
+    buffer = ChatMessageBuffer()
+    buffer.append(
+        _fake_message(
+            chat_id=77,
+            message_id=1,
+            caption='251w',
+            video=_fake_video(file_id='f1', file_name='one.mp4'),
+        ),
+        chat_id=77,
+    )
+    buffer.append(
+        _fake_message(
+            chat_id=77,
+            message_id=2,
+            video=_fake_video(file_id='f2', file_name='two.mp4'),
+        ),
+        chat_id=77,
+    )
+    buffer.append(
+        _fake_message(
+            chat_id=77,
+            message_id=3,
+            caption='oops',
+            video=_fake_video(file_id='f3', file_name='three.mp4'),
+        ),
+        chat_id=77,
+    )
+
+    clip_store = SimpleNamespace(
+        store=AsyncMock(return_value=StoreResult(stored_count=2, duplicate_count=0)),
+        compact=AsyncMock(),
+    )
+    services = _services(clip_store=clip_store, buffer=buffer)
+
+    bot = AsyncMock()
+    await on_intake_action(
+        callback,
+        SimpleNamespace(action=IntakeAction.ROUTE),
+        bot,
+        services,
+        _settings(),
+        state,
+    )
+
+    clip_store.store.assert_not_awaited()
+    message.edit_text.assert_awaited_once_with('Invalid route text', reply_markup=None)
+    message.answer.assert_not_awaited()
+    clip_store.compact.assert_not_awaited()
+    bot.get_file.assert_not_awaited()
+    bot.download_file.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_route_action_rejects_future_year_before_execution(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _FixedDate(date):
+        @classmethod
+        def today(cls) -> '_FixedDate':
+            return cls(2026, 6, 15)
+
+    monkeypatch.setattr(intake_module, 'date', _FixedDate)
+
+    message = _fake_message(text='Select action:', chat_id=77, message_id=76)
+    callback = _fake_callback(message)
+    state = _FakeState()
+    buffer = ChatMessageBuffer()
+    buffer.append(
+        _fake_message(
+            chat_id=77,
+            message_id=1,
+            caption='271w',
+            video=_fake_video(file_id='f1', file_name='one.mp4'),
+        ),
+        chat_id=77,
+    )
+
+    clip_store = SimpleNamespace(store=AsyncMock(), compact=AsyncMock())
+    services = _services(clip_store=clip_store, buffer=buffer)
+    bot = AsyncMock()
+
+    await on_intake_action(
+        callback,
+        SimpleNamespace(action=IntakeAction.ROUTE),
+        bot,
+        services,
+        _settings(),
+        state,
+    )
+
+    message.edit_text.assert_awaited_once_with('Invalid route text', reply_markup=None)
+    message.answer.assert_not_awaited()
+    clip_store.store.assert_not_awaited()
+    clip_store.compact.assert_not_awaited()
+    bot.get_file.assert_not_awaited()
+    bot.download_file.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_route_action_rejects_year_below_min_clip_year_before_execution() -> None:
+    message = _fake_message(text='Select action:', chat_id=77, message_id=77)
+    callback = _fake_callback(message)
+    state = _FakeState()
+    buffer = ChatMessageBuffer()
+    buffer.append(
+        _fake_message(
+            chat_id=77,
+            message_id=1,
+            caption='211w',
+            video=_fake_video(file_id='f1', file_name='one.mp4'),
+        ),
+        chat_id=77,
+    )
+
+    clip_store = SimpleNamespace(store=AsyncMock(), compact=AsyncMock())
+    services = _services(clip_store=clip_store, buffer=buffer)
+    bot = AsyncMock()
+
+    await on_intake_action(
+        callback,
+        SimpleNamespace(action=IntakeAction.ROUTE),
+        bot,
+        services,
+        _settings(),
+        state,
+    )
+
+    message.edit_text.assert_awaited_once_with('Invalid route text', reply_markup=None)
+    message.answer.assert_not_awaited()
+    clip_store.store.assert_not_awaited()
+    clip_store.compact.assert_not_awaited()
+    bot.get_file.assert_not_awaited()
+    bot.download_file.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_route_action_rejects_season_not_allowed_for_current_year_before_execution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _FixedDate(date):
+        @classmethod
+        def today(cls) -> '_FixedDate':
+            return cls(2026, 6, 15)
+
+    monkeypatch.setattr(intake_module, 'date', _FixedDate)
+
+    message = _fake_message(text='Select action:', chat_id=77, message_id=78)
+    callback = _fake_callback(message)
+    state = _FakeState()
+    buffer = ChatMessageBuffer()
+    buffer.append(
+        _fake_message(
+            chat_id=77,
+            message_id=1,
+            caption='264w',
+            video=_fake_video(file_id='f1', file_name='one.mp4'),
+        ),
+        chat_id=77,
+    )
+
+    clip_store = SimpleNamespace(store=AsyncMock(), compact=AsyncMock())
+    services = _services(clip_store=clip_store, buffer=buffer)
+    bot = AsyncMock()
+
+    await on_intake_action(
+        callback,
+        SimpleNamespace(action=IntakeAction.ROUTE),
+        bot,
+        services,
+        _settings(),
+        state,
+    )
+
+    message.edit_text.assert_awaited_once_with('Invalid route text', reply_markup=None)
+    message.answer.assert_not_awaited()
+    clip_store.store.assert_not_awaited()
+    clip_store.compact.assert_not_awaited()
+    bot.get_file.assert_not_awaited()
+    bot.download_file.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -797,7 +1320,7 @@ async def test_reconcile_back_from_sub_season_returns_to_clip_action_menu() -> N
 
     reply_markup = message.edit_text.await_args.kwargs['reply_markup']
     _assert_three_rows(reply_markup)
-    assert _keyboard_rows(reply_markup) == [['Store'], ['Reconcile'], ['Cancel']]
+    assert _keyboard_rows(reply_markup) == [['Store'], ['Route', 'Reconcile'], ['Cancel']]
     _assert_format_kwargs(
         message.edit_text.await_args.kwargs,
         Text(
