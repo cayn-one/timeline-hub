@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, call
 
 import pytest
+from aiogram.types import InlineKeyboardButton
 from aiogram.utils.formatting import Bold, Text
 
 import general_bot.handlers.clips.intake as intake_module
@@ -28,6 +29,7 @@ from general_bot.handlers.clips.intake import (
     IntakeCallbackData,
     ReorderCallbackData,
     ReorderClipFlow,
+    _column_right_to_left_two_row_keyboard,
     _reconcile_summary_kwargs,
     _show_store_scope_menu,
     _show_store_season_menu,
@@ -571,8 +573,22 @@ async def test_clip_action_selection_includes_store_button() -> None:
     reply_markup = message.answer.await_args.kwargs['reply_markup']
     _assert_three_rows(reply_markup)
     assert _keyboard_rows(reply_markup) == [
-        ['Route', 'Produce', 'Reorder'],
-        ['Reconcile', 'Store', 'Compact'],
+        ['Route', 'Store', 'Reorder'],
+        ['Reconcile', 'Produce', 'Compact'],
+        ['Cancel'],
+    ]
+
+
+def test_intake_action_keyboard_uses_right_to_left_columns() -> None:
+    reply_markup = _column_right_to_left_two_row_keyboard(
+        buttons=[InlineKeyboardButton(text=str(index), callback_data=str(index)) for index in range(1, 6)],
+        back_button=InlineKeyboardButton(text='Cancel', callback_data='cancel'),
+    )
+
+    _assert_three_rows(reply_markup)
+    assert _keyboard_rows(reply_markup) == [
+        ['5', '3', '1'],
+        ['4', '2'],
         ['Cancel'],
     ]
 
@@ -866,8 +882,8 @@ async def test_reorder_back_from_empty_state_returns_to_intake_action_menu() -> 
     reply_markup = message.edit_text.await_args.kwargs['reply_markup']
     _assert_three_rows(reply_markup)
     assert _keyboard_rows(reply_markup) == [
-        ['Route', 'Produce', 'Reorder'],
-        ['Reconcile', 'Store', 'Compact'],
+        ['Route', 'Store', 'Reorder'],
+        ['Reconcile', 'Produce', 'Compact'],
         ['Cancel'],
     ]
     _assert_format_kwargs(
@@ -2081,8 +2097,8 @@ async def test_reconcile_back_from_sub_season_returns_to_clip_action_menu() -> N
     reply_markup = message.edit_text.await_args.kwargs['reply_markup']
     _assert_three_rows(reply_markup)
     assert _keyboard_rows(reply_markup) == [
-        ['Route', 'Produce', 'Reorder'],
-        ['Reconcile', 'Store', 'Compact'],
+        ['Route', 'Store', 'Reorder'],
+        ['Reconcile', 'Produce', 'Compact'],
         ['Cancel'],
     ]
     _assert_format_kwargs(

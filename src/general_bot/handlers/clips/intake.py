@@ -27,6 +27,7 @@ from general_bot.handlers.clips.common import (
     create_padding_line,
     download_video_bytes,
     dummy_button,
+    ensure_three_rows,
     format_store_summary,
     handle_stale_selection,
     parse_scope,
@@ -35,10 +36,10 @@ from general_bot.handlers.clips.common import (
     parse_universe,
     parse_year,
     selected_text,
-    selection_keyboard,
     selection_labels,
     selection_text,
     set_flow_context,
+    three_row_keyboard,
     validate_flow_state,
 )
 from general_bot.handlers.clips.flow import (
@@ -1539,7 +1540,7 @@ def _intake_action_menu_kwargs(
             '\n',
             'Select action:',
         ).as_kwargs(),
-        'reply_markup': selection_keyboard(
+        'reply_markup': _column_right_to_left_two_row_keyboard(
             buttons=[
                 _create_intake_action_button(IntakeAction.REORDER),
                 _create_intake_action_button(IntakeAction.COMPACT),
@@ -1577,6 +1578,32 @@ def _create_intake_action_button(action: IntakeAction) -> InlineKeyboardButton:
     return InlineKeyboardButton(
         text=action.title(),
         callback_data=IntakeActionCallbackData(action=action).pack(),
+    )
+
+
+def _column_right_to_left_two_row_keyboard(
+    *,
+    buttons: Sequence[InlineKeyboardButton],
+    back_button: InlineKeyboardButton,
+) -> InlineKeyboardMarkup:
+    """Render intake options in right-to-left column order.
+
+    Buttons are grouped in input-order pairs as top/bottom columns, then
+    columns are rendered from right to left.
+    """
+    columns = [list(buttons[index : index + 2]) for index in range(0, len(buttons), 2)]
+    ordered_columns = list(reversed(columns))
+    top_row = [column[0] for column in ordered_columns]
+    middle_row = [column[1] for column in ordered_columns if len(column) > 1]
+    top_row, middle_row, bottom_row = ensure_three_rows(
+        top_row=top_row,
+        middle_row=middle_row,
+        bottom_row=[back_button],
+    )
+    return three_row_keyboard(
+        top_row=top_row,
+        middle_row=middle_row,
+        bottom_row=bottom_row,
     )
 
 
