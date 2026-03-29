@@ -270,6 +270,16 @@ def _assert_format_kwargs(actual: dict[str, object], expected: dict[str, object]
         assert actual[key] == value
 
 
+def _assert_route_progress_edit(edit_call, *routes: tuple[str, ...]) -> None:
+    assert edit_call.args == ()
+    _assert_format_kwargs(edit_call.kwargs, {**_route_progress_kwargs(*routes), 'reply_markup': None})
+    assert 'Route' not in edit_call.kwargs['text']
+    assert 'Selected:' not in edit_call.kwargs['text']
+    assert '·' not in edit_call.kwargs['text']
+    assert '\n\n' not in edit_call.kwargs['text']
+    assert '→' in edit_call.kwargs['text']
+
+
 def _assert_one_line_button_message(*, text: str, real_line: str, message_width: int) -> None:
     padding_line = create_padding_line(message_width)
     assert text.split('\n') == [padding_line, padding_line, real_line]
@@ -336,17 +346,15 @@ def _reorder_selected_kwargs(
     ).as_kwargs()
 
 
-def _route_selected_kwargs(*routes: tuple[str, ...]) -> dict[str, object]:
-    parts: list[object] = []
-
-    for index, route in enumerate(routes):
-        if index > 0:
-            parts.append('\n')
-        line_parts: list[object] = ['Selected: ', Bold('Route')]
-        for value in route:
-            line_parts.extend([' → ', Bold(value)])
-        parts.append(Text(*line_parts))
-
+def _route_progress_kwargs(*routes: tuple[str, ...]) -> dict[str, object]:
+    parts: list[object] = ['Routing...']
+    for route in routes:
+        line_parts: list[object] = ['→ ']
+        for index, value in enumerate(route):
+            if index > 0:
+                line_parts.append(' → ')
+            line_parts.append(Bold(value))
+        parts.extend(['\n', Text(*line_parts)])
     return Text(*parts).as_kwargs()
 
 
@@ -379,6 +387,44 @@ def test_selected_text_with_leading_text_keeps_plain_text_layout_and_segmented_b
         )
         == expected
     )
+
+
+def test_route_progress_kwargs_preserves_arrow_path_rendering_without_route_label() -> None:
+    actual = _route_progress_kwargs(
+        ('West', '2025', '1', 'Source'),
+        ('East', '2024', '2', 'Source'),
+    )
+    expected = Text(
+        'Routing...',
+        '\n',
+        Text(
+            '→ ',
+            Bold('West'),
+            ' → ',
+            Bold('2025'),
+            ' → ',
+            Bold('1'),
+            ' → ',
+            Bold('Source'),
+        ),
+        '\n',
+        Text(
+            '→ ',
+            Bold('East'),
+            ' → ',
+            Bold('2024'),
+            ' → ',
+            Bold('2'),
+            ' → ',
+            Bold('Source'),
+        ),
+    ).as_kwargs()
+
+    assert actual == expected
+    assert 'Route' not in actual['text']
+    assert 'Selected:' not in actual['text']
+    assert '·' not in actual['text']
+    assert '\n\n' not in actual['text']
 
 
 def test_handlers_package_router_imports_cleanly() -> None:
@@ -1357,9 +1403,10 @@ async def test_route_action_stores_clips_in_caption_route_order_across_message_g
         sub_season=SubSeason.NONE,
         scope=Scope.SOURCE,
     )
-    _assert_format_kwargs(
-        message.edit_text.await_args.kwargs,
-        _route_selected_kwargs(('West', '2025', '1', 'Source')),
+    assert message.edit_text.await_args_list[0] == call('Routing...', reply_markup=None)
+    _assert_route_progress_edit(
+        message.edit_text.await_args_list[1],
+        ('West', '2025', '1', 'Source'),
     )
     message.answer.assert_awaited_once_with(**Text('Stored: ', Bold('3')).as_kwargs())
     clip_store.compact.assert_awaited_once_with(
@@ -1455,12 +1502,15 @@ async def test_route_action_splits_store_calls_when_caption_route_overrides() ->
         call.kwargs['clip_sub_group'] == ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.SOURCE)
         for call in clip_store.store.await_args_list
     )
-    _assert_format_kwargs(
-        message.edit_text.await_args.kwargs,
-        _route_selected_kwargs(
-            ('West', '2025', '1', 'Source'),
-            ('East', '2024', '2', 'Source'),
-        ),
+    assert message.edit_text.await_args_list[0] == call('Routing...', reply_markup=None)
+    _assert_route_progress_edit(
+        message.edit_text.await_args_list[1],
+        ('West', '2025', '1', 'Source'),
+    )
+    _assert_route_progress_edit(
+        message.edit_text.await_args_list[2],
+        ('West', '2025', '1', 'Source'),
+        ('East', '2024', '2', 'Source'),
     )
     message.answer.assert_awaited_once_with(
         **Text(
@@ -1557,13 +1607,21 @@ async def test_route_action_updates_active_route_from_standalone_text_and_clip_c
         year=2025,
         season=Season.S2,
     )
-    _assert_format_kwargs(
-        message.edit_text.await_args.kwargs,
-        _route_selected_kwargs(
-            ('West', '2025', '1', 'Source'),
-            ('East', '2024', '2', 'Source'),
-            ('West', '2025', '2', 'Source'),
-        ),
+    assert message.edit_text.await_args_list[0] == call('Routing...', reply_markup=None)
+    _assert_route_progress_edit(
+        message.edit_text.await_args_list[1],
+        ('West', '2025', '1', 'Source'),
+    )
+    _assert_route_progress_edit(
+        message.edit_text.await_args_list[2],
+        ('West', '2025', '1', 'Source'),
+        ('East', '2024', '2', 'Source'),
+    )
+    _assert_route_progress_edit(
+        message.edit_text.await_args_list[3],
+        ('West', '2025', '1', 'Source'),
+        ('East', '2024', '2', 'Source'),
+        ('West', '2025', '2', 'Source'),
     )
     message.answer.assert_awaited_once_with(**Text('Stored: ', Bold('4')).as_kwargs())
     assert clip_store.compact.await_args_list == [
@@ -1689,9 +1747,10 @@ async def test_route_action_uses_latest_valid_pre_clip_text_before_first_video()
         season=Season.S1,
     )
     message.answer.assert_awaited_once_with(**Text('Stored: ', Bold('1')).as_kwargs())
-    _assert_format_kwargs(
-        message.edit_text.await_args.kwargs,
-        _route_selected_kwargs(('West', '2025', '1', 'Source')),
+    assert message.edit_text.await_args_list[0] == call('Routing...', reply_markup=None)
+    _assert_route_progress_edit(
+        message.edit_text.await_args_list[1],
+        ('West', '2025', '1', 'Source'),
     )
     clip_store.compact.assert_awaited_once_with(
         clip_group=ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1),
@@ -1738,9 +1797,10 @@ async def test_route_action_ignores_invalid_pre_clip_text_until_valid_route_text
         year=2024,
         season=Season.S2,
     )
-    _assert_format_kwargs(
-        message.edit_text.await_args.kwargs,
-        _route_selected_kwargs(('East', '2024', '2', 'Source')),
+    assert message.edit_text.await_args_list[0] == call('Routing...', reply_markup=None)
+    _assert_route_progress_edit(
+        message.edit_text.await_args_list[1],
+        ('East', '2024', '2', 'Source'),
     )
     assert services.chat_message_buffer.peek(77) == []
 

@@ -377,14 +377,19 @@ async def on_intake_action(
                 await message.edit_text('No clips received', reply_markup=None)
                 return
 
+            await message.edit_text('Routing...', reply_markup=None)
+
+            async def update_route_progress(selection_groups: Sequence[ClipGroup]) -> None:
+                await message.edit_text(
+                    **_route_progress_kwargs(selection_groups),
+                    reply_markup=None,
+                )
+
             route_result = await _store_route_batches(
                 bot=bot,
                 services=services,
                 route_batches=route_batches,
-            )
-            await message.edit_text(
-                **_route_selection_kwargs(route_result.selection_groups),
-                reply_markup=None,
+                on_batch_stored=update_route_progress,
             )
             await message.answer(**_store_summary_kwargs(route_result.store_result))
 
@@ -1209,10 +1214,12 @@ async def _store_route_batches(
     bot: Bot,
     services: Services,
     route_batches: Sequence[_RouteBatch],
+    on_batch_stored: Callable[[Sequence[ClipGroup]], Awaitable[None]] | None = None,
 ) -> _RouteResult:
     result = StoreResult(stored_count=0, duplicate_count=0)
     compact_groups: list[ClipGroup] = []
     compact_group_set: set[ClipGroup] = set()
+    selection_groups: list[ClipGroup] = []
     clip_sub_group = ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.SOURCE)
 
     for route_batch in route_batches:
@@ -1222,12 +1229,15 @@ async def _store_route_batches(
             clip_sub_group=clip_sub_group,
         )
         result += batch_result
+        selection_groups.append(route_batch.clip_group)
+        if on_batch_stored is not None:
+            await on_batch_stored(selection_groups)
         if batch_result.stored_count > 0 and route_batch.clip_group not in compact_group_set:
             compact_groups.append(route_batch.clip_group)
             compact_group_set.add(route_batch.clip_group)
 
     return _RouteResult(
-        selection_groups=[route_batch.clip_group for route_batch in route_batches],
+        selection_groups=selection_groups,
         store_result=result,
         compact_groups=compact_groups,
     )
@@ -1583,24 +1593,34 @@ def _intake_action_menu_kwargs(
     }
 
 
-def _route_selection_kwargs(route_groups: Sequence[ClipGroup]) -> dict[str, Any]:
-    parts: list[object] = []
+def _route_progress_kwargs(route_groups: Sequence[ClipGroup]) -> dict[str, Any]:
+    parts: list[object] = ['Routing...']
 
-    for index, clip_group in enumerate(route_groups):
-        if index > 0:
-            parts.append('\n')
-
-        line_parts: list[object] = ['Selected: ', Bold('Route')]
-        for value in selection_labels(
-            universe=clip_group.universe,
-            year=clip_group.year,
-            season=clip_group.season,
-            scope=Scope.SOURCE,
-        ):
-            line_parts.extend([' → ', Bold(value)])
-        parts.append(Text(*line_parts))
+    for clip_group in route_groups:
+        parts.extend(
+            [
+                '\n',
+                _route_progress_line(
+                    selection_labels(
+                        universe=clip_group.universe,
+                        year=clip_group.year,
+                        season=clip_group.season,
+                        scope=Scope.SOURCE,
+                    )
+                ),
+            ]
+        )
 
     return Text(*parts).as_kwargs()
+
+
+def _route_progress_line(values: Sequence[str]) -> Text:
+    parts: list[object] = ['→ ']
+    for index, value in enumerate(values):
+        if index > 0:
+            parts.append(' → ')
+        parts.append(Bold(value))
+    return Text(*parts)
 
 
 def _create_intake_action_button(action: IntakeAction) -> InlineKeyboardButton:
