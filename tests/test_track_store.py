@@ -45,11 +45,11 @@ class _FakeS3Client:
         self.get_calls: list[str] = []
         self.deleted_keys: list[str] = []
 
-    async def put_bytes(self, key: str, *, bytes_: bytes, content_type: str | None = None) -> None:
-        self.put_calls.append((key, bytes_, content_type))
+    async def put_bytes(self, key: str, data: bytes, *, content_type: str | None = None) -> None:
+        self.put_calls.append((key, data, content_type))
         if key in self.put_failures:
             raise RuntimeError(f'boom putting {key}')
-        self.objects[key] = bytes_
+        self.objects[key] = data
 
     async def get_bytes(self, key: str) -> bytes:
         self.get_calls.append(key)

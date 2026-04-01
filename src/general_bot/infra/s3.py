@@ -136,15 +136,15 @@ class S3Client:
     async def put_bytes(
         self,
         key: Key,
+        data: bytes,
         *,
-        bytes_: bytes,
         content_type: S3ContentType | str | None = None,
     ) -> None:
         """Store in-memory bytes as a single object."""
         kwargs: dict[str, object] = {
             'Bucket': self._config.bucket,
             'Key': key,
-            'Body': bytes_,
+            'Body': data,
         }
         if content_type is not None:
             kwargs['ContentType'] = content_type

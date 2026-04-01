@@ -490,14 +490,14 @@ class ClipStore:
                 clip_key = self._clip_key(clip_group_prefix, entry.id)
                 await self._s3_client.put_bytes(
                     clip_key,
-                    bytes_=clip.bytes,
+                    clip.bytes,
                     content_type=S3ContentType.MP4,
                 )
                 uploaded_keys.append(clip_key)
 
             await self._s3_client.put_bytes(
                 manifest_key,
-                bytes_=manifest_payload,
+                manifest_payload,
                 content_type=S3ContentType.JSON,
             )
         except Exception as error:
@@ -600,7 +600,7 @@ class ClipStore:
         # Compaction is manifest-only; clip objects stay untouched.
         await self._s3_client.put_bytes(
             manifest_key,
-            bytes_=manifest_payload,
+            manifest_payload,
             content_type=S3ContentType.JSON,
         )
 
@@ -777,7 +777,7 @@ class ClipStore:
 
         await self._s3_client.put_bytes(
             manifest_key,
-            bytes_=manifest_payload,
+            manifest_payload,
             content_type=S3ContentType.JSON,
         )
 

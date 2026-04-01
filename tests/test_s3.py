@@ -121,7 +121,7 @@ async def test_operation_before_open_raises_clear_error(monkeypatch: pytest.Monk
     storage = S3Client(_config())
 
     with pytest.raises(RuntimeError) as exc:
-        await storage.put_bytes('x', bytes_=b'data')
+        await storage.put_bytes('x', b'data')
 
     assert 'not open' in str(exc.value)
     assert 'await client.open()' in str(exc.value)

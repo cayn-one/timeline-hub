@@ -542,21 +542,21 @@ class TrackStore:
         try:
             await self._s3_client.put_bytes(
                 track_key,
-                bytes_=track_bytes,
+                track_bytes,
                 content_type=S3ContentType.OPUS,
             )
             uploaded_keys.append(track_key)
 
             await self._s3_client.put_bytes(
                 cover_key,
-                bytes_=cover_bytes,
+                cover_bytes,
                 content_type=S3ContentType.JPEG,
             )
             uploaded_keys.append(cover_key)
 
             await self._s3_client.put_bytes(
                 manifest_key,
-                bytes_=manifest_payload,
+                manifest_payload,
                 content_type=S3ContentType.JSON,
             )
         except Exception as error:
@@ -641,7 +641,7 @@ class TrackStore:
             presets = self._bootstrap_presets()
             await self._s3_client.put_bytes(
                 presets_key,
-                bytes_=json.dumps(presets.to_dict(), separators=(',', ':')).encode('utf-8'),
+                json.dumps(presets.to_dict(), separators=(',', ':')).encode('utf-8'),
                 content_type=S3ContentType.JSON,
             )
             self._presets_cache = presets
