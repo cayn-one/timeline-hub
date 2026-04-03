@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from enum import IntEnum, StrEnum
 from typing import Any, Self, TypeVar
 
+from loguru import logger
+
 from general_bot.infra.ffmpeg import hash_video_content, normalize_audio_loudness
 from general_bot.infra.s3 import Key, Prefix, S3Client, S3ContentType, S3ObjectNotFoundError
 
@@ -138,7 +140,13 @@ class AudioNormalization:
 
 @dataclass(frozen=True, slots=True)
 class ManifestEntry:
-    """Single persisted clip row in a clip-group manifest."""
+    """Single persisted clip row in a clip-group manifest.
+
+    `audio_normalization` records the currently authoritative normalized-cache
+    parameters for this clip. `None` means no normalized clip is tracked in
+    authoritative state, even if an untracked stale normalized object still
+    exists in storage after a failed cache write.
+    """
 
     id: ClipId
     video_hash: str
@@ -146,6 +154,7 @@ class ManifestEntry:
     scope: Scope
     batch: int
     order: int
+    audio_normalization: AudioNormalization | None = None
 
 
 class Manifest:
@@ -192,6 +201,14 @@ class Manifest:
             {
                 'id': entry.id,
                 'video_hash': entry.video_hash,
+                'audio_normalization': (
+                    None
+                    if entry.audio_normalization is None
+                    else {
+                        'loudness': entry.audio_normalization.loudness,
+                        'bitrate': entry.audio_normalization.bitrate,
+                    }
+                ),
                 'sub_season': entry.sub_season.value,
                 'scope': entry.scope.value,
                 'batch': entry.batch,
@@ -221,11 +238,20 @@ class Manifest:
         for raw_entry in data:
             if not isinstance(raw_entry, dict):
                 raise ValueError('manifest clip entry must be an object')
-            if set(raw_entry) != {'id', 'video_hash', 'sub_season', 'scope', 'batch', 'order'}:
+            if set(raw_entry) != {
+                'id',
+                'video_hash',
+                'audio_normalization',
+                'sub_season',
+                'scope',
+                'batch',
+                'order',
+            }:
                 raise ValueError('manifest clip entry has unexpected fields')
 
             clip_id = _parse_uuid7(_expect_str(raw_entry['id'], field='id'), field='id')
             video_hash = _parse_sha256_hex(_expect_str(raw_entry['video_hash'], field='video_hash'))
+            audio_normalization = _parse_audio_normalization(raw_entry['audio_normalization'])
             sub_season = _parse_sub_season(raw_entry['sub_season'])
             scope = _parse_enum(raw_entry['scope'], Scope, field='scope')
 
@@ -260,6 +286,7 @@ class Manifest:
                 ManifestEntry(
                     id=clip_id,
                     video_hash=video_hash,
+                    audio_normalization=audio_normalization,
                     sub_season=sub_season,
                     scope=scope,
                     batch=batch,
@@ -394,6 +421,26 @@ class ReconcileDeleteError(RuntimeError):
         super().__init__(f'Reconcile cleanup failed for {len(self.failed_keys)} removed keys: {list(self.failed_keys)}')
 
 
+class NormalizedClipManifestSyncError(RuntimeError):
+    """Raised when normalized clip uploads cannot be synchronized with manifest state."""
+
+    def __init__(
+        self,
+        *,
+        written_keys: Sequence[Key],
+        affected_clip_ids: Sequence[ClipId],
+        stage: str,
+    ) -> None:
+        self.written_keys = tuple(written_keys)
+        self.affected_clip_ids = tuple(affected_clip_ids)
+        self.stage = stage
+        super().__init__(
+            'Normalized clip/manifest synchronization failed '
+            f'at stage={self.stage} for clip ids {list(self.affected_clip_ids)} '
+            f'after writing normalized keys {list(self.written_keys)}'
+        )
+
+
 class ClipStore:
     """Domain-specific wrapper over `S3Client` for grouped clip storage.
 
@@ -412,6 +459,12 @@ class ClipStore:
     listing is manifest-based. Store operations stage uploads first and commit
     by writing the updated manifest. If commit fails after clip uploads begin,
     uploaded objects from that call are rolled back on a best-effort basis.
+
+    Normalized clips are cache-like derived artifacts, not authoritative
+    storage state. The manifest is the source of truth for whether a
+    normalized clip is tracked for a clip id; untracked normalized objects may
+    still exist in storage temporarily after failed cache writes and are
+    treated as stale cache.
     """
 
     def __init__(self, s3_client: S3Client) -> None:
@@ -486,6 +539,7 @@ class ClipStore:
             entry = ManifestEntry(
                 id=clip_id,
                 video_hash=video_hash,
+                audio_normalization=None,
                 sub_season=sub_group.sub_season,
                 scope=sub_group.scope,
                 batch=batch,
@@ -596,6 +650,7 @@ class ClipStore:
                     ManifestEntry(
                         id=entry.id,
                         video_hash=entry.video_hash,
+                        audio_normalization=entry.audio_normalization,
                         sub_season=entry.sub_season,
                         scope=entry.scope,
                         batch=compacted_batch,
@@ -693,6 +748,9 @@ class ClipStore:
         or rewrites clip bytes. It only rewrites the manifest and deletes clip
         objects that become unreachable from the final manifest.
 
+        The manifest remains authoritative for normalized-cache tracking.
+        Untracked normalized objects are treated as stale cache, not storage state.
+
         Precondition:
             `filename_batches` must refer to clips belonging to the provided
             `clip_group`. Callers are expected to validate and derive the
@@ -766,6 +824,7 @@ class ClipStore:
                     ManifestEntry(
                         id=clip_id,
                         video_hash=existing_entry.video_hash,
+                        audio_normalization=existing_entry.audio_normalization,
                         sub_season=sub_group.sub_season,
                         scope=sub_group.scope,
                         batch=batch_index,
@@ -800,11 +859,20 @@ class ClipStore:
         removed_ids = old_subgroup_ids - new_subgroup_ids
         failed_keys: list[Key] = []
         for removed_id in removed_ids:
-            clip_key = self._clip_key(clip_group_prefix, removed_id)
+            removed_entry = entries_by_id[removed_id]
+            raw_clip_key = self._clip_key(clip_group_prefix, removed_id)
             try:
-                await self._s3_client.delete_key(clip_key)
+                await self._s3_client.delete_key(raw_clip_key)
             except Exception:
-                failed_keys.append(clip_key)
+                logger.exception('Failed to delete key {}', raw_clip_key)
+                failed_keys.append(raw_clip_key)
+            if removed_entry.audio_normalization is not None:
+                normalized_clip_key = self._normalized_clip_key(clip_group_prefix, removed_id)
+                try:
+                    await self._s3_client.delete_key(normalized_clip_key)
+                except Exception:
+                    logger.exception('Failed to delete key {}', normalized_clip_key)
+                    failed_keys.append(normalized_clip_key)
 
         if failed_keys:
             raise ReconcileDeleteError(failed_keys=failed_keys)
@@ -895,23 +963,22 @@ class ClipStore:
         # `groupby()` only forms correct batch groups because entries are
         # sorted by `(batch, order)` immediately above.
         for _, batch_entries in itertools.groupby(matching_entries, key=lambda entry: entry.batch):
-            clip_batch: list[Clip] = []
-            for entry in batch_entries:
-                clip_key = self._clip_key(clip_group_prefix, entry.id)
-                clip_bytes = await self._s3_client.get_bytes(clip_key)
-                clip_batch.append(Clip(filename=self._s3_key_to_filename(clip_key), bytes=clip_bytes))
-            if audio_normalization is not None:
-                clip_batch = [
-                    Clip(
-                        filename=clip.filename,
-                        bytes=await normalize_audio_loudness(
-                            clip.bytes,
-                            loudness=audio_normalization.loudness,
-                            bitrate=audio_normalization.bitrate,
-                        ),
-                    )
-                    for clip in clip_batch
-                ]
+            batch_entries_list = list(batch_entries)
+            if audio_normalization is None:
+                clip_batch: list[Clip] = []
+                for entry in batch_entries_list:
+                    clip_key = self._clip_key(clip_group_prefix, entry.id)
+                    clip_bytes = await self._s3_client.get_bytes(clip_key)
+                    clip_batch.append(Clip(filename=self._s3_key_to_filename(clip_key), bytes=clip_bytes))
+                yield clip_batch
+                continue
+
+            clip_batch, manifest = await self._fetch_normalized_batch(
+                clip_group_prefix,
+                manifest,
+                batch_entries_list,
+                audio_normalization=audio_normalization,
+            )
             yield clip_batch
 
     async def list_groups(self) -> list[ClipGroup]:
@@ -990,6 +1057,9 @@ class ClipStore:
     def _clip_key(self, clip_group_prefix: Prefix, clip_id: ClipId) -> Key:
         return S3Client.join(clip_group_prefix, clip_id + _VIDEO_SUFFIX)
 
+    def _normalized_clip_key(self, clip_group_prefix: Prefix, clip_id: ClipId) -> Key:
+        return S3Client.join(clip_group_prefix, clip_id + '-normalized' + _VIDEO_SUFFIX)
+
     def _new_clip_id(self, *, manifest: Manifest, seen_ids: set[ClipId]) -> ClipId:
         """Return a fresh hex UUIDv7 clip id for a newly created S3 clip object.
 
@@ -1065,6 +1135,124 @@ class ClipStore:
         if failed_keys:
             raise ClipStoreRollbackError(failed_keys=failed_keys)
 
+    async def _fetch_normalized_batch(
+        self,
+        clip_group_prefix: Prefix,
+        manifest: Manifest,
+        batch_entries: Sequence[ManifestEntry],
+        *,
+        audio_normalization: AudioNormalization,
+    ) -> tuple[list[Clip], Manifest]:
+        clip_batch: list[Clip | None] = [None] * len(batch_entries)
+        rewritten_entries: dict[ClipId, ManifestEntry] = {}
+        uploaded_keys: list[Key] = []
+        affected_clip_ids: list[ClipId] = []
+
+        try:
+            for index, entry in enumerate(batch_entries):
+                filename = self._s3_key_to_filename(self._clip_key(clip_group_prefix, entry.id))
+                normalized_key = self._normalized_clip_key(clip_group_prefix, entry.id)
+
+                if entry.audio_normalization == audio_normalization:
+                    try:
+                        normalized_bytes = await self._s3_client.get_bytes(normalized_key)
+                    except S3ObjectNotFoundError:
+                        normalized_bytes = await self._regenerate_normalized_twin(
+                            clip_group_prefix,
+                            entry,
+                            audio_normalization=audio_normalization,
+                            normalized_key=normalized_key,
+                        )
+                        uploaded_keys.append(normalized_key)
+                        affected_clip_ids.append(entry.id)
+                        rewritten_entries[entry.id] = ManifestEntry(
+                            id=entry.id,
+                            video_hash=entry.video_hash,
+                            audio_normalization=audio_normalization,
+                            sub_season=entry.sub_season,
+                            scope=entry.scope,
+                            batch=entry.batch,
+                            order=entry.order,
+                        )
+                    clip_batch[index] = Clip(filename=filename, bytes=normalized_bytes)
+                    continue
+
+                normalized_bytes = await self._regenerate_normalized_twin(
+                    clip_group_prefix,
+                    entry,
+                    audio_normalization=audio_normalization,
+                    normalized_key=normalized_key,
+                )
+                uploaded_keys.append(normalized_key)
+                affected_clip_ids.append(entry.id)
+                rewritten_entries[entry.id] = ManifestEntry(
+                    id=entry.id,
+                    video_hash=entry.video_hash,
+                    audio_normalization=audio_normalization,
+                    sub_season=entry.sub_season,
+                    scope=entry.scope,
+                    batch=entry.batch,
+                    order=entry.order,
+                )
+                clip_batch[index] = Clip(filename=filename, bytes=normalized_bytes)
+        except Exception as error:
+            if uploaded_keys:
+                sync_error = NormalizedClipManifestSyncError(
+                    written_keys=uploaded_keys,
+                    affected_clip_ids=affected_clip_ids,
+                    stage='before_manifest_write',
+                )
+                sync_error.add_note(f'Original normalized twin write error: {error!r}')
+                raise sync_error from error
+            raise
+
+        if not rewritten_entries:
+            return [clip for clip in clip_batch if clip is not None], manifest
+
+        rewritten_manifest = Manifest([rewritten_entries.get(entry.id, entry) for entry in manifest])
+        manifest_key = self._manifest_key(clip_group_prefix)
+        manifest_payload = json.dumps(rewritten_manifest.to_list(), separators=(',', ':')).encode('utf-8')
+
+        try:
+            await self._s3_client.put_bytes(
+                manifest_key,
+                manifest_payload,
+                content_type=S3ContentType.JSON,
+            )
+        except Exception as error:
+            sync_error = NormalizedClipManifestSyncError(
+                written_keys=uploaded_keys,
+                affected_clip_ids=affected_clip_ids,
+                stage='manifest_write',
+            )
+            sync_error.add_note(f'Original manifest write error: {error!r}')
+            raise sync_error from error
+
+        self._manifest_cache[clip_group_prefix] = rewritten_manifest
+        return [clip for clip in clip_batch if clip is not None], rewritten_manifest
+
+    async def _regenerate_normalized_twin(
+        self,
+        clip_group_prefix: Prefix,
+        entry: ManifestEntry,
+        *,
+        audio_normalization: AudioNormalization,
+        normalized_key: Key,
+    ) -> bytes:
+        raw_clip_key = self._clip_key(clip_group_prefix, entry.id)
+        raw_bytes = await self._s3_client.get_bytes(raw_clip_key)
+        normalized_bytes = await normalize_audio_loudness(
+            raw_bytes,
+            loudness=audio_normalization.loudness,
+            bitrate=audio_normalization.bitrate,
+        )
+        await self._s3_client.put_bytes(
+            normalized_key,
+            normalized_bytes,
+            content_type=S3ContentType.MP4,
+        )
+        return normalized_bytes
+
     @staticmethod
     def _s3_key_to_filename(storage_key: Key) -> str:
         return _FILENAME_S3_DELIMITER_ESCAPE.join(S3Client.split(storage_key))
@@ -1076,6 +1264,22 @@ class ClipStore:
 
 def _uuid7() -> uuid.UUID:
     return uuid.uuid7()
+
+
+def _parse_audio_normalization(value: object) -> AudioNormalization | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError('manifest `audio_normalization` must be an object or null')
+    if set(value) != {'loudness', 'bitrate'}:
+        raise ValueError('manifest `audio_normalization` has unexpected fields')
+    try:
+        return AudioNormalization(
+            loudness=value['loudness'],
+            bitrate=value['bitrate'],
+        )
+    except ValueError as error:
+        raise ValueError(f'manifest `audio_normalization` is invalid: {error}') from error
 
 
 _ClipStrEnum = TypeVar('_ClipStrEnum', bound=StrEnum)
