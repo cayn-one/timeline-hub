@@ -6,7 +6,17 @@ import pytest
 from botocore.exceptions import ClientError
 
 import general_bot.infra.s3 as s3_module
-from general_bot.infra.s3 import S3Client, S3Config, S3ObjectNotFoundError
+from general_bot.infra.s3 import (
+    S3BatchDeleteError,
+    S3Client,
+    S3Config,
+    S3DeleteObjectError,
+    S3GetObjectError,
+    S3HeadObjectError,
+    S3ListObjectsError,
+    S3ObjectNotFoundError,
+    S3PutObjectError,
+)
 
 
 def _client_error(code: str, operation: str) -> ClientError:
@@ -149,6 +159,87 @@ async def test_get_bytes_missing_key_raises_object_not_found(
 
 
 @pytest.mark.asyncio
+async def test_put_bytes_wraps_backend_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _Client:
+        async def put_object(self, **_kwargs):
+            raise TimeoutError('timed out')
+
+    monkeypatch.setattr(s3_module, 'get_session', lambda: _FakeSession(_Client()))
+
+    storage = S3Client(_config())
+    await storage.open()
+
+    with pytest.raises(S3PutObjectError) as exc:
+        await storage.put_bytes('clips/a.bin', b'data')
+
+    await storage.close()
+    assert exc.value.bucket == 'bucket'
+    assert exc.value.key == 'clips/a.bin'
+    assert str(exc.value) == 'S3 put failed for key clips/a.bin in bucket bucket'
+    assert isinstance(exc.value.__cause__, TimeoutError)
+
+
+@pytest.mark.asyncio
+async def test_get_bytes_wraps_non_not_found_backend_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Client:
+        async def get_object(self, **_kwargs):
+            raise _client_error('AccessDenied', 'GetObject')
+
+    monkeypatch.setattr(s3_module, 'get_session', lambda: _FakeSession(_Client()))
+
+    storage = S3Client(_config())
+    await storage.open()
+
+    with pytest.raises(S3GetObjectError) as exc:
+        await storage.get_bytes('secret.txt')
+
+    await storage.close()
+    assert exc.value.bucket == 'bucket'
+    assert exc.value.key == 'secret.txt'
+    assert str(exc.value) == 'S3 get failed for key secret.txt in bucket bucket'
+    assert isinstance(exc.value.__cause__, ClientError)
+
+
+@pytest.mark.asyncio
+async def test_exists_returns_false_for_not_found(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _Client:
+        async def head_object(self, **_kwargs):
+            raise _client_error('NotFound', 'HeadObject')
+
+    monkeypatch.setattr(s3_module, 'get_session', lambda: _FakeSession(_Client()))
+
+    storage = S3Client(_config())
+    await storage.open()
+
+    assert await storage.exists('missing.txt') is False
+
+    await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_exists_wraps_non_not_found_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _Client:
+        async def head_object(self, **_kwargs):
+            raise ConnectionError('network down')
+
+    monkeypatch.setattr(s3_module, 'get_session', lambda: _FakeSession(_Client()))
+
+    storage = S3Client(_config())
+    await storage.open()
+
+    with pytest.raises(S3HeadObjectError) as exc:
+        await storage.exists('x')
+
+    await storage.close()
+    assert exc.value.bucket == 'bucket'
+    assert exc.value.key == 'x'
+    assert str(exc.value) == 'S3 head failed for key x in bucket bucket'
+    assert isinstance(exc.value.__cause__, ConnectionError)
+
+
+@pytest.mark.asyncio
 async def test_list_keys_collects_all_pages(monkeypatch: pytest.MonkeyPatch) -> None:
     class _Client:
         def __init__(self) -> None:
@@ -179,27 +270,24 @@ async def test_list_keys_collects_all_pages(monkeypatch: pytest.MonkeyPatch) -> 
 
 
 @pytest.mark.asyncio
-async def test_list_prefixes_without_prefix_lists_bucket_root(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+async def test_list_keys_wraps_backend_failure(monkeypatch: pytest.MonkeyPatch) -> None:
     class _Client:
-        async def list_objects_v2(self, **kwargs):
-            assert kwargs['Bucket'] == 'bucket'
-            assert kwargs['Delimiter'] == '/'
-            assert 'Prefix' not in kwargs
-            return {
-                'CommonPrefixes': [{'Prefix': 'a/'}, {'Prefix': 'b/'}],
-                'IsTruncated': False,
-            }
+        async def list_objects_v2(self, **_kwargs):
+            raise RuntimeError('boom')
 
     monkeypatch.setattr(s3_module, 'get_session', lambda: _FakeSession(_Client()))
 
     storage = S3Client(_config())
     await storage.open()
-    prefixes = await storage.list_prefixes()
-    await storage.close()
 
-    assert prefixes == ['a/', 'b/']
+    with pytest.raises(S3ListObjectsError) as exc:
+        await storage.list_keys('a/')
+
+    await storage.close()
+    assert exc.value.bucket == 'bucket'
+    assert exc.value.prefix == 'a/'
+    assert str(exc.value) == 'S3 list failed for prefix a/ in bucket bucket'
+    assert isinstance(exc.value.__cause__, RuntimeError)
 
 
 @pytest.mark.asyncio
@@ -224,6 +312,74 @@ async def test_list_subprefixes_normalizes_parent_prefix(
     await storage.close()
 
     assert prefixes == ['a/1/', 'a/2/']
+
+
+@pytest.mark.asyncio
+async def test_list_keys_empty_prefix_matches_no_prefix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Client:
+        async def list_objects_v2(self, **kwargs):
+            assert 'Prefix' not in kwargs
+            return {
+                'Contents': [{'Key': 'a/1'}],
+                'IsTruncated': False,
+            }
+
+    monkeypatch.setattr(s3_module, 'get_session', lambda: _FakeSession(_Client()))
+
+    storage = S3Client(_config())
+    await storage.open()
+    keys = await storage.list_keys('')
+    await storage.close()
+
+    assert keys == ['a/1']
+
+
+@pytest.mark.asyncio
+async def test_list_subprefixes_empty_prefix_matches_no_prefix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Client:
+        async def list_objects_v2(self, **kwargs):
+            assert kwargs['Delimiter'] == '/'
+            assert 'Prefix' not in kwargs
+            return {
+                'CommonPrefixes': [{'Prefix': 'a/'}, {'Prefix': 'b/'}],
+                'IsTruncated': False,
+            }
+
+    monkeypatch.setattr(s3_module, 'get_session', lambda: _FakeSession(_Client()))
+
+    storage = S3Client(_config())
+    await storage.open()
+    prefixes = await storage.list_subprefixes('')
+    await storage.close()
+
+    assert prefixes == ['a/', 'b/']
+
+
+@pytest.mark.asyncio
+async def test_list_subprefixes_wraps_backend_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Client:
+        async def list_objects_v2(self, **_kwargs):
+            raise _client_error('InternalError', 'ListObjectsV2')
+
+    monkeypatch.setattr(s3_module, 'get_session', lambda: _FakeSession(_Client()))
+
+    storage = S3Client(_config())
+    await storage.open()
+
+    with pytest.raises(S3ListObjectsError) as exc:
+        await storage.list_subprefixes('a')
+
+    await storage.close()
+    assert exc.value.bucket == 'bucket'
+    assert exc.value.prefix == 'a/'
+    assert str(exc.value) == 'S3 list failed for prefix a/ in bucket bucket'
+    assert isinstance(exc.value.__cause__, ClientError)
 
 
 @pytest.mark.asyncio
@@ -270,7 +426,28 @@ async def test_delete_prefix_batches_and_counts_deleted_objects(
 
 
 @pytest.mark.asyncio
-async def test_delete_prefix_raises_on_partial_delete_failure(
+async def test_delete_key_wraps_backend_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _Client:
+        async def delete_object(self, **_kwargs):
+            raise _client_error('AccessDenied', 'DeleteObject')
+
+    monkeypatch.setattr(s3_module, 'get_session', lambda: _FakeSession(_Client()))
+
+    storage = S3Client(_config())
+    await storage.open()
+
+    with pytest.raises(S3DeleteObjectError) as exc:
+        await storage.delete_key('p/1')
+
+    await storage.close()
+    assert exc.value.bucket == 'bucket'
+    assert exc.value.key == 'p/1'
+    assert str(exc.value) == 'S3 delete failed for key p/1 in bucket bucket'
+    assert isinstance(exc.value.__cause__, ClientError)
+
+
+@pytest.mark.asyncio
+async def test_delete_prefix_raises_batch_delete_error_on_partial_delete_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class _Client:
@@ -291,11 +468,86 @@ async def test_delete_prefix_raises_on_partial_delete_failure(
     storage = S3Client(_config())
     await storage.open()
 
-    with pytest.raises(RuntimeError) as exc:
+    with pytest.raises(S3BatchDeleteError) as exc:
         await storage.delete_prefix('p/')
 
     await storage.close()
-    assert 'Failed to delete 1 objects' in str(exc.value)
+    assert exc.value.bucket == 'bucket'
+    assert exc.value.keys == ['p/1', 'p/2']
+    assert exc.value.delete_errors == [{'Key': 'p/2', 'Code': 'AccessDenied'}]
+    assert "S3 batch delete failed for keys ['p/1', 'p/2'] in bucket bucket" in str(exc.value)
+    assert "backend reported delete errors [{'Key': 'p/2', 'Code': 'AccessDenied'}]" in str(exc.value)
+
+
+@pytest.mark.asyncio
+async def test_delete_prefix_wraps_delete_request_failure_as_batch_delete_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Client:
+        async def list_objects_v2(self, **_kwargs):
+            return {
+                'Contents': [{'Key': 'p/1'}, {'Key': 'p/2'}],
+                'IsTruncated': False,
+            }
+
+        async def delete_objects(self, **_kwargs):
+            raise TimeoutError('timed out')
+
+    monkeypatch.setattr(s3_module, 'get_session', lambda: _FakeSession(_Client()))
+
+    storage = S3Client(_config())
+    await storage.open()
+
+    with pytest.raises(S3BatchDeleteError) as exc:
+        await storage.delete_prefix('p/')
+
+    await storage.close()
+    assert exc.value.bucket == 'bucket'
+    assert exc.value.keys == ['p/1', 'p/2']
+    assert exc.value.delete_errors == [{'exception': "TimeoutError('timed out')"}]
+    assert str(exc.value).startswith("S3 batch delete failed for keys ['p/1', 'p/2'] in bucket bucket")
+    assert isinstance(exc.value.__cause__, TimeoutError)
+
+
+@pytest.mark.asyncio
+async def test_list_keys_wraps_backend_failure_without_prefix_as_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Client:
+        async def list_objects_v2(self, **_kwargs):
+            raise RuntimeError('boom')
+
+    monkeypatch.setattr(s3_module, 'get_session', lambda: _FakeSession(_Client()))
+
+    storage = S3Client(_config())
+    await storage.open()
+
+    with pytest.raises(S3ListObjectsError) as exc:
+        await storage.list_keys()
+
+    await storage.close()
+    assert exc.value.prefix is None
+    assert str(exc.value) == 'S3 list failed for prefix None in bucket bucket'
+
+
+@pytest.mark.asyncio
+async def test_get_stream_missing_key_raises_object_not_found(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Client:
+        async def get_object(self, **_kwargs):
+            raise _client_error('NoSuchKey', 'GetObject')
+
+    monkeypatch.setattr(s3_module, 'get_session', lambda: _FakeSession(_Client()))
+
+    storage = S3Client(_config())
+    await storage.open()
+
+    with pytest.raises(S3ObjectNotFoundError) as exc:
+        await storage.get_stream('missing-stream.txt', io.BytesIO())
+
+    await storage.close()
+    assert exc.value.key == 'missing-stream.txt'
 
 
 @pytest.mark.asyncio

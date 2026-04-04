@@ -27,6 +27,75 @@ class S3ObjectNotFoundError(Exception):
         super().__init__(f'Object not found: {key}')
 
 
+class S3OperationError(Exception):
+    """Base class for S3 operation failures."""
+
+    def __init__(self, message: str, *, bucket: str) -> None:
+        self.bucket = bucket
+        super().__init__(message)
+
+
+class S3PutObjectError(S3OperationError):
+    """Raised when an S3 put operation fails."""
+
+    def __init__(self, *, bucket: str, key: Key) -> None:
+        self.key = key
+        super().__init__(f'S3 put failed for key {key} in bucket {bucket}', bucket=bucket)
+
+
+class S3GetObjectError(S3OperationError):
+    """Raised when an S3 get operation fails."""
+
+    def __init__(self, *, bucket: str, key: Key) -> None:
+        self.key = key
+        super().__init__(f'S3 get failed for key {key} in bucket {bucket}', bucket=bucket)
+
+
+class S3DeleteObjectError(S3OperationError):
+    """Raised when an S3 delete operation fails."""
+
+    def __init__(self, *, bucket: str, key: Key) -> None:
+        self.key = key
+        super().__init__(f'S3 delete failed for key {key} in bucket {bucket}', bucket=bucket)
+
+
+class S3ListObjectsError(S3OperationError):
+    """Raised when an S3 list operation fails."""
+
+    def __init__(self, *, bucket: str, prefix: Prefix | None) -> None:
+        self.prefix = prefix
+        super().__init__(f'S3 list failed for prefix {prefix} in bucket {bucket}', bucket=bucket)
+
+
+class S3BatchDeleteError(S3OperationError):
+    """Raised when an S3 batch delete operation fails."""
+
+    def __init__(
+        self,
+        *,
+        bucket: str,
+        keys: list[Key],
+        delete_errors: list[dict[str, Any]],
+    ) -> None:
+        self.keys = keys
+        self.delete_errors = delete_errors
+        super().__init__(
+            (
+                f'S3 batch delete failed for keys {keys} in bucket {bucket}: '
+                f'backend reported delete errors {delete_errors}'
+            ),
+            bucket=bucket,
+        )
+
+
+class S3HeadObjectError(S3OperationError):
+    """Raised when an S3 head operation fails."""
+
+    def __init__(self, *, bucket: str, key: Key) -> None:
+        self.key = key
+        super().__init__(f'S3 head failed for key {key} in bucket {bucket}', bucket=bucket)
+
+
 @dataclass(frozen=True, slots=True)
 class S3Config:
     """S3-compatible storage configuration."""
@@ -141,6 +210,7 @@ class S3Client:
         content_type: S3ContentType | str | None = None,
     ) -> None:
         """Store in-memory bytes as a single object."""
+        client = self._require_client()
         kwargs: dict[str, object] = {
             'Bucket': self._config.bucket,
             'Key': key,
@@ -148,7 +218,10 @@ class S3Client:
         }
         if content_type is not None:
             kwargs['ContentType'] = content_type
-        await self._require_client().put_object(**kwargs)
+        try:
+            await client.put_object(**kwargs)
+        except Exception as error:
+            raise S3PutObjectError(bucket=self._config.bucket, key=key) from error
 
     async def get_bytes(self, key: Key) -> bytes:
         """Load an object into memory.
@@ -156,11 +229,13 @@ class S3Client:
         Raises:
             S3ObjectNotFoundError: If the object key does not exist.
         """
+        client = self._require_client()
         try:
-            response = await self._require_client().get_object(Bucket=self._config.bucket, Key=key)
-        except ClientError as error:
-            self._raise_if_not_found(error, key)
-            raise
+            response = await client.get_object(Bucket=self._config.bucket, Key=key)
+        except Exception as error:
+            if self._is_not_found(error):
+                raise S3ObjectNotFoundError(key) from error
+            raise S3GetObjectError(bucket=self._config.bucket, key=key) from error
 
         async with response['Body'] as body:
             return await body.read()
@@ -207,6 +282,7 @@ class S3Client:
         content_type: S3ContentType | str | None = None,
     ) -> None:
         """Store data from a binary stream as a single object."""
+        client = self._require_client()
         kwargs: dict[str, object] = {
             'Bucket': self._config.bucket,
             'Key': key,
@@ -214,7 +290,10 @@ class S3Client:
         }
         if content_type is not None:
             kwargs['ContentType'] = content_type
-        await self._require_client().put_object(**kwargs)
+        try:
+            await client.put_object(**kwargs)
+        except Exception as error:
+            raise S3PutObjectError(bucket=self._config.bucket, key=key) from error
 
     async def get_stream(self, key: Key, target: BinaryIO) -> int:
         """Stream an object into a writable binary stream.
@@ -225,11 +304,13 @@ class S3Client:
         Raises:
             S3ObjectNotFoundError: If the object key does not exist.
         """
+        client = self._require_client()
         try:
-            response = await self._require_client().get_object(Bucket=self._config.bucket, Key=key)
-        except ClientError as error:
-            self._raise_if_not_found(error, key)
-            raise
+            response = await client.get_object(Bucket=self._config.bucket, Key=key)
+        except Exception as error:
+            if self._is_not_found(error):
+                raise S3ObjectNotFoundError(key) from error
+            raise S3GetObjectError(bucket=self._config.bucket, key=key) from error
 
         bytes_written = 0
         async with response['Body'] as body:
@@ -248,20 +329,25 @@ class S3Client:
 
     async def exists(self, key: Key) -> bool:
         """Check whether an object key exists."""
+        client = self._require_client()
         try:
-            await self._require_client().head_object(Bucket=self._config.bucket, Key=key)
+            await client.head_object(Bucket=self._config.bucket, Key=key)
             return True
-        except ClientError as error:
+        except Exception as error:
             if self._is_not_found(error):
                 return False
-            raise
+            raise S3HeadObjectError(bucket=self._config.bucket, key=key) from error
 
     async def list_keys(self, prefix: Prefix | None = None) -> list[Key]:
         """List all object keys under an optional prefix.
 
         Uses one S3 list request per page. Each request returns up to 1000 keys,
         so large prefixes may require multiple backend requests.
+
+        `None` and ``''`` both mean no prefix.
         """
+        client = self._require_client()
+        prefix = prefix or None
         keys: list[Key] = []
         token: str | None = None
 
@@ -275,7 +361,10 @@ class S3Client:
             if token is not None:
                 kwargs['ContinuationToken'] = token
 
-            response = await self._require_client().list_objects_v2(**kwargs)
+            try:
+                response = await client.list_objects_v2(**kwargs)
+            except Exception as error:
+                raise S3ListObjectsError(bucket=self._config.bucket, prefix=prefix) from error
             keys.extend(obj['Key'] for obj in response.get('Contents', []))
 
             if not response.get('IsTruncated'):
@@ -291,14 +380,18 @@ class S3Client:
         Uses one S3 list request per page. Each request returns up to 1000
         entries, so large results may require multiple backend requests.
 
-        If `prefix` is provided, it is treated as a logical parent prefix:
+        `None` and ``''`` both mean no prefix. Otherwise `prefix` is treated as
+        a logical parent prefix:
         a trailing delimiter is added automatically if missing.
         """
+        client = self._require_client()
+        prefix = prefix or None
         prefixes: list[Prefix] = []
         token: str | None = None
 
-        if prefix and not prefix.endswith(_DELIMITER):
-            prefix = prefix + _DELIMITER
+        effective_prefix = prefix
+        if effective_prefix and not effective_prefix.endswith(_DELIMITER):
+            effective_prefix = effective_prefix + _DELIMITER
 
         while True:
             kwargs: dict[str, object] = {
@@ -306,12 +399,15 @@ class S3Client:
                 'MaxKeys': _LIST_MAX_KEYS,
                 'Delimiter': _DELIMITER,
             }
-            if prefix is not None:
-                kwargs['Prefix'] = prefix
+            if effective_prefix is not None:
+                kwargs['Prefix'] = effective_prefix
             if token is not None:
                 kwargs['ContinuationToken'] = token
 
-            response = await self._require_client().list_objects_v2(**kwargs)
+            try:
+                response = await client.list_objects_v2(**kwargs)
+            except Exception as error:
+                raise S3ListObjectsError(bucket=self._config.bucket, prefix=effective_prefix) from error
             prefixes.extend(item['Prefix'] for item in response.get('CommonPrefixes', []))
 
             if not response.get('IsTruncated'):
@@ -321,16 +417,13 @@ class S3Client:
 
         return prefixes
 
-    async def list_prefixes(self, prefix: Prefix | None = None) -> list[Prefix]:
-        """List immediate subprefixes under an optional prefix.
-
-        Backward-compatible alias for `list_subprefixes`.
-        """
-        return await self.list_subprefixes(prefix)
-
     async def delete_key(self, key: Key) -> None:
         """Delete a single object by exact key."""
-        await self._require_client().delete_object(Bucket=self._config.bucket, Key=key)
+        client = self._require_client()
+        try:
+            await client.delete_object(Bucket=self._config.bucket, Key=key)
+        except Exception as error:
+            raise S3DeleteObjectError(bucket=self._config.bucket, key=key) from error
 
     async def delete_prefix(self, prefix: Prefix, *, allow_root: bool = False) -> int:
         """Delete all objects under prefix and return number of deleted keys.
@@ -345,10 +438,13 @@ class S3Client:
 
         Raises:
             ValueError: If prefix is empty and allow_root is False.
-            RuntimeError: If the backend reports partial delete failures.
+            S3ListObjectsError: If listing objects under the prefix fails.
+            S3BatchDeleteError: If a delete request fails or reports delete errors.
         """
+        client = self._require_client()
         if not prefix and not allow_root:
             raise ValueError('Refusing to delete entire bucket without allow_root=True')
+        effective_prefix = prefix or None
 
         deleted = 0
         batch: list[Key] = []
@@ -359,12 +455,15 @@ class S3Client:
                 'Bucket': self._config.bucket,
                 'MaxKeys': _LIST_MAX_KEYS,
             }
-            if prefix:
-                kwargs['Prefix'] = prefix
+            if effective_prefix is not None:
+                kwargs['Prefix'] = effective_prefix
             if token is not None:
                 kwargs['ContinuationToken'] = token
 
-            response = await self._require_client().list_objects_v2(**kwargs)
+            try:
+                response = await client.list_objects_v2(**kwargs)
+            except Exception as error:
+                raise S3ListObjectsError(bucket=self._config.bucket, prefix=effective_prefix) from error
             contents = response.get('Contents', [])
 
             for obj in contents:
@@ -398,15 +497,27 @@ class S3Client:
         return [segment for segment in key.split(_DELIMITER) if segment]
 
     async def _delete_batch(self, keys: list[Key]) -> int:
+        client = self._require_client()
         objects = [{'Key': key} for key in keys]
-        response = await self._require_client().delete_objects(
-            Bucket=self._config.bucket,
-            Delete={'Objects': objects},
-        )
+        try:
+            response = await client.delete_objects(
+                Bucket=self._config.bucket,
+                Delete={'Objects': objects},
+            )
+        except Exception as error:
+            raise S3BatchDeleteError(
+                bucket=self._config.bucket,
+                keys=list(keys),
+                delete_errors=[{'exception': repr(error)}],
+            ) from error
 
         errors = response.get('Errors', [])
         if errors:
-            raise RuntimeError(f'Failed to delete {len(errors)} objects: {errors}')
+            raise S3BatchDeleteError(
+                bucket=self._config.bucket,
+                keys=list(keys),
+                delete_errors=errors,
+            )
 
         return len(response.get('Deleted', []))
 
@@ -416,10 +527,7 @@ class S3Client:
         return self._client
 
     @staticmethod
-    def _is_not_found(error: ClientError) -> bool:
+    def _is_not_found(error: Exception) -> bool:
+        if not isinstance(error, ClientError):
+            return False
         return error.response.get('Error', {}).get('Code') in _NOT_FOUND_CODES
-
-    @staticmethod
-    def _raise_if_not_found(error: ClientError, key: Key) -> None:
-        if S3Client._is_not_found(error):
-            raise S3ObjectNotFoundError(key) from error
