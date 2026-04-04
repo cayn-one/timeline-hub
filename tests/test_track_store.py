@@ -985,6 +985,68 @@ async def test_store_uses_dense_order_within_sub_season_only(monkeypatch: pytest
 
 
 @pytest.mark.asyncio
+async def test_store_propagates_raw_error_when_track_upload_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_uuid7(monkeypatch, _UUID_1)
+    track_key = _track_key(universe=TrackUniverse.WEST, year=2026, season=Season.S1, track_id=_UUID_1)
+    manifest_key = _manifest_key(universe=TrackUniverse.WEST, year=2026, season=Season.S1)
+    s3_client = _FakeS3Client(
+        objects={_presets_key(): _presets_bytes()},
+        put_failures={track_key},
+    )
+    store = _store(s3_client)
+
+    with pytest.raises(RuntimeError, match=re.escape(f'boom putting {track_key}')) as excinfo:
+        await store.store(
+            _track(),
+            group=TrackGroup(universe=TrackUniverse.WEST, year=2026, season=Season.S1),
+            sub_season=SubSeason.A,
+        )
+
+    assert excinfo.value.__cause__ is None
+    assert track_key not in s3_client.objects
+    assert manifest_key not in s3_client.objects
+    cache_key = _track_group_prefix(universe=TrackUniverse.WEST, year=2026, season=Season.S1)
+    assert cache_key not in store._manifest_cache
+
+
+@pytest.mark.asyncio
+async def test_store_raises_sync_error_and_keeps_uploaded_track_when_cover_upload_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_uuid7(monkeypatch, _UUID_1)
+    manifest_key = _manifest_key(universe=TrackUniverse.WEST, year=2026, season=Season.S1)
+    track_key = _track_key(universe=TrackUniverse.WEST, year=2026, season=Season.S1, track_id=_UUID_1)
+    cover_key = _cover_key(universe=TrackUniverse.WEST, year=2026, season=Season.S1, track_id=_UUID_1)
+    s3_client = _FakeS3Client(
+        objects={_presets_key(): _presets_bytes()},
+        put_failures={cover_key},
+    )
+    store = _store(s3_client)
+
+    with pytest.raises(TrackManifestSyncError, match='cover_upload') as excinfo:
+        await store.store(
+            _track(),
+            group=TrackGroup(universe=TrackUniverse.WEST, year=2026, season=Season.S1),
+            sub_season=SubSeason.A,
+        )
+
+    assert excinfo.value.stage == 'cover_upload'
+    assert excinfo.value.track_id == _UUID_1
+    assert excinfo.value.written_keys == (track_key,)
+    assert excinfo.value.manifest_key == manifest_key
+    assert isinstance(excinfo.value.__cause__, RuntimeError)
+    assert str(excinfo.value.__cause__) == f'boom putting {cover_key}'
+    assert getattr(excinfo.value, '__notes__', []) == [
+        f"Original cover upload error: RuntimeError('boom putting {cover_key}')"
+    ]
+    assert s3_client.objects[track_key] == b'track'
+    assert cover_key not in s3_client.objects
+    assert manifest_key not in s3_client.objects
+    cache_key = _track_group_prefix(universe=TrackUniverse.WEST, year=2026, season=Season.S1)
+    assert cache_key not in store._manifest_cache
+
+
+@pytest.mark.asyncio
 async def test_store_raises_sync_error_and_keeps_uploaded_objects_when_manifest_write_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -998,16 +1060,19 @@ async def test_store_raises_sync_error_and_keeps_uploaded_objects_when_manifest_
     )
     store = _store(s3_client)
 
-    with pytest.raises(TrackManifestSyncError, match='Created object keys') as excinfo:
+    with pytest.raises(TrackManifestSyncError, match='manifest_write') as excinfo:
         await store.store(
             _track(),
             group=TrackGroup(universe=TrackUniverse.WEST, year=2026, season=Season.S1),
             sub_season=SubSeason.A,
         )
 
+    assert excinfo.value.stage == 'manifest_write'
     assert excinfo.value.track_id == _UUID_1
     assert excinfo.value.written_keys == (track_key, cover_key)
     assert excinfo.value.manifest_key == manifest_key
+    assert isinstance(excinfo.value.__cause__, RuntimeError)
+    assert str(excinfo.value.__cause__) == f'boom putting {manifest_key}'
     assert getattr(excinfo.value, '__notes__', []) == [
         f"Original manifest write error: RuntimeError('boom putting {manifest_key}')"
     ]

@@ -518,21 +518,24 @@ class TrackGroupNotFoundError(LookupError):
 
 
 class TrackManifestSyncError(RuntimeError):
-    """Raised when newly uploaded track objects cannot be synchronized with manifest state."""
+    """Raised when staged track-store writes leave uploaded objects unsynchronized."""
 
     def __init__(
         self,
         *,
+        stage: str,
         track_id: TrackId,
         written_keys: Iterable[Key],
         manifest_key: Key,
     ) -> None:
+        self.stage = stage
         self.track_id = track_id
         self.written_keys = tuple(written_keys)
         self.manifest_key = manifest_key
         super().__init__(
-            f'Created object keys {list(self.written_keys)} for track id {self.track_id} '
-            f'but manifest write failed for {self.manifest_key}'
+            f'Staged track store failed at {self.stage} for track id {self.track_id}; '
+            f'written keys: {list(self.written_keys)}; '
+            f'manifest key not synchronized: {self.manifest_key}'
         )
 
 
@@ -607,9 +610,10 @@ class TrackStore:
 
         Store creates the target group implicitly by writing its first manifest
         if that group does not yet exist. Track and cover objects are uploaded
-        first, then the authoritative manifest is persisted. If manifest
-        persistence fails after uploads succeed, those uploaded objects remain
-        in storage and an explicit sync error is raised for manual recovery.
+        first, then the authoritative manifest is persisted. If a later staged
+        upload or manifest persistence fails after one or more objects were
+        written, those uploaded objects remain in storage and an explicit sync
+        error is raised for manual recovery.
 
         This phase does not perform hashing or deduplication. Every successful
         call stores a new original track object with a fresh UUIDv7 id.
@@ -626,7 +630,7 @@ class TrackStore:
         Raises:
             TrackPresetsCorruptedError: If `tracks/presets.json` exists but is malformed.
             TrackManifestCorruptedError: If the target group's manifest exists but is malformed.
-            TrackManifestSyncError: If track or cover objects are written but manifest persistence fails.
+            TrackManifestSyncError: If one or more track-store objects are written but a later stage fails.
         """
         await self._ensure_presets_loaded()
 
@@ -654,19 +658,27 @@ class TrackStore:
         track_key = self._track_key(track_group_prefix, track_id)
         cover_key = self._cover_key(track_group_prefix, track_id)
         manifest_key = self._manifest_key(track_group_prefix)
-        written_keys = [track_key, cover_key]
-
         await self._s3_client.put_bytes(
             track_key,
             track.audio_bytes,
             content_type=S3ContentType.OPUS,
         )
 
-        await self._s3_client.put_bytes(
-            cover_key,
-            track.cover_bytes,
-            content_type=S3ContentType.JPEG,
-        )
+        try:
+            await self._s3_client.put_bytes(
+                cover_key,
+                track.cover_bytes,
+                content_type=S3ContentType.JPEG,
+            )
+        except Exception as error:
+            sync_error = TrackManifestSyncError(
+                stage='cover_upload',
+                track_id=track_id,
+                written_keys=[track_key],
+                manifest_key=manifest_key,
+            )
+            sync_error.add_note(f'Original cover upload error: {error!r}')
+            raise sync_error from error
 
         try:
             await self._write_manifest_and_update_cache(
@@ -675,8 +687,9 @@ class TrackStore:
             )
         except Exception as error:
             sync_error = TrackManifestSyncError(
+                stage='manifest_write',
                 track_id=track_id,
-                written_keys=written_keys,
+                written_keys=[track_key, cover_key],
                 manifest_key=manifest_key,
             )
             sync_error.add_note(f'Original manifest write error: {error!r}')
