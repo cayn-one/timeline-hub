@@ -405,12 +405,31 @@ class ClipGroupNotFoundError(LookupError):
         )
 
 
-class ClipStoreRollbackError(RuntimeError):
-    """Raised when store rollback cannot fully delete uploaded clip objects."""
+class ClipManifestSyncError(RuntimeError):
+    """Explicit manual-recovery error for staged store failures without rollback.
 
-    def __init__(self, *, failed_keys: Sequence[Key]) -> None:
-        self.failed_keys = tuple(failed_keys)
-        super().__init__(f'Rollback failed for {len(self.failed_keys)} uploaded keys: {list(self.failed_keys)}')
+    Rollback is intentionally not attempted. `stage`, `written_keys`,
+    `affected_clip_ids`, and `manifest_key` provide the intended recovery
+    context for investigation and manual cleanup.
+    """
+
+    def __init__(
+        self,
+        *,
+        stage: str,
+        written_keys: Sequence[Key],
+        affected_clip_ids: Sequence[ClipId],
+        manifest_key: Key,
+    ) -> None:
+        self.stage = stage
+        self.written_keys = tuple(written_keys)
+        self.affected_clip_ids = tuple(affected_clip_ids)
+        self.manifest_key = manifest_key
+        super().__init__(
+            f'Staged clip store failed at {self.stage} for clip ids {list(self.affected_clip_ids)}; '
+            f'written keys: {list(self.written_keys)}; '
+            f'manifest key not synchronized: {self.manifest_key}'
+        )
 
 
 class ReconcileDeleteError(RuntimeError):
@@ -456,9 +475,13 @@ class ClipStore:
 
     The manifest is the authoritative index for each clip group and is
     validated on load. Clip-group listing is prefix-based, while sub-group
-    listing is manifest-based. Store operations stage uploads first and commit
-    by writing the updated manifest. If commit fails after clip uploads begin,
-    uploaded objects from that call are rolled back on a best-effort basis.
+    listing is manifest-based. Store operations stage clip uploads first and
+    commit by writing the updated manifest. If a later store stage fails after
+    one or more clip uploads succeed, this module prefers fail-fast explicit
+    sync errors over rollback complexity. Uploaded orphaned clip objects may
+    remain in storage until manual cleanup, while the manifest remains the
+    only authoritative logical clip state. Manual cleanup after such failures
+    is an expected operational responsibility.
 
     Normalized clips are cache-like derived artifacts, not authoritative
     storage state. The manifest is the source of truth for whether a
@@ -487,9 +510,14 @@ class ClipStore:
         duplicate, the method returns without creating a new batch. Callers
         must not mix clips from multiple logical batches in a single call.
 
-        The operation is atomic at the store-call level: if persistence fails
-        after any clip uploads succeed, all clip objects uploaded during this
-        call are deleted before the exception is re-raised.
+        Clip uploads are staged before manifest persistence, and the manifest
+        remains authoritative for whether stored clips exist in logical state.
+        `store()` intentionally does not attempt rollback if a later stage
+        fails. Instead, `ClipManifestSyncError` is the intended recovery
+        surface for manual investigation and cleanup. Later-stage failures may
+        leave uploaded clip objects in storage without manifest entries, and
+        callers are expected to use the exception's attached context to clean
+        up manually when needed.
 
         Writes to the same `ClipGroup` are assumed to be sequential
         (single-writer). Concurrent writes are not supported and may lead to
@@ -497,6 +525,7 @@ class ClipStore:
 
         Raises:
             ManifestCorruptedError: If the clip-group manifest exists but is malformed.
+            ClipManifestSyncError: If one or more clip objects are written but a later stage fails.
             RuntimeError: If clip hashing fails.
         """
         clip_group_prefix = self._clip_group_prefix(
@@ -549,32 +578,43 @@ class ClipStore:
             new_entries.append((entry, clip))
 
         manifest_key = self._manifest_key(clip_group_prefix)
-        manifest_payload = json.dumps(manifest.to_list(), separators=(',', ':')).encode('utf-8')
 
-        try:
-            for entry, clip in new_entries:
-                clip_key = self._clip_key(clip_group_prefix, entry.id)
+        for entry, clip in new_entries:
+            clip_key = self._clip_key(clip_group_prefix, entry.id)
+            try:
                 await self._s3_client.put_bytes(
                     clip_key,
                     clip.bytes,
                     content_type=S3ContentType.MP4,
                 )
-                uploaded_keys.append(clip_key)
+            except Exception as error:
+                if not uploaded_keys:
+                    raise
+                sync_error = ClipManifestSyncError(
+                    stage='clip_upload',
+                    written_keys=uploaded_keys,
+                    affected_clip_ids=[written_entry.id for written_entry, _ in new_entries[: len(uploaded_keys)]],
+                    manifest_key=manifest_key,
+                )
+                sync_error.add_note(f'Original clip upload error: {error!r}')
+                raise sync_error from error
+            uploaded_keys.append(clip_key)
 
-            await self._s3_client.put_bytes(
-                manifest_key,
-                manifest_payload,
-                content_type=S3ContentType.JSON,
+        try:
+            await self._write_manifest_and_update_cache(
+                clip_group_prefix=clip_group_prefix,
+                manifest=manifest,
             )
         except Exception as error:
-            try:
-                await self._rollback_uploads(uploaded_keys)
-            except Exception as rollback_error:
-                rollback_error.add_note(f'Original store error: {error!r}')
-                raise rollback_error from error
-            raise
+            sync_error = ClipManifestSyncError(
+                stage='manifest_write',
+                written_keys=uploaded_keys,
+                affected_clip_ids=[entry.id for entry, _ in new_entries],
+                manifest_key=manifest_key,
+            )
+            sync_error.add_note(f'Original manifest write error: {error!r}')
+            raise sync_error from error
 
-        self._manifest_cache[clip_group_prefix] = manifest.copy()
         return StoreResult(
             stored_count=len(new_entries),
             duplicate_count=duplicate_count,
@@ -661,18 +701,12 @@ class ClipStore:
                 rewritten_entries.append(entry)
 
         rewritten_manifest = Manifest(rewritten_entries)
-        manifest_key = self._manifest_key(clip_group_prefix)
-        manifest_payload = json.dumps(rewritten_manifest.to_list(), separators=(',', ':')).encode('utf-8')
 
         # Compaction is manifest-only; clip objects stay untouched.
-        await self._s3_client.put_bytes(
-            manifest_key,
-            manifest_payload,
-            content_type=S3ContentType.JSON,
+        await self._write_manifest_and_update_cache(
+            clip_group_prefix=clip_group_prefix,
+            manifest=rewritten_manifest,
         )
-
-        # Keep the manifest cache synchronized with the rewritten manifest.
-        self._manifest_cache[clip_group_prefix] = rewritten_manifest
 
     async def derive_group(
         self,
@@ -843,18 +877,13 @@ class ClipStore:
 
         rewritten_entries.extend(new_entries)
         rewritten_manifest = Manifest(rewritten_entries)
-        manifest_key = self._manifest_key(clip_group_prefix)
-        manifest_payload = json.dumps(rewritten_manifest.to_list(), separators=(',', ':')).encode('utf-8')
-
-        await self._s3_client.put_bytes(
-            manifest_key,
-            manifest_payload,
-            content_type=S3ContentType.JSON,
+        await self._write_manifest_and_update_cache(
+            clip_group_prefix=clip_group_prefix,
+            manifest=rewritten_manifest,
         )
 
         # The manifest is authoritative, so cache must track the rewritten
         # manifest even if deleting removed clip objects fails afterwards.
-        self._manifest_cache[clip_group_prefix] = rewritten_manifest
 
         removed_ids = old_subgroup_ids - new_subgroup_ids
         failed_keys: list[Key] = []
@@ -982,7 +1011,12 @@ class ClipStore:
             yield clip_batch
 
     async def list_groups(self) -> list[ClipGroup]:
-        """List all discovered clip groups from stored S3 prefixes."""
+        """List discovered clip groups from stored S3 prefixes.
+
+        This is prefix-based storage discovery, not a manifest-authoritative
+        existence check. After failed first writes, orphaned prefixes may
+        appear temporarily until manual cleanup removes them.
+        """
         clip_group_prefixes = await self._s3_client.list_subprefixes(prefix=_CLIPS_PREFIX)
         clip_groups = [self._parse_clip_group_prefix(prefix) for prefix in clip_group_prefixes]
         return sorted(clip_groups, key=lambda group: (group.universe.order(), group.year, int(group.season)))
@@ -1123,17 +1157,20 @@ class ClipStore:
         except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
             raise ManifestCorruptedError(manifest_key, str(error)) from error
 
-    async def _rollback_uploads(self, keys: list[Key]) -> None:
-        failed_keys: list[Key] = []
-
-        for key in reversed(keys):
-            try:
-                await self._s3_client.delete_key(key)
-            except Exception:
-                failed_keys.append(key)
-
-        if failed_keys:
-            raise ClipStoreRollbackError(failed_keys=failed_keys)
+    async def _write_manifest_and_update_cache(
+        self,
+        *,
+        clip_group_prefix: Prefix,
+        manifest: Manifest,
+    ) -> None:
+        manifest_key = self._manifest_key(clip_group_prefix)
+        manifest_payload = json.dumps(manifest.to_list(), separators=(',', ':')).encode('utf-8')
+        await self._s3_client.put_bytes(
+            manifest_key,
+            manifest_payload,
+            content_type=S3ContentType.JSON,
+        )
+        self._manifest_cache[clip_group_prefix] = manifest.copy()
 
     async def _fetch_normalized_batch(
         self,
@@ -1210,14 +1247,11 @@ class ClipStore:
             return [clip for clip in clip_batch if clip is not None], manifest
 
         rewritten_manifest = Manifest([rewritten_entries.get(entry.id, entry) for entry in manifest])
-        manifest_key = self._manifest_key(clip_group_prefix)
-        manifest_payload = json.dumps(rewritten_manifest.to_list(), separators=(',', ':')).encode('utf-8')
 
         try:
-            await self._s3_client.put_bytes(
-                manifest_key,
-                manifest_payload,
-                content_type=S3ContentType.JSON,
+            await self._write_manifest_and_update_cache(
+                clip_group_prefix=clip_group_prefix,
+                manifest=rewritten_manifest,
             )
         except Exception as error:
             sync_error = NormalizedClipManifestSyncError(
@@ -1228,7 +1262,6 @@ class ClipStore:
             sync_error.add_note(f'Original manifest write error: {error!r}')
             raise sync_error from error
 
-        self._manifest_cache[clip_group_prefix] = rewritten_manifest
         return [clip for clip in clip_batch if clip is not None], rewritten_manifest
 
     async def _regenerate_normalized_twin(

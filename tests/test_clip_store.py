@@ -12,6 +12,7 @@ from general_bot.services.clip_store import (
     ClipGroup,
     ClipGroupNotFoundError,
     ClipIdsNotInSubGroupError,
+    ClipManifestSyncError,
     ClipStore,
     ClipSubGroup,
     DuplicateClipIdsError,
@@ -1699,6 +1700,164 @@ async def test_store_all_duplicates_do_not_create_new_batch(monkeypatch: pytest.
     assert result == StoreResult(stored_count=0, duplicate_count=1)
     assert json.loads(s3_client.objects[manifest_key].decode('utf-8')) == Manifest(original_manifest).to_list()
     assert s3_client.put_calls == []
+
+
+@pytest.mark.asyncio
+async def test_store_propagates_first_clip_upload_failure_without_sync_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_hashes(monkeypatch, {b'clip': _HASH_B})
+    _patch_uuid7(monkeypatch, _UUID_2)
+    clip_group = ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1)
+    clip_sub_group = ClipSubGroup(sub_season=SubSeason.A, scope=Scope.COLLECTION)
+    manifest_key = _manifest_key(year=2024, season=Season.S1, universe=Universe.WEST)
+    clip_key = _clip_key(year=2024, season=Season.S1, universe=Universe.WEST, clip_id=_UUID_2)
+    original_manifest = [
+        ManifestEntry(
+            id=_UUID_1,
+            video_hash=_HASH_A,
+            sub_season=SubSeason.A,
+            scope=Scope.COLLECTION,
+            batch=1,
+            order=1,
+        )
+    ]
+    s3_client = _FakeS3Client(
+        {manifest_key: _manifest_bytes(original_manifest)},
+        put_failures={clip_key},
+    )
+    store = ClipStore(s3_client)
+    clip_group_prefix = store._clip_group_prefix(
+        universe=clip_group.universe,
+        year=clip_group.year,
+        season=clip_group.season,
+    )
+
+    with pytest.raises(RuntimeError, match=f'boom putting {clip_key}'):
+        await store.store(
+            [Clip(filename='incoming.mp4', bytes=b'clip')],
+            group=clip_group,
+            sub_group=clip_sub_group,
+        )
+
+    assert manifest_key not in [call[0] for call in s3_client.put_calls]
+    assert clip_key not in s3_client.objects
+    assert s3_client.deleted_keys == []
+    assert store._manifest_cache[clip_group_prefix].to_list() == Manifest(original_manifest).to_list()
+
+
+@pytest.mark.asyncio
+async def test_store_raises_sync_error_when_later_clip_upload_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_hashes(monkeypatch, {b'first': _HASH_B, b'second': _HASH_C})
+    _patch_uuid7(monkeypatch, _UUID_2, _UUID_3)
+    clip_group = ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1)
+    clip_sub_group = ClipSubGroup(sub_season=SubSeason.A, scope=Scope.COLLECTION)
+    manifest_key = _manifest_key(year=2024, season=Season.S1, universe=Universe.WEST)
+    first_clip_key = _clip_key(year=2024, season=Season.S1, universe=Universe.WEST, clip_id=_UUID_2)
+    second_clip_key = _clip_key(year=2024, season=Season.S1, universe=Universe.WEST, clip_id=_UUID_3)
+    original_manifest = [
+        ManifestEntry(
+            id=_UUID_1,
+            video_hash=_HASH_A,
+            sub_season=SubSeason.A,
+            scope=Scope.COLLECTION,
+            batch=1,
+            order=1,
+        )
+    ]
+    s3_client = _FakeS3Client(
+        {manifest_key: _manifest_bytes(original_manifest)},
+        put_failures={second_clip_key},
+    )
+    store = ClipStore(s3_client)
+    clip_group_prefix = store._clip_group_prefix(
+        universe=clip_group.universe,
+        year=clip_group.year,
+        season=clip_group.season,
+    )
+
+    with pytest.raises(ClipManifestSyncError, match='Staged clip store failed at clip_upload') as excinfo:
+        await store.store(
+            [
+                Clip(filename='first.mp4', bytes=b'first'),
+                Clip(filename='second.mp4', bytes=b'second'),
+            ],
+            group=clip_group,
+            sub_group=clip_sub_group,
+        )
+
+    assert excinfo.value.stage == 'clip_upload'
+    assert excinfo.value.written_keys == (first_clip_key,)
+    assert excinfo.value.affected_clip_ids == (_UUID_2,)
+    assert excinfo.value.manifest_key == manifest_key
+    assert isinstance(excinfo.value.__cause__, RuntimeError)
+    assert str(excinfo.value.__cause__) == f'boom putting {second_clip_key}'
+    assert excinfo.value.__notes__ == [f"Original clip upload error: RuntimeError('boom putting {second_clip_key}')"]
+    assert first_clip_key in s3_client.objects
+    assert second_clip_key not in s3_client.objects
+    assert manifest_key in s3_client.objects
+    assert s3_client.objects[manifest_key] == _manifest_bytes(original_manifest)
+    assert manifest_key not in [call[0] for call in s3_client.put_calls]
+    assert s3_client.deleted_keys == []
+    assert store._manifest_cache[clip_group_prefix].to_list() == Manifest(original_manifest).to_list()
+
+
+@pytest.mark.asyncio
+async def test_store_raises_sync_error_when_manifest_write_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_hashes(monkeypatch, {b'first': _HASH_B, b'second': _HASH_C})
+    _patch_uuid7(monkeypatch, _UUID_2, _UUID_3)
+    clip_group = ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1)
+    clip_sub_group = ClipSubGroup(sub_season=SubSeason.A, scope=Scope.COLLECTION)
+    manifest_key = _manifest_key(year=2024, season=Season.S1, universe=Universe.WEST)
+    first_clip_key = _clip_key(year=2024, season=Season.S1, universe=Universe.WEST, clip_id=_UUID_2)
+    second_clip_key = _clip_key(year=2024, season=Season.S1, universe=Universe.WEST, clip_id=_UUID_3)
+    original_manifest = [
+        ManifestEntry(
+            id=_UUID_1,
+            video_hash=_HASH_A,
+            sub_season=SubSeason.A,
+            scope=Scope.COLLECTION,
+            batch=1,
+            order=1,
+        )
+    ]
+    s3_client = _FakeS3Client(
+        {manifest_key: _manifest_bytes(original_manifest)},
+        put_failures={manifest_key},
+    )
+    store = ClipStore(s3_client)
+    clip_group_prefix = store._clip_group_prefix(
+        universe=clip_group.universe,
+        year=clip_group.year,
+        season=clip_group.season,
+    )
+
+    with pytest.raises(ClipManifestSyncError, match='Staged clip store failed at manifest_write') as excinfo:
+        await store.store(
+            [
+                Clip(filename='first.mp4', bytes=b'first'),
+                Clip(filename='second.mp4', bytes=b'second'),
+            ],
+            group=clip_group,
+            sub_group=clip_sub_group,
+        )
+
+    assert excinfo.value.stage == 'manifest_write'
+    assert excinfo.value.written_keys == (first_clip_key, second_clip_key)
+    assert excinfo.value.affected_clip_ids == (_UUID_2, _UUID_3)
+    assert excinfo.value.manifest_key == manifest_key
+    assert isinstance(excinfo.value.__cause__, RuntimeError)
+    assert str(excinfo.value.__cause__) == f'boom putting {manifest_key}'
+    assert excinfo.value.__notes__ == [f"Original manifest write error: RuntimeError('boom putting {manifest_key}')"]
+    assert s3_client.objects[first_clip_key] == b'first'
+    assert s3_client.objects[second_clip_key] == b'second'
+    assert s3_client.objects[manifest_key] == _manifest_bytes(original_manifest)
+    assert s3_client.deleted_keys == []
+    assert store._manifest_cache[clip_group_prefix].to_list() == Manifest(original_manifest).to_list()
 
 
 @pytest.mark.asyncio
