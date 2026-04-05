@@ -447,6 +447,150 @@ async def test_delete_key_wraps_backend_failure(monkeypatch: pytest.MonkeyPatch)
 
 
 @pytest.mark.asyncio
+async def test_delete_keys_returns_zero_for_empty_iterable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Client:
+        async def delete_objects(self, **_kwargs):
+            pytest.fail('delete_objects should not be called for empty input')
+
+    monkeypatch.setattr(s3_module, 'get_session', lambda: _FakeSession(_Client()))
+
+    storage = S3Client(_config())
+    await storage.open()
+    deleted = await storage.delete_keys([])
+    await storage.close()
+
+    assert deleted == 0
+
+
+@pytest.mark.asyncio
+async def test_delete_keys_deletes_single_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _Client:
+        def __init__(self) -> None:
+            self.delete_batches: list[list[str]] = []
+
+        async def delete_objects(self, **kwargs):
+            batch = [item['Key'] for item in kwargs['Delete']['Objects']]
+            self.delete_batches.append(batch)
+            return {'Deleted': [{'Key': key} for key in batch]}
+
+    client = _Client()
+    monkeypatch.setattr(s3_module, 'get_session', lambda: _FakeSession(client))
+
+    storage = S3Client(_config())
+    await storage.open()
+    deleted = await storage.delete_keys(['p/1'])
+    await storage.close()
+
+    assert deleted == 1
+    assert client.delete_batches == [['p/1']]
+
+
+@pytest.mark.asyncio
+async def test_delete_keys_deletes_multiple_keys_within_one_batch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Client:
+        def __init__(self) -> None:
+            self.delete_batches: list[list[str]] = []
+
+        async def delete_objects(self, **kwargs):
+            batch = [item['Key'] for item in kwargs['Delete']['Objects']]
+            self.delete_batches.append(batch)
+            return {'Deleted': [{'Key': key} for key in batch]}
+
+    client = _Client()
+    monkeypatch.setattr(s3_module, 'get_session', lambda: _FakeSession(client))
+
+    storage = S3Client(_config())
+    await storage.open()
+    deleted = await storage.delete_keys(['p/1', 'p/2', 'p/3'])
+    await storage.close()
+
+    assert deleted == 3
+    assert client.delete_batches == [['p/1', 'p/2', 'p/3']]
+
+
+@pytest.mark.asyncio
+async def test_delete_keys_batches_and_sums_deleted_counts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Client:
+        def __init__(self) -> None:
+            self.delete_batches: list[list[str]] = []
+
+        async def delete_objects(self, **kwargs):
+            batch = [item['Key'] for item in kwargs['Delete']['Objects']]
+            self.delete_batches.append(batch)
+            deleted_count = 2 if len(self.delete_batches) == 1 else 3
+            return {'Deleted': [{'Key': key} for key in batch[:deleted_count]]}
+
+    client = _Client()
+    monkeypatch.setattr(s3_module, 'get_session', lambda: _FakeSession(client))
+
+    keys = [f'p/{i}' for i in range(s3_module._DELETE_MAX_OBJECTS + 3)]
+
+    storage = S3Client(_config())
+    await storage.open()
+    deleted = await storage.delete_keys(keys)
+    await storage.close()
+
+    assert deleted == 5
+    assert len(client.delete_batches) == 2
+    assert client.delete_batches[0] == keys[: s3_module._DELETE_MAX_OBJECTS]
+    assert client.delete_batches[1] == keys[s3_module._DELETE_MAX_OBJECTS :]
+
+
+@pytest.mark.asyncio
+async def test_delete_keys_raises_batch_delete_error_on_partial_delete_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Client:
+        async def delete_objects(self, **_kwargs):
+            return {
+                'Deleted': [{'Key': 'p/1'}],
+                'Errors': [{'Key': 'p/2', 'Code': 'AccessDenied'}],
+            }
+
+    monkeypatch.setattr(s3_module, 'get_session', lambda: _FakeSession(_Client()))
+
+    storage = S3Client(_config())
+    await storage.open()
+
+    with pytest.raises(S3BatchDeleteError) as exc:
+        await storage.delete_keys(['p/1', 'p/2'])
+
+    await storage.close()
+    assert exc.value.bucket == 'bucket'
+    assert exc.value.keys == ['p/1', 'p/2']
+    assert exc.value.delete_errors == [{'Key': 'p/2', 'Code': 'AccessDenied'}]
+
+
+@pytest.mark.asyncio
+async def test_delete_keys_wraps_delete_request_failure_as_batch_delete_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Client:
+        async def delete_objects(self, **_kwargs):
+            raise TimeoutError('timed out')
+
+    monkeypatch.setattr(s3_module, 'get_session', lambda: _FakeSession(_Client()))
+
+    storage = S3Client(_config())
+    await storage.open()
+
+    with pytest.raises(S3BatchDeleteError) as exc:
+        await storage.delete_keys(['p/1', 'p/2'])
+
+    await storage.close()
+    assert exc.value.bucket == 'bucket'
+    assert exc.value.keys == ['p/1', 'p/2']
+    assert exc.value.delete_errors == [{'exception': "TimeoutError('timed out')"}]
+    assert isinstance(exc.value.__cause__, TimeoutError)
+
+
+@pytest.mark.asyncio
 async def test_delete_prefix_raises_batch_delete_error_on_partial_delete_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

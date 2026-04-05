@@ -3,7 +3,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
 from types import TracebackType
-from typing import Any, BinaryIO, Self
+from typing import Any, BinaryIO, Iterable, Self
 
 from aiobotocore.config import AioConfig
 from aiobotocore.session import get_session
@@ -425,6 +425,33 @@ class S3Client:
         except Exception as error:
             raise S3DeleteObjectError(bucket=self._config.bucket, key=key) from error
 
+    async def delete_keys(self, keys: Iterable[Key]) -> int:
+        """Delete exact object keys and return the backend-reported deleted count.
+
+        This deletes the provided exact keys, not a prefix. Keys are
+        materialized once and deleted in batches automatically when the total
+        exceeds the backend batch-delete limit.
+
+        Raises:
+            TypeError: If `keys` is a string.
+            S3BatchDeleteError: If a delete request fails or reports delete errors.
+        """
+        if isinstance(keys, str):
+            raise TypeError('delete_keys() expects Iterable[Key], got str; use delete_key() for a single key')
+
+        self._require_client()
+
+        key_list = list(keys)
+        if not key_list:
+            return 0
+
+        deleted = 0
+        for start in range(0, len(key_list), _DELETE_MAX_OBJECTS):
+            batch = key_list[start : start + _DELETE_MAX_OBJECTS]
+            deleted += await self._delete_batch(batch)
+
+        return deleted
+
     async def delete_prefix(self, prefix: Prefix, *, allow_root: bool = False) -> int:
         """Delete all objects under prefix and return number of deleted keys.
 
@@ -497,6 +524,7 @@ class S3Client:
         return [segment for segment in key.split(_DELIMITER) if segment]
 
     async def _delete_batch(self, keys: list[Key]) -> int:
+        """Delete one exact-key batch and return backend-reported deleted count."""
         client = self._require_client()
         objects = [{'Key': key} for key in keys]
         try:
