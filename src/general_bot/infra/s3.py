@@ -223,6 +223,38 @@ class S3Client:
         except Exception as error:
             raise S3PutObjectError(bucket=self._config.bucket, key=key) from error
 
+    async def put_file(
+        self,
+        key: Key,
+        path: Path,
+        *,
+        content_type: S3ContentType | str | None = None,
+    ) -> None:
+        """Store a local file."""
+        with path.open('rb') as file:
+            await self.put_stream(key, file, content_type=content_type)
+
+    async def put_stream(
+        self,
+        key: Key,
+        stream: BinaryIO,
+        *,
+        content_type: S3ContentType | str | None = None,
+    ) -> None:
+        """Store data from a binary stream as a single object."""
+        client = self._require_client()
+        kwargs: dict[str, object] = {
+            'Bucket': self._config.bucket,
+            'Key': key,
+            'Body': stream,
+        }
+        if content_type is not None:
+            kwargs['ContentType'] = content_type
+        try:
+            await client.put_object(**kwargs)
+        except Exception as error:
+            raise S3PutObjectError(bucket=self._config.bucket, key=key) from error
+
     async def get_bytes(self, key: Key) -> bytes:
         """Load an object into memory.
 
@@ -239,17 +271,6 @@ class S3Client:
 
         async with response['Body'] as body:
             return await body.read()
-
-    async def put_file(
-        self,
-        key: Key,
-        path: Path,
-        *,
-        content_type: S3ContentType | str | None = None,
-    ) -> None:
-        """Store a local file."""
-        with path.open('rb') as file:
-            await self.put_stream(key, file, content_type=content_type)
 
     async def get_file(self, key: Key, path: Path, *, overwrite: bool = False) -> None:
         """Load an object into a local file path.
@@ -273,27 +294,6 @@ class S3Client:
         except Exception:
             tmp_path.unlink(missing_ok=True)
             raise
-
-    async def put_stream(
-        self,
-        key: Key,
-        stream: BinaryIO,
-        *,
-        content_type: S3ContentType | str | None = None,
-    ) -> None:
-        """Store data from a binary stream as a single object."""
-        client = self._require_client()
-        kwargs: dict[str, object] = {
-            'Bucket': self._config.bucket,
-            'Key': key,
-            'Body': stream,
-        }
-        if content_type is not None:
-            kwargs['ContentType'] = content_type
-        try:
-            await client.put_object(**kwargs)
-        except Exception as error:
-            raise S3PutObjectError(bucket=self._config.bucket, key=key) from error
 
     async def get_stream(self, key: Key, target: BinaryIO) -> int:
         """Stream an object into a writable binary stream.
