@@ -375,14 +375,18 @@ class S3Client:
         return keys
 
     async def list_subprefixes(self, prefix: Prefix | None = None) -> list[Prefix]:
-        """List immediate subprefixes under an optional prefix.
+        """List immediate logical child prefixes under an optional parent prefix.
 
-        Uses one S3 list request per page. Each request returns up to 1000
-        entries, so large results may require multiple backend requests.
+        `None` and ``''`` both refer to the bucket root. Non-empty prefixes are
+        treated as logical parent prefixes, so `tracks` and `tracks/` are
+        equivalent.
 
-        `None` and ``''`` both mean no prefix. Otherwise `prefix` is treated as
-        a logical parent prefix:
-        a trailing delimiter is added automatically if missing.
+        This method returns only the immediate child prefixes (one level deep)
+        using S3 delimiter-based grouping. Results correspond to logical
+        "folders", not arbitrary key prefixes.
+
+        Uses paginated S3 list requests, with up to 1000 entries per request.
+        Large result sets may require multiple backend calls.
         """
         client = self._require_client()
         prefix = prefix or None
