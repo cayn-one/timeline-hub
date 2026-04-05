@@ -23,6 +23,7 @@ from general_bot.services.track_store import (
     TrackGroupNotFoundError,
     TrackInfo,
     TrackInstrumentalManifestSyncError,
+    TrackInvalidAudioFormatError,
     TrackManifestCorruptedError,
     TrackManifestSyncError,
     TrackPresetsCorruptedError,
@@ -1371,12 +1372,13 @@ async def test_list_tracks_raises_group_not_found_for_missing_group() -> None:
 
 
 @pytest.mark.asyncio
-async def test_store_creates_new_group_and_manifest_entry(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_store_track_creates_new_group_and_manifest_entry(monkeypatch: pytest.MonkeyPatch) -> None:
     _patch_uuid7(monkeypatch, _UUID_1)
+    probe_calls = _patch_probe_audio_sample_rate(monkeypatch)
     s3_client = _FakeS3Client(objects={_presets_key(): _presets_bytes()})
     store = _store(s3_client)
 
-    result = await store.store(
+    result = await store.store_track(
         _track(artists=('artist one', 'artist two'), title='Track Title'),
         group=TrackGroup(universe=TrackUniverse.WEST, year=2026, season=Season.S1),
         sub_season=SubSeason.A,
@@ -1413,11 +1415,13 @@ async def test_store_creates_new_group_and_manifest_entry(monkeypatch: pytest.Mo
             'has_instrumental_variants': False,
         }
     ]
+    assert probe_calls == [b'track']
 
 
 @pytest.mark.asyncio
-async def test_store_uses_dense_order_within_sub_season_only(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_store_track_uses_dense_order_within_sub_season_only(monkeypatch: pytest.MonkeyPatch) -> None:
     _patch_uuid7(monkeypatch, _UUID_2)
+    _patch_probe_audio_sample_rate(monkeypatch)
     manifest_key = _manifest_key(universe=TrackUniverse.WEST, year=2026, season=Season.S1)
     store = _store(
         _FakeS3Client(
@@ -1451,7 +1455,7 @@ async def test_store_uses_dense_order_within_sub_season_only(monkeypatch: pytest
         )
     )
 
-    await store.store(
+    await store.store_track(
         _track(),
         group=TrackGroup(universe=TrackUniverse.WEST, year=2026, season=Season.S1),
         sub_season=SubSeason.A,
@@ -1492,8 +1496,11 @@ async def test_store_uses_dense_order_within_sub_season_only(monkeypatch: pytest
 
 
 @pytest.mark.asyncio
-async def test_store_propagates_raw_error_when_track_upload_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_store_track_propagates_raw_error_when_track_upload_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     _patch_uuid7(monkeypatch, _UUID_1)
+    _patch_probe_audio_sample_rate(monkeypatch)
     track_key = _track_key(universe=TrackUniverse.WEST, year=2026, season=Season.S1, track_id=_UUID_1)
     manifest_key = _manifest_key(universe=TrackUniverse.WEST, year=2026, season=Season.S1)
     s3_client = _FakeS3Client(
@@ -1503,7 +1510,7 @@ async def test_store_propagates_raw_error_when_track_upload_fails(monkeypatch: p
     store = _store(s3_client)
 
     with pytest.raises(RuntimeError, match=re.escape(f'boom putting {track_key}')) as excinfo:
-        await store.store(
+        await store.store_track(
             _track(),
             group=TrackGroup(universe=TrackUniverse.WEST, year=2026, season=Season.S1),
             sub_season=SubSeason.A,
@@ -1517,10 +1524,11 @@ async def test_store_propagates_raw_error_when_track_upload_fails(monkeypatch: p
 
 
 @pytest.mark.asyncio
-async def test_store_raises_sync_error_and_keeps_uploaded_track_when_cover_upload_fails(
+async def test_store_track_raises_sync_error_and_keeps_uploaded_track_when_cover_upload_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _patch_uuid7(monkeypatch, _UUID_1)
+    _patch_probe_audio_sample_rate(monkeypatch)
     manifest_key = _manifest_key(universe=TrackUniverse.WEST, year=2026, season=Season.S1)
     track_key = _track_key(universe=TrackUniverse.WEST, year=2026, season=Season.S1, track_id=_UUID_1)
     cover_key = _cover_key(universe=TrackUniverse.WEST, year=2026, season=Season.S1, track_id=_UUID_1)
@@ -1531,7 +1539,7 @@ async def test_store_raises_sync_error_and_keeps_uploaded_track_when_cover_uploa
     store = _store(s3_client)
 
     with pytest.raises(TrackManifestSyncError, match='cover_upload') as excinfo:
-        await store.store(
+        await store.store_track(
             _track(),
             group=TrackGroup(universe=TrackUniverse.WEST, year=2026, season=Season.S1),
             sub_season=SubSeason.A,
@@ -1554,10 +1562,11 @@ async def test_store_raises_sync_error_and_keeps_uploaded_track_when_cover_uploa
 
 
 @pytest.mark.asyncio
-async def test_store_raises_sync_error_and_keeps_uploaded_objects_when_manifest_write_fails(
+async def test_store_track_raises_sync_error_and_keeps_uploaded_objects_when_manifest_write_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _patch_uuid7(monkeypatch, _UUID_1)
+    _patch_probe_audio_sample_rate(monkeypatch)
     manifest_key = _manifest_key(universe=TrackUniverse.WEST, year=2026, season=Season.S1)
     track_key = _track_key(universe=TrackUniverse.WEST, year=2026, season=Season.S1, track_id=_UUID_1)
     cover_key = _cover_key(universe=TrackUniverse.WEST, year=2026, season=Season.S1, track_id=_UUID_1)
@@ -1568,7 +1577,7 @@ async def test_store_raises_sync_error_and_keeps_uploaded_objects_when_manifest_
     store = _store(s3_client)
 
     with pytest.raises(TrackManifestSyncError, match='manifest_write') as excinfo:
-        await store.store(
+        await store.store_track(
             _track(),
             group=TrackGroup(universe=TrackUniverse.WEST, year=2026, season=Season.S1),
             sub_season=SubSeason.A,
@@ -1592,8 +1601,31 @@ async def test_store_raises_sync_error_and_keeps_uploaded_objects_when_manifest_
 
 
 @pytest.mark.asyncio
-async def test_store_instrumental_uploads_and_rewrites_manifest_for_existing_track() -> None:
+async def test_store_track_rejects_non_48k_audio_before_writes(monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_uuid7(monkeypatch, _UUID_1)
+    probe_calls = _patch_probe_audio_sample_rate(monkeypatch, sample_rate=44_100)
+    s3_client = _FakeS3Client(objects={_presets_key(): _presets_bytes()})
+    store = _store(s3_client)
+
+    with pytest.raises(TrackInvalidAudioFormatError, match='Audio sample rate must be 48000 Hz, got 44100') as excinfo:
+        await store.store_track(
+            _track(audio_bytes=b'bad-track'),
+            group=TrackGroup(universe=TrackUniverse.WEST, year=2026, season=Season.S1),
+            sub_season=SubSeason.A,
+        )
+
+    assert excinfo.value.track_id is None
+    assert excinfo.value.reason == 'Audio sample rate must be 48000 Hz, got 44100'
+    assert probe_calls == [b'bad-track']
+    assert s3_client.put_calls == []
+
+
+@pytest.mark.asyncio
+async def test_store_instrumental_uploads_and_rewrites_manifest_for_existing_track(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     group = TrackGroup(universe=TrackUniverse.WEST, year=2026, season=Season.S1)
+    probe_calls = _patch_probe_audio_sample_rate(monkeypatch, sample_rate=48_000)
     manifest_key = _manifest_key(universe=TrackUniverse.WEST, year=2026, season=Season.S1)
     instrumental_key = _instrumental_key(
         universe=TrackUniverse.WEST,
@@ -1685,11 +1717,15 @@ async def test_store_instrumental_uploads_and_rewrites_manifest_for_existing_tra
             'has_instrumental_variants': False,
         },
     ]
+    assert probe_calls == [b'new-instrumental']
 
 
 @pytest.mark.asyncio
-async def test_store_instrumental_raises_for_unknown_track_id_in_group() -> None:
+async def test_store_instrumental_raises_for_unknown_track_id_in_group(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     group = TrackGroup(universe=TrackUniverse.WEST, year=2026, season=Season.S1)
+    _patch_probe_audio_sample_rate(monkeypatch)
     manifest_key = _manifest_key(universe=TrackUniverse.WEST, year=2026, season=Season.S1)
     store = _store(
         _FakeS3Client(
@@ -1722,8 +1758,11 @@ async def test_store_instrumental_raises_for_unknown_track_id_in_group() -> None
 
 
 @pytest.mark.asyncio
-async def test_store_instrumental_overwrites_existing_key_without_probing_storage() -> None:
+async def test_store_instrumental_overwrites_existing_key_without_probing_storage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     group = TrackGroup(universe=TrackUniverse.WEST, year=2026, season=Season.S1)
+    probe_calls = _patch_probe_audio_sample_rate(monkeypatch)
     manifest_key = _manifest_key(universe=TrackUniverse.WEST, year=2026, season=Season.S1)
     instrumental_key = _instrumental_key(
         universe=TrackUniverse.WEST,
@@ -1762,11 +1801,15 @@ async def test_store_instrumental_overwrites_existing_key_without_probing_storag
     assert s3_client.objects[instrumental_key] == b'new-instrumental'
     assert instrumental_key not in s3_client.get_calls
     assert s3_client.list_subprefixes_calls == []
+    assert probe_calls == [b'new-instrumental']
 
 
 @pytest.mark.asyncio
-async def test_store_instrumental_raises_sync_error_and_keeps_uploaded_object_when_manifest_write_fails() -> None:
+async def test_store_instrumental_raises_sync_error_and_keeps_uploaded_object_when_manifest_write_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     group = TrackGroup(universe=TrackUniverse.WEST, year=2026, season=Season.S1)
+    _patch_probe_audio_sample_rate(monkeypatch)
     manifest_key = _manifest_key(universe=TrackUniverse.WEST, year=2026, season=Season.S1)
     instrumental_key = _instrumental_key(
         universe=TrackUniverse.WEST,
@@ -1830,6 +1873,54 @@ async def test_store_instrumental_raises_sync_error_and_keeps_uploaded_object_wh
     ]
 
 
+@pytest.mark.asyncio
+async def test_store_instrumental_rejects_non_48k_audio_before_writes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    group = TrackGroup(universe=TrackUniverse.WEST, year=2026, season=Season.S1)
+    probe_calls = _patch_probe_audio_sample_rate(monkeypatch, sample_rate=44_100)
+    manifest_key = _manifest_key(universe=TrackUniverse.WEST, year=2026, season=Season.S1)
+    instrumental_key = _instrumental_key(
+        universe=TrackUniverse.WEST,
+        year=2026,
+        season=Season.S1,
+        track_id=_UUID_1,
+    )
+    s3_client = _FakeS3Client(
+        objects={
+            _presets_key(): _presets_bytes(),
+            manifest_key: _manifest_bytes(
+                [
+                    ManifestEntry(
+                        id=_UUID_1,
+                        artists=('artist',),
+                        title='title',
+                        sub_season=SubSeason.A,
+                        order=1,
+                        preset=None,
+                        has_instrumental=False,
+                        has_instrumental_variants=False,
+                    ),
+                ]
+            ),
+        }
+    )
+    store = _store(s3_client)
+
+    with pytest.raises(TrackInvalidAudioFormatError, match='Audio sample rate must be 48000 Hz, got 44100') as excinfo:
+        await store.store_instrumental(
+            b'bad-instrumental',
+            group=group,
+            track_id=_UUID_1,
+        )
+
+    assert excinfo.value.track_id == _UUID_1
+    assert excinfo.value.reason == 'Audio sample rate must be 48000 Hz, got 44100'
+    assert probe_calls == [b'bad-instrumental']
+    assert s3_client.put_calls == []
+    assert instrumental_key not in s3_client.objects
+
+
 def _track_group(
     *, universe: TrackUniverse = TrackUniverse.WEST, year: int = 2026, season: Season = Season.S1
 ) -> TrackGroup:
@@ -1865,6 +1956,21 @@ def _patch_create_audio_variant(monkeypatch: pytest.MonkeyPatch) -> list[tuple[b
         return f'{audio_bytes.decode()}|{speed:.2f}|{reverb:.2f}'.encode()
 
     monkeypatch.setattr(track_store_module, 'create_audio_variant', _fake_create_audio_variant)
+    return calls
+
+
+def _patch_probe_audio_sample_rate(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    sample_rate: int = 48_000,
+) -> list[bytes]:
+    calls: list[bytes] = []
+
+    async def _fake_probe_audio_sample_rate(audio_bytes: bytes, **_: object) -> int:
+        calls.append(audio_bytes)
+        return sample_rate
+
+    monkeypatch.setattr(track_store_module, 'probe_audio_sample_rate', _fake_probe_audio_sample_rate)
     return calls
 
 

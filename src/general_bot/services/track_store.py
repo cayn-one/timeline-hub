@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from enum import IntEnum, StrEnum
 from typing import Self, TypeVar
 
-from general_bot.infra.ffmpeg import create_audio_variant
+from general_bot.infra.ffmpeg import create_audio_variant, probe_audio_sample_rate
 from general_bot.infra.s3 import Key, Prefix, S3Client, S3ContentType, S3ObjectNotFoundError
 
 _TRACKS_PREFIX = 'tracks'
@@ -582,6 +582,18 @@ class TrackGroupNotFoundError(LookupError):
         )
 
 
+class TrackInvalidAudioFormatError(ValueError):
+    """Raised when provided audio bytes do not satisfy TrackStore audio invariants."""
+
+    def __init__(self, reason: str, *, track_id: TrackId | None = None) -> None:
+        self.track_id = track_id
+        self.reason = reason
+        if self.track_id is None:
+            super().__init__(self.reason)
+            return
+        super().__init__(f'Track audio format is invalid for track id {self.track_id}: {self.reason}')
+
+
 class TrackManifestSyncError(RuntimeError):
     """Raised when staged track-store writes leave uploaded objects unsynchronized."""
 
@@ -714,7 +726,7 @@ class TrackStore:
             for entry in entries
         ]
 
-    async def store(
+    async def store_track(
         self,
         track: Track,
         *,
@@ -726,6 +738,12 @@ class TrackStore:
         `track.audio_bytes` must already be Opus data and `track.cover_bytes` must already
         be JPEG data. This phase treats those media formats as a caller
         contract and does not perform expensive media validation.
+
+        Invariant:
+            All stored audio must have a sample rate of exactly 48_000 Hz.
+
+        Validation is strict and performed before any S3 writes. No resampling
+        is performed.
 
         Store creates the target group implicitly by writing its first manifest
         if that group does not yet exist. Track and cover objects are uploaded
@@ -749,9 +767,13 @@ class TrackStore:
         Raises:
             TrackPresetsCorruptedError: If `tracks/presets.json` exists but is malformed.
             TrackManifestCorruptedError: If the target group's manifest exists but is malformed.
+            TrackInvalidAudioFormatError: If `track.audio_bytes` is not 48_000 Hz audio.
             TrackManifestSyncError: If one or more track-store objects are written but a later stage fails.
         """
         await self._ensure_presets_loaded()
+        sample_rate = await probe_audio_sample_rate(track.audio_bytes)
+        if sample_rate != 48_000:
+            raise TrackInvalidAudioFormatError(f'Audio sample rate must be 48000 Hz, got {sample_rate}')
 
         track_group_prefix = self._track_group_prefix(
             universe=group.universe,
@@ -829,11 +851,18 @@ class TrackStore:
         uploaded instrumental is left in place and an explicit sync error is
         raised for manual recovery.
 
+        Invariant:
+            All stored audio must have a sample rate of exactly 48_000 Hz.
+
+        Validation is strict and performed before any S3 writes. No resampling
+        is performed.
+
         Raises:
             TrackPresetsCorruptedError: If `tracks/presets.json` exists but is malformed.
             TrackManifestCorruptedError: If the target group's manifest exists but is malformed.
             TrackGroupNotFoundError: If the target group's manifest does not exist.
             ValueError: If `track_id` does not exist in the provided group's manifest.
+            TrackInvalidAudioFormatError: If `instrumental_bytes` is not 48_000 Hz audio.
             TrackInstrumentalManifestSyncError: If the instrumental is written but the manifest rewrite fails.
         """
         await self._ensure_presets_loaded()
@@ -848,6 +877,12 @@ class TrackStore:
         if not manifest.has_id(track_id):
             raise ValueError(
                 f'Track id {track_id} does not exist in group {group.universe.value}-{group.year}-{int(group.season)}'
+            )
+        sample_rate = await probe_audio_sample_rate(instrumental_bytes)
+        if sample_rate != 48_000:
+            raise TrackInvalidAudioFormatError(
+                f'Audio sample rate must be 48000 Hz, got {sample_rate}',
+                track_id=track_id,
             )
 
         rewritten_manifest = Manifest(
