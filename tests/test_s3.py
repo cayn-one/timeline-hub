@@ -14,6 +14,7 @@ from timeline_hub.infra.s3 import (
     S3GetObjectError,
     S3HeadObjectError,
     S3ListObjectsError,
+    S3MoveObjectError,
     S3ObjectNotFoundError,
     S3PutObjectError,
 )
@@ -444,6 +445,253 @@ async def test_delete_key_wraps_backend_failure(monkeypatch: pytest.MonkeyPatch)
     assert exc.value.key == 'p/1'
     assert str(exc.value) == 'S3 delete failed for key p/1 in bucket bucket'
     assert isinstance(exc.value.__cause__, ClientError)
+
+
+@pytest.mark.asyncio
+async def test_move_key_copies_then_deletes_source(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _Client:
+        def __init__(self) -> None:
+            self.objects = {'source.txt': b'payload'}
+
+        async def head_object(self, **kwargs):
+            key = kwargs['Key']
+            if key not in self.objects:
+                raise _client_error('NotFound', 'HeadObject')
+            return {'ContentLength': len(self.objects[key])}
+
+        async def copy_object(self, **kwargs) -> None:
+            source = kwargs['CopySource']['Key']
+            self.objects[kwargs['Key']] = self.objects[source]
+
+        async def delete_object(self, **kwargs) -> None:
+            del self.objects[kwargs['Key']]
+
+    client = _Client()
+    monkeypatch.setattr(s3_module, 'get_session', lambda: _FakeSession(client))
+
+    storage = S3Client(_config())
+    await storage.open()
+    await storage.move('source.txt', 'target.txt')
+    await storage.close()
+
+    assert client.objects == {'target.txt': b'payload'}
+
+
+@pytest.mark.asyncio
+async def test_move_key_rejects_existing_target_without_overwrite(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Client:
+        def __init__(self) -> None:
+            self.objects = {
+                'source.txt': b'source',
+                'target.txt': b'target',
+            }
+
+        async def head_object(self, **kwargs):
+            key = kwargs['Key']
+            if key not in self.objects:
+                raise _client_error('NotFound', 'HeadObject')
+            return {'ContentLength': len(self.objects[key])}
+
+        async def copy_object(self, **_kwargs) -> None:
+            pytest.fail('copy_object should not be called')
+
+        async def delete_object(self, **_kwargs) -> None:
+            pytest.fail('delete_object should not be called')
+
+    client = _Client()
+    monkeypatch.setattr(s3_module, 'get_session', lambda: _FakeSession(client))
+
+    storage = S3Client(_config())
+    await storage.open()
+
+    with pytest.raises(ValueError) as exc:
+        await storage.move('source.txt', 'target.txt')
+
+    await storage.close()
+    assert str(exc.value) == 'Target key already exists: target.txt'
+    assert client.objects == {
+        'source.txt': b'source',
+        'target.txt': b'target',
+    }
+
+
+@pytest.mark.asyncio
+async def test_move_key_rejects_identical_source_and_target(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Client:
+        async def head_object(self, **_kwargs) -> None:
+            pytest.fail('head_object should not be called')
+
+        async def copy_object(self, **_kwargs) -> None:
+            pytest.fail('copy_object should not be called')
+
+        async def delete_object(self, **_kwargs) -> None:
+            pytest.fail('delete_object should not be called')
+
+    monkeypatch.setattr(s3_module, 'get_session', lambda: _FakeSession(_Client()))
+
+    storage = S3Client(_config())
+    await storage.open()
+
+    with pytest.raises(ValueError) as exc:
+        await storage.move('same.txt', 'same.txt')
+
+    await storage.close()
+    assert str(exc.value) == 'source_key and target_key must differ'
+
+
+@pytest.mark.asyncio
+async def test_move_key_overwrite_replaces_existing_target(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Client:
+        def __init__(self) -> None:
+            self.objects = {
+                'source.txt': b'source',
+                'target.txt': b'target',
+            }
+
+        async def head_object(self, **kwargs):
+            key = kwargs['Key']
+            if key not in self.objects:
+                raise _client_error('NotFound', 'HeadObject')
+            return {'ContentLength': len(self.objects[key])}
+
+        async def copy_object(self, **kwargs) -> None:
+            source = kwargs['CopySource']['Key']
+            self.objects[kwargs['Key']] = self.objects[source]
+
+        async def delete_object(self, **kwargs) -> None:
+            del self.objects[kwargs['Key']]
+
+    client = _Client()
+    monkeypatch.setattr(s3_module, 'get_session', lambda: _FakeSession(client))
+
+    storage = S3Client(_config())
+    await storage.open()
+    await storage.move('source.txt', 'target.txt', overwrite=True)
+    await storage.close()
+
+    assert client.objects == {'target.txt': b'source'}
+
+
+@pytest.mark.asyncio
+async def test_move_key_copy_failure_leaves_source_untouched(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Client:
+        def __init__(self) -> None:
+            self.objects = {'source.txt': b'payload'}
+
+        async def head_object(self, **kwargs):
+            key = kwargs['Key']
+            if key not in self.objects:
+                raise _client_error('NotFound', 'HeadObject')
+            return {'ContentLength': len(self.objects[key])}
+
+        async def copy_object(self, **_kwargs) -> None:
+            raise TimeoutError('timed out')
+
+        async def delete_object(self, **_kwargs) -> None:
+            pytest.fail('delete_object should not be called')
+
+    client = _Client()
+    monkeypatch.setattr(s3_module, 'get_session', lambda: _FakeSession(client))
+
+    storage = S3Client(_config())
+    await storage.open()
+
+    with pytest.raises(S3MoveObjectError) as exc:
+        await storage.move('source.txt', 'target.txt')
+
+    await storage.close()
+    assert exc.value.bucket == 'bucket'
+    assert exc.value.source_key == 'source.txt'
+    assert exc.value.target_key == 'target.txt'
+    assert exc.value.stage == 'copy'
+    assert isinstance(exc.value.__cause__, TimeoutError)
+    assert client.objects == {'source.txt': b'payload'}
+
+
+@pytest.mark.asyncio
+async def test_move_key_delete_failure_leaves_both_keys_and_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Client:
+        def __init__(self) -> None:
+            self.objects = {'source.txt': b'payload'}
+
+        async def head_object(self, **kwargs):
+            key = kwargs['Key']
+            if key not in self.objects:
+                raise _client_error('NotFound', 'HeadObject')
+            return {'ContentLength': len(self.objects[key])}
+
+        async def copy_object(self, **kwargs) -> None:
+            source = kwargs['CopySource']['Key']
+            self.objects[kwargs['Key']] = self.objects[source]
+
+        async def delete_object(self, **_kwargs) -> None:
+            raise ConnectionError('network down')
+
+    client = _Client()
+    monkeypatch.setattr(s3_module, 'get_session', lambda: _FakeSession(client))
+
+    storage = S3Client(_config())
+    await storage.open()
+
+    with pytest.raises(S3MoveObjectError) as exc:
+        await storage.move('source.txt', 'target.txt')
+
+    await storage.close()
+    assert exc.value.bucket == 'bucket'
+    assert exc.value.source_key == 'source.txt'
+    assert exc.value.target_key == 'target.txt'
+    assert exc.value.stage == 'delete_source'
+    assert isinstance(exc.value.__cause__, ConnectionError)
+    assert client.objects == {
+        'source.txt': b'payload',
+        'target.txt': b'payload',
+    }
+
+
+@pytest.mark.asyncio
+async def test_move_key_rejects_source_above_single_copy_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Client:
+        def __init__(self) -> None:
+            self.objects = {'source.txt': b'payload'}
+
+        async def head_object(self, **kwargs):
+            key = kwargs['Key']
+            if key not in self.objects:
+                raise _client_error('NotFound', 'HeadObject')
+            if key == 'source.txt':
+                return {'ContentLength': 5 * 1024**3 + 1}
+            return {'ContentLength': len(self.objects[key])}
+
+        async def copy_object(self, **_kwargs) -> None:
+            pytest.fail('copy_object should not be called')
+
+        async def delete_object(self, **_kwargs) -> None:
+            pytest.fail('delete_object should not be called')
+
+    client = _Client()
+    monkeypatch.setattr(s3_module, 'get_session', lambda: _FakeSession(client))
+
+    storage = S3Client(_config())
+    await storage.open()
+
+    with pytest.raises(ValueError) as exc:
+        await storage.move('source.txt', 'target.txt')
+
+    await storage.close()
+    assert str(exc.value) == ('source_key exceeds the 5 GiB single-copy limit: source.txt (5368709121 bytes)')
+    assert client.objects == {'source.txt': b'payload'}
 
 
 @pytest.mark.asyncio

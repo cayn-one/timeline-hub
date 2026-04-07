@@ -17,6 +17,7 @@ _LIST_MAX_KEYS = 1000
 _DELETE_MAX_OBJECTS = 1000
 _NOT_FOUND_CODES = frozenset({'404', 'NoSuchKey', 'NotFound'})
 _STREAM_READ_SIZE = 64 * 1024
+_COPY_OBJECT_MAX_BYTES = 5 * 1024**3
 
 
 class S3ObjectNotFoundError(Exception):
@@ -94,6 +95,19 @@ class S3HeadObjectError(S3OperationError):
     def __init__(self, *, bucket: str, key: Key) -> None:
         self.key = key
         super().__init__(f'S3 head failed for key {key} in bucket {bucket}', bucket=bucket)
+
+
+class S3MoveObjectError(S3OperationError):
+    """Raised when an S3 move operation fails."""
+
+    def __init__(self, *, bucket: str, source_key: Key, target_key: Key, stage: str) -> None:
+        self.source_key = source_key
+        self.target_key = target_key
+        self.stage = stage
+        super().__init__(
+            (f'S3 move failed for key {source_key} -> {target_key} in bucket {bucket} during {stage}'),
+            bucket=bucket,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -512,6 +526,82 @@ class S3Client:
             deleted += await self._delete_batch(batch)
 
         return deleted
+
+    async def move(
+        self,
+        source_key: Key,
+        target_key: Key,
+        *,
+        overwrite: bool = False,
+    ) -> None:
+        """Move an object key within the same bucket.
+
+        This is implemented as copy + delete; not atomic. It is equivalent to
+        S3 rename/move semantics, where the backend first copies the source
+        object to the target key and then deletes the source key.
+
+        A successful copy may temporarily result in both objects existing.
+        Delete failure after copy leaves duplicate data at both keys.
+
+        Limitations:
+            - This implementation uses a single `copy_object` call and therefore
+              only supports objects up to 5 GiB (S3 single-copy limit).
+            - Larger objects require multipart copy and are rejected explicitly.
+
+        Raises:
+            ValueError: If `source_key` and `target_key` are identical, or if
+                `target_key` already exists and `overwrite` is False, or if the
+                source object exceeds the S3 single-copy size limit.
+            S3ObjectNotFoundError: If `source_key` does not exist.
+            S3MoveObjectError: If the backend copy fails, or if deleting the
+                source fails after a successful copy.
+        """
+        client = self._require_client()
+
+        if source_key == target_key:
+            raise ValueError('source_key and target_key must differ')
+
+        try:
+            source_metadata = await client.head_object(Bucket=self._config.bucket, Key=source_key)
+        except Exception as error:
+            if self._is_not_found(error):
+                raise S3ObjectNotFoundError(source_key) from error
+            raise S3HeadObjectError(bucket=self._config.bucket, key=source_key) from error
+
+        source_size = source_metadata.get('ContentLength')
+        if isinstance(source_size, int) and source_size > _COPY_OBJECT_MAX_BYTES:
+            raise ValueError(f'source_key exceeds the 5 GiB single-copy limit: {source_key} ({source_size} bytes)')
+
+        if not overwrite and await self.exists(target_key):
+            raise ValueError(f'Target key already exists: {target_key}')
+
+        copy_source = {
+            'Bucket': self._config.bucket,
+            'Key': source_key,
+        }
+        try:
+            await client.copy_object(
+                Bucket=self._config.bucket,
+                Key=target_key,
+                CopySource=copy_source,
+            )
+        except Exception as error:
+            raise S3MoveObjectError(
+                bucket=self._config.bucket,
+                source_key=source_key,
+                target_key=target_key,
+                stage='copy',
+            ) from error
+
+        try:
+            await client.delete_object(Bucket=self._config.bucket, Key=source_key)
+        except Exception as error:
+            raise S3MoveObjectError(
+                bucket=self._config.bucket,
+                source_key=source_key,
+                target_key=target_key,
+                stage='delete_source',
+            ) from error
 
     @staticmethod
     def join(*segments: str) -> str:
