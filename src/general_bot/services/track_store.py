@@ -279,7 +279,7 @@ class AppliedPreset:
 
 @dataclass(frozen=True, slots=True)
 class Presets:
-    """Authoritative preset registry stored at `tracks/presets.json`.
+    """Internal validated preset registry aggregate for `PresetStore`.
 
     Invariants:
     - `presets` must not be empty.
@@ -658,17 +658,236 @@ class TrackUpdateManifestSyncError(RuntimeError):
         )
 
 
+class PresetStore:
+    """Owner of authoritative preset registry state stored at `tracks/presets.json`.
+
+    `PresetStore` fully owns bootstrap initialization, lazy cache state, JSON
+    decoding, schema validation, corruption handling, persistence, and preset
+    resolution rules. It is the only component that touches
+    `tracks/presets.json`, and higher-level services do not work with raw
+    `Presets` directly.
+
+    Preset invariants:
+        - The registry is never empty.
+        - The default preset is always stored at index 0.
+        - Stored preset ids and versions are integers >= 1.
+    """
+
+    def __init__(self, s3_client: S3Client, *, bootstrap_preset: Preset) -> None:
+        """Initialize the preset store with an opened generic S3 client."""
+        self._s3_client = s3_client
+        self._bootstrap_preset = bootstrap_preset
+        self._presets_cache: Presets | None = None
+
+    async def ensure_ready(self) -> None:
+        """Force bootstrap and validation of preset storage."""
+        await self._load_presets()
+
+    async def all(self) -> list[PresetRecord]:
+        """List authoritative stored preset records, including version metadata."""
+        presets = await self._load_presets()
+        return list(presets.presets)
+
+    async def default(self) -> PresetRecord:
+        """Return the current default stored preset."""
+        presets = await self._load_presets()
+        return presets.default_preset()
+
+    async def require(self, preset_id: PresetId) -> PresetRecord:
+        """Return one stored preset by id or raise `ValueError`."""
+        presets = await self._load_presets()
+        return presets.require(preset_id)
+
+    async def resolve(self, preset_id: PresetId | None) -> PresetRecord:
+        """Resolve store-time preset selection.
+
+        `None` selects the current default preset. An explicit id is required
+        strictly and raises `ValueError` if unknown.
+        """
+        if preset_id is None:
+            return await self.default()
+        return await self.require(preset_id)
+
+    async def resolve_with_fallback(
+        self,
+        *,
+        requested_id: PresetId | None,
+        fallback_id: PresetId,
+    ) -> PresetRecord:
+        """Resolve preset using fallback semantics.
+
+        Resolution order:
+        - if `requested_id` is provided, it must exist (strict)
+        - otherwise `fallback_id` is attempted
+        - if `fallback_id` is missing, the current default is returned
+        """
+        if requested_id is not None:
+            return await self.require(requested_id)
+
+        presets = await self._load_presets()
+        snapshot = presets.get(fallback_id)
+        if snapshot is not None:
+            return snapshot
+        return presets.default_preset()
+
+    async def add(self, preset: Preset) -> None:
+        """Append a new stored preset record.
+
+        Raises:
+            TrackPresetsCorruptedError: If `tracks/presets.json` exists but is malformed.
+        """
+        presets = await self._load_presets()
+        updated_presets = Presets(
+            presets=[
+                *presets.presets,
+                PresetRecord(
+                    id=self._next_preset_id(presets),
+                    version=1,
+                    preset=preset,
+                ),
+            ],
+        )
+        await self._write_presets_and_update_cache(updated_presets)
+
+    async def replace(self, preset_id: PresetId, preset: Preset) -> None:
+        """Replace one stored preset's editable values and bump its version.
+
+        Raises:
+            TrackPresetsCorruptedError: If `tracks/presets.json` exists but is malformed.
+            ValueError: If `preset_id` does not refer to a known preset.
+        """
+        presets = await self._load_presets()
+        stored_preset = presets.require(preset_id)
+        updated_presets = Presets(
+            presets=[
+                PresetRecord(
+                    id=stored_preset.id,
+                    version=stored_preset.version + 1,
+                    preset=preset,
+                )
+                if existing_preset.id == preset_id
+                else existing_preset
+                for existing_preset in presets.presets
+            ],
+        )
+        await self._write_presets_and_update_cache(updated_presets)
+
+    async def set_default(self, preset_id: PresetId) -> None:
+        """Move the selected preset to the default position at index 0.
+
+        Raises:
+            TrackPresetsCorruptedError: If `tracks/presets.json` exists but is malformed.
+            ValueError: If `preset_id` does not refer to a known preset.
+        """
+        validated_preset_id = _expect_positive_int(
+            preset_id,
+            field='preset_id',
+            context='set_default',
+        )
+
+        presets = await self._load_presets()
+        target = presets.require(validated_preset_id)
+        if presets.default_preset().id == target.id:
+            return
+
+        updated_presets = Presets(
+            presets=[target] + [preset for preset in presets.presets if preset.id != validated_preset_id],
+        )
+        await self._write_presets_and_update_cache(updated_presets)
+
+    async def remove(self, preset_id: PresetId) -> None:
+        """Remove one non-default stored preset.
+
+        The default preset cannot be removed.
+
+        Raises:
+            TrackPresetsCorruptedError: If `tracks/presets.json` exists but is malformed.
+            ValueError: If `preset_id` does not refer to a known preset.
+            TrackDefaultPresetRemovalError: If `preset_id` refers to the current default preset.
+        """
+        validated_preset_id = _expect_positive_int(
+            preset_id,
+            field='preset_id',
+            context='remove',
+        )
+
+        presets = await self._load_presets()
+        target = presets.require(validated_preset_id)
+        if target.id == presets.default_preset().id:
+            raise TrackDefaultPresetRemovalError(f'Cannot remove default preset: {validated_preset_id}')
+
+        updated_presets = Presets(
+            presets=[stored_preset for stored_preset in presets.presets if stored_preset.id != validated_preset_id],
+        )
+        await self._write_presets_and_update_cache(updated_presets)
+
+    async def _load_presets(self) -> Presets:
+        """Return authoritative presets via the single lazy load/cache path."""
+        if self._presets_cache is None:
+            presets_key = self._presets_key()
+            try:
+                raw_presets = await self._s3_client.get_bytes(presets_key)
+            except S3ObjectNotFoundError:
+                presets = self._bootstrap_presets()
+                await self._s3_client.put_bytes(
+                    presets_key,
+                    json.dumps(presets.to_dict(), separators=(',', ':')).encode('utf-8'),
+                    content_type=S3ContentType.JSON,
+                )
+                self._presets_cache = presets
+            else:
+                try:
+                    decoded_presets = json.loads(raw_presets.decode('utf-8'))
+                    presets = Presets.from_dict(decoded_presets)
+                except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+                    raise TrackPresetsCorruptedError(presets_key, str(error)) from error
+
+                self._presets_cache = presets
+
+        return self._presets_cache
+
+    def _bootstrap_presets(self) -> Presets:
+        return Presets(
+            presets=[
+                PresetRecord(
+                    id=1,
+                    version=1,
+                    preset=self._bootstrap_preset,
+                )
+            ],
+        )
+
+    async def _write_presets_and_update_cache(self, presets: Presets) -> None:
+        await self._s3_client.put_bytes(
+            self._presets_key(),
+            json.dumps(presets.to_dict(), separators=(',', ':')).encode('utf-8'),
+            content_type=S3ContentType.JSON,
+        )
+        self._presets_cache = Presets(
+            presets=list(presets.presets),
+        )
+
+    def _next_preset_id(self, presets: Presets) -> PresetId:
+        if not presets.presets:
+            return 1
+        return max(stored_preset.id for stored_preset in presets.presets) + 1
+
+    def _presets_key(self) -> Key:
+        return S3Client.join(_TRACKS_PREFIX, _PRESETS_FILENAME)
+
+
 class TrackStore:
     """Domain-specific wrapper over `S3Client` for grouped track storage.
 
-    Authoritative storage state is limited to `tracks/presets.json`, each
-    group's `manifest.json`, the original track object, the mandatory cover
-    object, and the optional instrumental object. Generated variants are
-    cache-like and may be regenerated later from those authoritative inputs.
+    Authoritative storage state is limited to each group's `manifest.json`,
+    the original track object, the mandatory cover object, and the optional
+    instrumental object. Generated variants are cache-like and may be
+    regenerated later from those authoritative inputs.
 
-    `tracks/presets.json` is guaranteed to exist before any public async
-    method proceeds. The store handles that bootstrap internally and keeps the
-    parsed presets in `_presets_cache`.
+    Preset registry state is owned by an external `PresetStore`. `TrackStore`
+    depends on that service for readiness checks and resolved preset
+    selection only and does not bootstrap, parse, validate, persist, or cache
+    `tracks/presets.json` itself.
 
     The group manifest is authoritative for logical tracks in a `TrackGroup`.
     Store-path reads use copy-safe manifests so writes can stage updates before
@@ -688,11 +907,16 @@ class TrackStore:
         - `fetch()` returns generated variants only and may lazily regenerate stale caches.
     """
 
-    def __init__(self, s3_client: S3Client, *, bootstrap_preset: Preset) -> None:
-        """Initialize the store with an opened generic S3 client."""
+    def __init__(self, s3_client: S3Client, *, preset_store: PresetStore) -> None:
+        """Initialize the store with an opened generic S3 client and preset resolver.
+
+        The caller constructs and owns the `PresetStore` instance passed here.
+        """
+        if preset_store._s3_client is not s3_client:
+            raise ValueError('TrackStore and PresetStore must share the same S3 client instance')
+
         self._s3_client = s3_client
-        self._bootstrap_preset = bootstrap_preset
-        self._presets_cache: Presets | None = None
+        self._preset_store = preset_store
         self._manifest_cache: dict[Prefix, Manifest] = {}
 
     async def list_groups(self) -> list[TrackGroup]:
@@ -703,7 +927,7 @@ class TrackStore:
         `tracks/presets.json` is not part of the returned collection and no
         file-specific ignore list is needed here.
         """
-        await self._ensure_presets_loaded()
+        await self._preset_store.ensure_ready()
         track_group_prefixes = await self._s3_client.list_subprefixes(prefix=_TRACKS_PREFIX)
         track_groups = [self._parse_track_group_prefix(prefix) for prefix in track_group_prefixes]
         return sorted(track_groups, key=lambda group: (group.universe.order(), group.year, int(group.season)))
@@ -716,7 +940,7 @@ class TrackStore:
             TrackGroupNotFoundError: If the requested group manifest does not exist.
             TrackManifestCorruptedError: If the group manifest exists but is malformed.
         """
-        await self._ensure_presets_loaded()
+        await self._preset_store.ensure_ready()
         manifest = await self._require_group_manifest(group, sub_season=None)
         sub_seasons = {entry.sub_season for entry in manifest}
         return sorted(sub_seasons, key=lambda value: value.order())
@@ -734,7 +958,7 @@ class TrackStore:
             TrackGroupNotFoundError: If the requested group manifest does not exist.
             TrackManifestCorruptedError: If the group manifest exists but is malformed.
         """
-        await self._ensure_presets_loaded()
+        await self._preset_store.ensure_ready()
         manifest = await self._require_group_manifest(group, sub_season=sub_season)
         entries = sorted(
             (entry for entry in manifest if entry.sub_season is sub_season),
@@ -801,12 +1025,11 @@ class TrackStore:
             TrackInvalidAudioFormatError: If `track.audio_bytes` is not 48_000 Hz audio.
             TrackManifestSyncError: If one or more track-store objects are written but a later stage fails.
         """
-        presets = await self._ensure_presets_loaded()
         sample_rate = await probe_audio_sample_rate(track.audio_bytes)
         if sample_rate != 48_000:
             raise TrackInvalidAudioFormatError(f'Audio sample rate must be 48000 Hz, got {sample_rate}')
 
-        resolved_preset = presets.default_preset() if preset_id is None else presets.require(preset_id)
+        resolved_preset = await self._preset_store.resolve(preset_id)
         variant_count = len(self._resolve_variant_specs(resolved_preset.preset))
 
         track_group_prefix = self._track_group_prefix(
@@ -909,7 +1132,7 @@ class TrackStore:
             TrackInvalidAudioFormatError: If provided audio bytes are not 48_000 Hz audio.
             TrackUpdateManifestSyncError: If one or more object mutations are applied but a later stage fails.
         """
-        await self._ensure_presets_loaded()
+        await self._preset_store.ensure_ready()
         if (
             artists is None
             and title is None
@@ -1116,11 +1339,10 @@ class TrackStore:
         original track and optional authoritative instrumental objects are read
         only when regeneration is required.
 
-        Preset resolution is tolerant of stale snapshot ids:
-        - if `preset_id` is provided, fetch first tries that preset id
-        - otherwise fetch first tries the track's stored `entry.preset.id`
-        - if the selected preset id no longer exists in `tracks/presets.json`,
-          fetch falls back to the current default preset instead of raising
+        Preset resolution is delegated to `PresetStore`. An explicit
+        caller-supplied preset id is strict, while the manifest snapshot id is
+        tolerant of stale or deleted presets and falls back to the current
+        default preset.
 
         Staleness is determined only by the manifest's cached `AppliedPreset`
         metadata, the resolved source-of-truth `PresetRecord`, the
@@ -1139,8 +1361,8 @@ class TrackStore:
             TrackGroupNotFoundError: If the requested group manifest does not exist.
             TrackManifestCorruptedError: If the requested group manifest exists but is malformed.
             ValueError: If `track_id` is missing from the manifest.
+            ValueError: If caller-supplied `preset_id` does not refer to a known preset.
         """
-        presets = await self._ensure_presets_loaded()
         track_group_prefix = self._track_group_prefix(
             universe=group.universe,
             year=group.year,
@@ -1149,10 +1371,10 @@ class TrackStore:
         manifest = await self._require_group_manifest(group, sub_season=None)
         entry = self._require_manifest_entry(manifest, group=group, track_id=track_id)
 
-        if preset_id is not None:
-            resolved_stored_preset = presets.require(preset_id)
-        else:
-            resolved_stored_preset = presets.get(entry.preset.id) or presets.default_preset()
+        resolved_stored_preset = await self._preset_store.resolve_with_fallback(
+            requested_id=preset_id,
+            fallback_id=entry.preset.id,
+        )
 
         cover_key = self._cover_key(track_group_prefix, track_id)
         cover_bytes = await self._s3_client.get_bytes(cover_key)
@@ -1265,165 +1487,6 @@ class TrackStore:
             instrumental_variants=instrumental_variants,
         )
 
-    async def list_presets(self) -> list[PresetRecord]:
-        """List authoritative stored preset records, including version metadata."""
-        presets = await self._ensure_presets_loaded()
-        return list(presets.presets)
-
-    async def add_preset(self, preset: Preset) -> None:
-        """Append a new stored preset record.
-
-        Raises:
-            TrackPresetsCorruptedError: If `tracks/presets.json` exists but is malformed.
-        """
-        presets = await self._ensure_presets_loaded()
-        next_preset_id = self._next_preset_id(presets)
-        updated_presets = Presets(
-            presets=[
-                *presets.presets,
-                PresetRecord(
-                    id=next_preset_id,
-                    version=1,
-                    preset=preset,
-                ),
-            ],
-        )
-        await self._write_presets_and_update_cache(updated_presets)
-
-    async def replace_preset(self, preset_id: PresetId, preset: Preset) -> None:
-        """Replace one stored preset's editable values and bump its version.
-
-        Raises:
-            TrackPresetsCorruptedError: If `tracks/presets.json` exists but is malformed.
-            ValueError: If `preset_id` does not refer to a known preset.
-        """
-        presets = await self._ensure_presets_loaded()
-        stored_preset = presets.require(preset_id)
-        updated_presets = Presets(
-            presets=[
-                PresetRecord(
-                    id=stored_preset.id,
-                    version=stored_preset.version + 1,
-                    preset=preset,
-                )
-                if existing_preset.id == preset_id
-                else existing_preset
-                for existing_preset in presets.presets
-            ],
-        )
-        await self._write_presets_and_update_cache(updated_presets)
-
-    async def set_default_preset(self, preset_id: PresetId) -> None:
-        """Move the selected preset to the default position at index 0.
-
-        Raises:
-            TrackPresetsCorruptedError: If `tracks/presets.json` exists but is malformed.
-            ValueError: If `preset_id` does not refer to a known preset.
-        """
-        validated_preset_id = _expect_positive_int(
-            preset_id,
-            field='preset_id',
-            context='set_default_preset',
-        )
-
-        presets = await self._ensure_presets_loaded()
-        target = presets.require(validated_preset_id)
-        if presets.default_preset().id == target.id:
-            return
-
-        # Reorder: move selected preset to front, preserve order of others
-        reordered = [target] + [preset for preset in presets.presets if preset.id != validated_preset_id]
-
-        updated_presets = Presets(
-            presets=reordered,
-        )
-
-        await self._write_presets_and_update_cache(updated_presets)
-
-    async def remove_preset(self, preset_id: PresetId) -> None:
-        """Remove one non-default stored preset.
-
-        The default preset cannot be removed.
-
-        Raises:
-            TrackPresetsCorruptedError: If `tracks/presets.json` exists but is malformed.
-            ValueError: If `preset_id` does not refer to a known preset.
-            TrackDefaultPresetRemovalError: If `preset_id` refers to the current default preset.
-        """
-        validated_preset_id = _expect_positive_int(
-            preset_id,
-            field='preset_id',
-            context='remove_preset',
-        )
-
-        presets = await self._ensure_presets_loaded()
-        target = presets.require(validated_preset_id)
-
-        if target.id == presets.default_preset().id:
-            raise TrackDefaultPresetRemovalError(f'Cannot remove default preset: {validated_preset_id}')
-
-        remaining_presets = [
-            stored_preset for stored_preset in presets.presets if stored_preset.id != validated_preset_id
-        ]
-
-        updated_presets = Presets(
-            presets=remaining_presets,
-        )
-        await self._write_presets_and_update_cache(updated_presets)
-
-    async def _ensure_presets_loaded(self) -> Presets:
-        if self._presets_cache is not None:
-            return self._presets_cache
-
-        presets_key = self._presets_key()
-        try:
-            raw_presets = await self._s3_client.get_bytes(presets_key)
-        except S3ObjectNotFoundError:
-            presets = self._bootstrap_presets()
-            await self._s3_client.put_bytes(
-                presets_key,
-                json.dumps(presets.to_dict(), separators=(',', ':')).encode('utf-8'),
-                content_type=S3ContentType.JSON,
-            )
-            self._presets_cache = presets
-            return presets
-
-        try:
-            decoded_presets = json.loads(raw_presets.decode('utf-8'))
-            presets = Presets.from_dict(decoded_presets)
-        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
-            raise TrackPresetsCorruptedError(presets_key, str(error)) from error
-
-        self._presets_cache = presets
-        return presets
-
-    def _bootstrap_presets(self) -> Presets:
-        bootstrap_preset = PresetRecord(
-            id=1,
-            version=1,
-            preset=self._bootstrap_preset,
-        )
-        return Presets(
-            presets=[bootstrap_preset],
-        )
-
-    async def _write_presets_and_update_cache(self, presets: Presets) -> None:
-        presets_key = self._presets_key()
-        presets_payload = json.dumps(presets.to_dict(), separators=(',', ':')).encode('utf-8')
-        await self._s3_client.put_bytes(
-            presets_key,
-            presets_payload,
-            content_type=S3ContentType.JSON,
-        )
-        self._presets_cache = Presets(
-            presets=list(presets.presets),
-        )
-
-    def _next_preset_id(self, presets: Presets) -> PresetId:
-        if not presets.presets:
-            return 1
-        return max(stored_preset.id for stored_preset in presets.presets) + 1
-
     async def _require_group_manifest(self, group: TrackGroup, *, sub_season: SubSeason | None) -> Manifest:
         track_group_prefix = self._track_group_prefix(
             universe=group.universe,
@@ -1484,9 +1547,6 @@ class TrackStore:
             content_type=S3ContentType.JSON,
         )
         self._manifest_cache[track_group_prefix] = manifest.copy()
-
-    def _presets_key(self) -> Key:
-        return S3Client.join(_TRACKS_PREFIX, _PRESETS_FILENAME)
 
     def _track_group_prefix(self, *, universe: TrackUniverse, year: int, season: Season) -> Prefix:
         track_group = _TRACK_GROUP_SEPARATOR.join((universe.value, str(year), str(int(season))))

@@ -16,6 +16,7 @@ from general_bot.services.track_store import (
     PresetMode,
     PresetRecord,
     Presets,
+    PresetStore,
     Season,
     SubSeason,
     Track,
@@ -267,8 +268,27 @@ def _patch_uuid7(monkeypatch: pytest.MonkeyPatch, *track_ids: str) -> None:
     monkeypatch.setattr(track_store_module, '_uuid7', lambda: next(uuids))
 
 
-def _store(s3_client: _FakeS3Client, *, bootstrap_preset: Preset | None = None) -> TrackStore:
+def _store(
+    s3_client: _FakeS3Client,
+    *,
+    bootstrap_preset: Preset | None = None,
+    preset_store: PresetStore | None = None,
+) -> TrackStore:
     return TrackStore(
+        s3_client,
+        preset_store=(
+            preset_store
+            if preset_store is not None
+            else _preset_store(
+                s3_client,
+                bootstrap_preset=bootstrap_preset,
+            )
+        ),
+    )
+
+
+def _preset_store(s3_client: _FakeS3Client, *, bootstrap_preset: Preset | None = None) -> PresetStore:
+    return PresetStore(
         s3_client,
         bootstrap_preset=bootstrap_preset or _bootstrap_preset(),
     )
@@ -832,59 +852,111 @@ def test_instrumental_variant_key_uses_ordered_variant_index() -> None:
 
 
 @pytest.mark.asyncio
-async def test_public_methods_bootstrap_presets_from_constructor_and_cache() -> None:
+async def test_preset_store_bootstraps_presets_from_constructor_and_cache() -> None:
     s3_client = _FakeS3Client()
     bootstrap_preset = _bootstrap_preset()
-    store = _store(s3_client, bootstrap_preset=bootstrap_preset)
+    preset_store = _preset_store(s3_client, bootstrap_preset=bootstrap_preset)
 
-    groups = await store.list_groups()
+    await preset_store.ensure_ready()
 
-    assert groups == []
     assert json.loads(s3_client.objects[_presets_key()].decode('utf-8')) == _presets_payload(
         presets=[_stored_preset(preset_id=1, version=1, preset=bootstrap_preset)]
     )
-    assert store._presets_cache == Presets(
+    assert preset_store._presets_cache == Presets(
         presets=[_stored_preset(preset_id=1, version=1, preset=bootstrap_preset)],
     )
 
 
 @pytest.mark.asyncio
-async def test_existing_s3_presets_win_over_bootstrap_input() -> None:
+async def test_preset_store_existing_s3_presets_win_over_bootstrap_input() -> None:
     s3_client = _FakeS3Client(objects={_presets_key(): _presets_bytes()})
-    store = _store(
+    preset_store = _preset_store(
         s3_client,
         bootstrap_preset=_bootstrap_preset(),
     )
 
-    await store.list_groups()
+    await preset_store.ensure_ready()
 
-    assert store._presets_cache == Presets(
+    assert preset_store._presets_cache == Presets(
         presets=_sample_stored_presets(),
     )
     assert json.loads(s3_client.objects[_presets_key()].decode('utf-8'))['data'][0]['version'] == 3
 
 
 @pytest.mark.asyncio
-async def test_list_presets_returns_stored_presets() -> None:
-    store = _store(_FakeS3Client(objects={_presets_key(): _presets_bytes()}))
+async def test_preset_store_all_returns_stored_presets() -> None:
+    preset_store = _preset_store(_FakeS3Client(objects={_presets_key(): _presets_bytes()}))
 
-    assert await store.list_presets() == _sample_stored_presets()
+    assert await preset_store.all() == _sample_stored_presets()
 
 
 @pytest.mark.asyncio
-async def test_list_presets_returns_shallow_copy_of_cached_list() -> None:
-    store = _store(_FakeS3Client(objects={_presets_key(): _presets_bytes()}))
+async def test_preset_store_all_returns_shallow_copy_of_cached_list() -> None:
+    preset_store = _preset_store(_FakeS3Client(objects={_presets_key(): _presets_bytes()}))
 
-    listed_presets = await store.list_presets()
+    listed_presets = await preset_store.all()
 
     assert listed_presets == _sample_stored_presets()
-    assert listed_presets is not store._presets_cache.presets
+    assert listed_presets is not preset_store._presets_cache.presets
     listed_presets.pop()
-    assert store._presets_cache.presets == _sample_stored_presets()
+    assert preset_store._presets_cache.presets == _sample_stored_presets()
 
 
 @pytest.mark.asyncio
-async def test_add_preset_appends_new_stored_preset_and_preserves_default_first() -> None:
+async def test_preset_store_default_returns_current_default_preset() -> None:
+    preset_store = _preset_store(_FakeS3Client(objects={_presets_key(): _presets_bytes()}))
+
+    assert await preset_store.default() == _sample_stored_presets()[0]
+
+
+@pytest.mark.asyncio
+async def test_preset_store_require_returns_strict_match() -> None:
+    preset_store = _preset_store(_FakeS3Client(objects={_presets_key(): _presets_bytes()}))
+
+    assert await preset_store.require(2) == _sample_stored_presets()[1]
+
+
+@pytest.mark.asyncio
+async def test_preset_store_resolve_uses_default_for_none() -> None:
+    preset_store = _preset_store(_FakeS3Client(objects={_presets_key(): _presets_bytes()}))
+
+    assert await preset_store.resolve(None) == _sample_stored_presets()[0]
+
+
+@pytest.mark.asyncio
+async def test_preset_store_resolve_uses_strict_id_when_provided() -> None:
+    preset_store = _preset_store(_FakeS3Client(objects={_presets_key(): _presets_bytes()}))
+
+    assert await preset_store.resolve(2) == _sample_stored_presets()[1]
+
+
+@pytest.mark.asyncio
+async def test_preset_store_resolve_for_fetch_uses_snapshot_when_current() -> None:
+    preset_store = _preset_store(_FakeS3Client(objects={_presets_key(): _presets_bytes()}))
+
+    assert await preset_store.resolve_with_fallback(requested_id=None, fallback_id=2) == (_sample_stored_presets()[1])
+
+
+@pytest.mark.asyncio
+async def test_preset_store_resolve_for_fetch_falls_back_to_default_for_stale_snapshot() -> None:
+    presets = [
+        _sample_stored_presets()[1],
+        _sample_stored_presets()[0],
+    ]
+    preset_store = _preset_store(_FakeS3Client(objects={_presets_key(): _presets_bytes(presets=presets)}))
+
+    assert await preset_store.resolve_with_fallback(requested_id=None, fallback_id=99) == presets[0]
+
+
+@pytest.mark.asyncio
+async def test_preset_store_resolve_for_fetch_uses_strict_explicit_id() -> None:
+    preset_store = _preset_store(_FakeS3Client(objects={_presets_key(): _presets_bytes()}))
+
+    assert await preset_store.resolve_with_fallback(requested_id=2, fallback_id=1) == (_sample_stored_presets()[1])
+
+
+@pytest.mark.asyncio
+async def test_preset_store_add_appends_new_stored_preset_and_preserves_default_first() -> None:
     new_preset = _preset(
         name='hard',
         slowed=PresetMode(step=0.09, levels=4),
@@ -893,9 +965,9 @@ async def test_add_preset_appends_new_stored_preset_and_preserves_default_first(
         reverb_step=0.02,
     )
     s3_client = _FakeS3Client(objects={_presets_key(): _presets_bytes()})
-    store = _store(s3_client)
+    preset_store = _preset_store(s3_client)
 
-    await store.add_preset(new_preset)
+    await preset_store.add(new_preset)
 
     expected_presets = [
         *_sample_stored_presets(),
@@ -905,14 +977,14 @@ async def test_add_preset_appends_new_stored_preset_and_preserves_default_first(
             preset=new_preset,
         ),
     ]
-    assert store._presets_cache == Presets(
+    assert preset_store._presets_cache == Presets(
         presets=expected_presets,
     )
     assert json.loads(s3_client.objects[_presets_key()].decode('utf-8')) == _presets_payload(presets=expected_presets)
 
 
 @pytest.mark.asyncio
-async def test_replace_preset_preserves_id_increments_version_and_keeps_default() -> None:
+async def test_preset_store_replace_preserves_id_increments_version_and_keeps_default() -> None:
     replacement = _preset(
         name='updated soft',
         slowed=None,
@@ -921,11 +993,11 @@ async def test_replace_preset_preserves_id_increments_version_and_keeps_default(
         reverb_step=0.03,
     )
     s3_client = _FakeS3Client(objects={_presets_key(): _presets_bytes()})
-    store = _store(s3_client)
+    preset_store = _preset_store(s3_client)
 
-    await store.replace_preset(2, replacement)
+    await preset_store.replace(2, replacement)
 
-    assert store._presets_cache == Presets(
+    assert preset_store._presets_cache == Presets(
         presets=[
             _sample_stored_presets()[0],
             _stored_preset(
@@ -948,13 +1020,13 @@ async def test_replace_preset_preserves_id_increments_version_and_keeps_default(
 
 
 @pytest.mark.asyncio
-async def test_set_default_preset_reorders_selected_preset_to_front() -> None:
+async def test_preset_store_set_default_reorders_selected_preset_to_front() -> None:
     s3_client = _FakeS3Client(objects={_presets_key(): _presets_bytes()})
-    store = _store(s3_client)
+    preset_store = _preset_store(s3_client)
 
-    await store.set_default_preset(2)
+    await preset_store.set_default(2)
 
-    assert store._presets_cache == Presets(
+    assert preset_store._presets_cache == Presets(
         presets=[
             _sample_stored_presets()[1],
             _sample_stored_presets()[0],
@@ -969,14 +1041,14 @@ async def test_set_default_preset_reorders_selected_preset_to_front() -> None:
 
 
 @pytest.mark.asyncio
-async def test_set_default_preset_is_noop_when_selected_preset_is_already_first() -> None:
+async def test_preset_store_set_default_is_noop_when_selected_preset_is_already_first() -> None:
     original_bytes = _presets_bytes()
     s3_client = _FakeS3Client(objects={_presets_key(): original_bytes})
-    store = _store(s3_client)
+    preset_store = _preset_store(s3_client)
 
-    await store.set_default_preset(1)
+    await preset_store.set_default(1)
 
-    assert store._presets_cache == Presets(
+    assert preset_store._presets_cache == Presets(
         presets=_sample_stored_presets(),
     )
     assert s3_client.objects[_presets_key()] == original_bytes
@@ -984,13 +1056,13 @@ async def test_set_default_preset_is_noop_when_selected_preset_is_already_first(
 
 
 @pytest.mark.asyncio
-async def test_remove_preset_removes_non_default_preset() -> None:
+async def test_preset_store_remove_removes_non_default_preset() -> None:
     s3_client = _FakeS3Client(objects={_presets_key(): _presets_bytes()})
-    store = _store(s3_client)
+    preset_store = _preset_store(s3_client)
 
-    await store.remove_preset(2)
+    await preset_store.remove(2)
 
-    assert store._presets_cache == Presets(
+    assert preset_store._presets_cache == Presets(
         presets=[_sample_stored_presets()[0]],
     )
     assert json.loads(s3_client.objects[_presets_key()].decode('utf-8')) == _presets_payload(
@@ -999,15 +1071,15 @@ async def test_remove_preset_removes_non_default_preset() -> None:
 
 
 @pytest.mark.asyncio
-async def test_remove_preset_rejects_removing_default_preset() -> None:
-    store = _store(_FakeS3Client(objects={_presets_key(): _presets_bytes()}))
+async def test_preset_store_remove_rejects_removing_default_preset() -> None:
+    preset_store = _preset_store(_FakeS3Client(objects={_presets_key(): _presets_bytes()}))
 
     with pytest.raises(track_store_module.TrackDefaultPresetRemovalError, match='Cannot remove default preset: 1'):
-        await store.remove_preset(1)
+        await preset_store.remove(1)
 
 
 @pytest.mark.asyncio
-async def test_remove_preset_rejects_removing_default_preset_after_reordering() -> None:
+async def test_preset_store_remove_rejects_removing_default_preset_after_reordering() -> None:
     presets = [
         _stored_preset(
             preset_id=2,
@@ -1044,29 +1116,67 @@ async def test_remove_preset_rejects_removing_default_preset_after_reordering() 
         ),
     ]
     s3_client = _FakeS3Client(objects={_presets_key(): _presets_bytes(presets=presets)})
-    store = _store(s3_client)
+    preset_store = _preset_store(s3_client)
 
     with pytest.raises(track_store_module.TrackDefaultPresetRemovalError, match='Cannot remove default preset: 2'):
-        await store.remove_preset(2)
+        await preset_store.remove(2)
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ('method_name', 'args'),
     [
-        ('replace_preset', (99, _preset(name='replacement', slowed=PresetMode(step=0.05, levels=1)))),
-        ('set_default_preset', (99,)),
-        ('remove_preset', (99,)),
+        ('require', (99,)),
+        ('replace', (99, _preset(name='replacement', slowed=PresetMode(step=0.05, levels=1)))),
+        ('set_default', (99,)),
+        ('remove', (99,)),
     ],
 )
-async def test_preset_management_methods_raise_value_error_for_unknown_preset_id(
+async def test_preset_store_management_methods_raise_value_error_for_unknown_preset_id(
     method_name: str,
     args: tuple[object, ...],
 ) -> None:
-    store = _store(_FakeS3Client(objects={_presets_key(): _presets_bytes()}))
+    preset_store = _preset_store(_FakeS3Client(objects={_presets_key(): _presets_bytes()}))
 
     with pytest.raises(ValueError, match='Unknown preset id: 99'):
-        await getattr(store, method_name)(*args)
+        await getattr(preset_store, method_name)(*args)
+
+
+@pytest.mark.asyncio
+async def test_track_store_rejects_preset_store_with_different_s3_client() -> None:
+    with pytest.raises(ValueError, match='TrackStore and PresetStore must share the same S3 client instance'):
+        TrackStore(_FakeS3Client(), preset_store=_preset_store(_FakeS3Client()))
+
+
+@pytest.mark.asyncio
+async def test_track_store_uses_provided_preset_store_without_own_preset_cache() -> None:
+    s3_client = _FakeS3Client(objects={_presets_key(): _presets_bytes()})
+    preset_store = _preset_store(s3_client)
+    store = TrackStore(s3_client, preset_store=preset_store)
+
+    assert store._preset_store is preset_store
+    assert not hasattr(store, '_presets_cache')
+    assert not hasattr(store, 'all')
+    assert not hasattr(store, 'add')
+    assert not hasattr(store, 'replace')
+    assert not hasattr(store, 'set_default')
+    assert not hasattr(store, 'remove')
+
+    assert await store.list_groups() == []
+    assert preset_store._presets_cache == Presets(presets=_sample_stored_presets())
+
+
+@pytest.mark.asyncio
+async def test_shared_preset_store_cache_is_reused_across_track_store_instances() -> None:
+    s3_client = _FakeS3Client(objects={_presets_key(): _presets_bytes()})
+    preset_store = _preset_store(s3_client)
+    first_store = TrackStore(s3_client, preset_store=preset_store)
+    second_store = TrackStore(s3_client, preset_store=preset_store)
+
+    await first_store.list_groups()
+    await second_store.list_groups()
+
+    assert s3_client.get_calls == [_presets_key()]
 
 
 @pytest.mark.asyncio
@@ -2515,19 +2625,12 @@ async def test_fetch_with_unknown_preset_id_raises_value_error(
 async def test_fetch_with_none_resolves_current_default_preset_and_returns_no_instrumental(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    default_calls: list[int] = []
-    original_default_preset = Presets.default_preset
     generation_calls = _patch_create_audio_variant(monkeypatch)
-
-    def _tracking_default_preset(self: Presets) -> PresetRecord:
-        default_calls.append(self.presets[0].id)
-        return original_default_preset(self)
 
     group = _track_group()
     manifest_key = _manifest_key(universe=group.universe, year=group.year, season=group.season)
     track_key = _track_key(universe=group.universe, year=group.year, season=group.season, track_id=_UUID_1)
     cover_key = _cover_key(universe=group.universe, year=group.year, season=group.season, track_id=_UUID_1)
-    monkeypatch.setattr(Presets, 'default_preset', _tracking_default_preset)
     s3_client = _FakeS3Client(
         objects={
             _presets_key(): _presets_bytes(
@@ -2558,7 +2661,6 @@ async def test_fetch_with_none_resolves_current_default_preset_and_returns_no_in
 
     result = await store.fetch(group, _UUID_1)
 
-    assert default_calls == [2]
     assert result.instrumental_variants is None
     assert result.cover_filename == store._s3_key_to_filename(cover_key)
     assert generation_calls == [
@@ -2887,6 +2989,14 @@ async def test_fetch_regeneration_rewrites_manifest_with_applied_preset(monkeypa
         iter(store._manifest_cache[_track_group_prefix(universe=group.universe, year=group.year, season=group.season)])
     ).preset
     assert cached_applied_preset == _applied_preset(preset_id=1, version=3, preset=_sample_stored_presets()[0].preset)
+
+
+@pytest.mark.asyncio
+async def test_preset_store_wraps_corrupted_presets() -> None:
+    preset_store = _preset_store(_FakeS3Client(objects={_presets_key(): b'[]'}))
+
+    with pytest.raises(TrackPresetsCorruptedError):
+        await preset_store.ensure_ready()
 
 
 @pytest.mark.asyncio
