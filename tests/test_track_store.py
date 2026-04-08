@@ -110,17 +110,17 @@ def _presets_key() -> str:
 
 
 def _track_key(*, universe: TrackUniverse, year: int, season: Season, track_id: str) -> str:
-    return S3Client.join(_track_group_prefix(universe=universe, year=year, season=season), track_id + '.opus')
+    return S3Client.join(_track_group_prefix(universe=universe, year=year, season=season), track_id)
 
 
 def _cover_key(*, universe: TrackUniverse, year: int, season: Season, track_id: str) -> str:
-    return S3Client.join(_track_group_prefix(universe=universe, year=year, season=season), track_id + '-cover.jpg')
+    return S3Client.join(_track_group_prefix(universe=universe, year=year, season=season), track_id + '-cover')
 
 
 def _instrumental_key(*, universe: TrackUniverse, year: int, season: Season, track_id: str) -> str:
     return S3Client.join(
         _track_group_prefix(universe=universe, year=year, season=season),
-        track_id + '-instrumental.opus',
+        track_id + '-instrumental',
     )
 
 
@@ -831,11 +831,11 @@ def test_variant_key_uses_ordered_variant_index() -> None:
 
     assert store._variant_key(group_prefix, _UUID_1, index=1) == S3Client.join(
         group_prefix,
-        _UUID_1 + '-variant-1.opus',
+        _UUID_1 + '-variant-1',
     )
     assert store._variant_key(group_prefix, _UUID_1, index=2) == S3Client.join(
         group_prefix,
-        _UUID_1 + '-variant-2.opus',
+        _UUID_1 + '-variant-2',
     )
 
 
@@ -845,12 +845,64 @@ def test_instrumental_variant_key_uses_ordered_variant_index() -> None:
 
     assert store._instrumental_variant_key(group_prefix, _UUID_1, index=1) == S3Client.join(
         group_prefix,
-        _UUID_1 + '-instrumental-variant-1.opus',
+        _UUID_1 + '-instrumental-variant-1',
     )
     assert store._instrumental_variant_key(group_prefix, _UUID_1, index=2) == S3Client.join(
         group_prefix,
-        _UUID_1 + '-instrumental-variant-2.opus',
+        _UUID_1 + '-instrumental-variant-2',
     )
+
+
+def test_track_key_uses_bare_track_id_without_track_suffix() -> None:
+    store = _store(_FakeS3Client())
+    group_prefix = _track_group_prefix(universe=TrackUniverse.WEST, year=2026, season=Season.S1)
+
+    assert store._track_key(group_prefix, _UUID_1) == S3Client.join(group_prefix, _UUID_1)
+    assert not store._track_key(group_prefix, _UUID_1).endswith('-track')
+
+
+def test_attached_and_variant_keys_are_extensionless_and_distinguishable() -> None:
+    store = _store(_FakeS3Client())
+    group_prefix = _track_group_prefix(universe=TrackUniverse.WEST, year=2026, season=Season.S1)
+
+    assert store._cover_key(group_prefix, _UUID_1) == S3Client.join(group_prefix, _UUID_1 + '-cover')
+    assert store._instrumental_key(group_prefix, _UUID_1) == S3Client.join(group_prefix, _UUID_1 + '-instrumental')
+    assert store._variant_key(group_prefix, _UUID_1, index=1) == S3Client.join(group_prefix, _UUID_1 + '-variant-1')
+    assert store._instrumental_variant_key(group_prefix, _UUID_1, index=1) == S3Client.join(
+        group_prefix,
+        _UUID_1 + '-instrumental-variant-1',
+    )
+
+
+def test_track_identity_to_string_returns_expected_identity_string() -> None:
+    group = TrackGroup(universe=TrackUniverse.WEST, year=2026, season=Season.S1)
+
+    assert TrackStore.track_identity_to_string(group, _UUID_1) == f'west-2026-1--{_UUID_1}'
+
+
+def test_track_identity_string_round_trips() -> None:
+    group = TrackGroup(universe=TrackUniverse.EAST, year=2027, season=Season.S4)
+    identity = TrackStore.track_identity_to_string(group, _UUID_1)
+
+    assert TrackStore.string_to_track_identity(identity) == (group, _UUID_1)
+
+
+@pytest.mark.parametrize(
+    ('identity', 'message'),
+    [
+        (f'west-2026-1--{_UUID_1}.jpg', 'must not contain extensions'),
+        (f'west-2026-1--{_UUID_1}.png', 'must not contain extensions'),
+        (f'west-2026-1---{_UUID_1}', 'exactly one'),
+        (f'north-2026-1--{_UUID_1}', 'unsupported universe'),
+        (f'west-year-1--{_UUID_1}', 'invalid year'),
+        (f'west-2026-9--{_UUID_1}', 'invalid season'),
+        ('west-2026-1--not-a-uuid', 'must be a valid UUID'),
+        (f'west-2026-1--{uuid.UUID(int=0x1234).hex}', 'must be a UUIDv7'),
+    ],
+)
+def test_string_to_track_identity_rejects_malformed_values(identity: str, message: str) -> None:
+    with pytest.raises(ValueError, match=re.escape(message)):
+        TrackStore.string_to_track_identity(identity)
 
 
 @pytest.mark.asyncio
@@ -2678,8 +2730,7 @@ async def test_fetch_with_explicit_preset_returns_current_original_and_instrumen
     assert result.artists == ('artist', 'featured')
     assert result.title == 'title'
     assert result.cover_bytes == b'cover-bytes'
-    assert result.cover_filename == store._s3_key_to_filename(cover_key)
-    assert result.cover_filename == 'tracks--west-2026-1--' + _UUID_1 + '-cover.jpg'
+    assert not hasattr(result, 'cover_filename')
     assert isinstance(result.variants[0], FetchedVariant)
     assert [variant.speed for variant in result.variants] == sorted(variant.speed for variant in result.variants)
     assert [variant.audio_bytes for variant in result.variants] == [
@@ -2785,7 +2836,7 @@ async def test_fetch_with_none_resolves_current_default_preset_and_returns_no_in
     result = await store.fetch(group, _UUID_1)
 
     assert result.instrumental_variants is None
-    assert result.cover_filename == store._s3_key_to_filename(cover_key)
+    assert not hasattr(result, 'cover_filename')
     assert generation_calls == [
         (b'authoritative-track', 0.9, 0.03),
         (b'authoritative-track', 0.95, 0.02),

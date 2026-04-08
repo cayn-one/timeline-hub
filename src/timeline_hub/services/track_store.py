@@ -13,16 +13,14 @@ from timeline_hub.infra.s3 import Key, Prefix, S3Client, S3ContentType, S3Object
 _TRACKS_PREFIX = 'tracks'
 _PRESETS_FILENAME = 'presets.json'
 _MANIFEST_FILENAME = 'manifest.json'
-_TRACK_SUFFIX = '.opus'
-_COVER_SUFFIX = '-cover.jpg'
-_INSTRUMENTAL_SUFFIX = '-instrumental.opus'
+_COVER_SUFFIX = '-cover'
+_INSTRUMENTAL_SUFFIX = '-instrumental'
 _VARIANT_MODE_SEPARATOR = '-'
 _TRACK_GROUP_SEPARATOR = '-'
-_FILENAME_S3_DELIMITER_ESCAPE = '--'
+_TRACK_IDENTITY_SEPARATOR = '--'
 
 type TrackId = str
 type PresetId = int
-type Filename = str
 
 
 class Season(IntEnum):
@@ -144,7 +142,6 @@ class FetchedVariants:
     track_id: TrackId
     artists: tuple[str, ...]
     title: str
-    cover_filename: Filename
     cover_bytes: bytes
     variants: tuple[FetchedVariant, ...]
     instrumental_variants: tuple[FetchedVariant, ...] | None
@@ -1314,9 +1311,9 @@ class TrackStore:
 
         The selected track is identified by `(group, track_id)`. The returned
         payload contains only generated variants plus shared UI metadata:
-        cover bytes and a deterministic flat cover filename. The authoritative
-        original track and optional authoritative instrumental objects are read
-        only when regeneration is required.
+        cover bytes. The authoritative original track and optional
+        authoritative instrumental objects are read only when regeneration is
+        required.
 
         Preset resolution is delegated to `PresetStore`. An explicit
         caller-supplied preset id is strict, while the manifest snapshot id is
@@ -1360,7 +1357,6 @@ class TrackStore:
 
         cover_key = self._cover_key(track_group_prefix, track_id)
         cover_bytes = await self._s3_client.get_bytes(cover_key)
-        cover_filename = self._s3_key_to_filename(cover_key)
 
         variant_specs = self._resolve_variant_specs(resolved_stored_preset.preset)
         variant_count = len(variant_specs)
@@ -1587,11 +1583,73 @@ class TrackStore:
             track_id=entry.id,
             artists=entry.artists,
             title=entry.title,
-            cover_filename=cover_filename,
             cover_bytes=cover_bytes,
             variants=variants,
             instrumental_variants=instrumental_variants,
         )
+
+    @staticmethod
+    def track_identity_to_string(group: TrackGroup, track_id: TrackId) -> str:
+        """Encode logical track identity as a strict flat string.
+
+        This is a logical identity string only. It is safe to embed in
+        filenames if higher layers want that, but it is not a filename
+        abstraction and carries no extension handling. Higher layers own any
+        extension policy; `TrackStore` does not participate in it.
+        """
+        track_group = _TRACK_GROUP_SEPARATOR.join((group.universe.value, str(group.year), str(int(group.season))))
+        return _TRACK_IDENTITY_SEPARATOR.join((track_group, track_id))
+
+    @staticmethod
+    def string_to_track_identity(value: str) -> tuple[TrackGroup, TrackId]:
+        """Decode a strict logical track identity string.
+
+        The input must be a clean logical identity string in the exact format
+        produced by `track_identity_to_string()`. It is safe to carry inside
+        filenames, but it is not itself a filename abstraction. `TrackStore`
+        does not strip or tolerate extensions; higher layers must handle that
+        separately.
+        """
+        if not isinstance(value, str):
+            raise ValueError('track identity `value` must be a string')
+        if '.' in value:
+            raise ValueError('track identity `value` must not contain extensions')
+
+        parts = value.split(_TRACK_IDENTITY_SEPARATOR)
+        if len(parts) != 2:
+            raise ValueError(f'track identity `value` must contain exactly one {_TRACK_IDENTITY_SEPARATOR!r} separator')
+
+        group_text, track_id_text = parts
+        if (
+            not group_text
+            or not track_id_text
+            or group_text.endswith(_TRACK_GROUP_SEPARATOR)
+            or track_id_text.startswith(_TRACK_GROUP_SEPARATOR)
+        ):
+            raise ValueError(f'track identity `value` must contain exactly one {_TRACK_IDENTITY_SEPARATOR!r} separator')
+
+        try:
+            universe_text, year_text, season_text = group_text.split(_TRACK_GROUP_SEPARATOR)
+        except ValueError as error:
+            raise ValueError('track identity `value` has malformed group segment') from error
+
+        try:
+            universe = TrackUniverse(universe_text)
+        except ValueError as error:
+            raise ValueError(f'track identity `value` has unsupported universe: {universe_text}') from error
+
+        try:
+            year = int(year_text)
+        except ValueError as error:
+            raise ValueError('track identity `value` has invalid year') from error
+
+        try:
+            season = Season(int(season_text))
+        except ValueError as error:
+            raise ValueError('track identity `value` has invalid season') from error
+
+        track_id = _parse_uuid7(track_id_text, field='value', context='track identity')
+        return TrackGroup(universe=universe, year=year, season=season), track_id
 
     async def _require_group_manifest(self, group: TrackGroup, *, sub_season: SubSeason | None) -> Manifest:
         track_group_prefix = self._track_group_prefix(
@@ -1686,7 +1744,7 @@ class TrackStore:
         return S3Client.join(track_group_prefix, _MANIFEST_FILENAME)
 
     def _track_key(self, track_group_prefix: Prefix, track_id: TrackId) -> Key:
-        return S3Client.join(track_group_prefix, track_id + _TRACK_SUFFIX)
+        return S3Client.join(track_group_prefix, track_id)
 
     def _cover_key(self, track_group_prefix: Prefix, track_id: TrackId) -> Key:
         return S3Client.join(track_group_prefix, track_id + _COVER_SUFFIX)
@@ -1697,7 +1755,7 @@ class TrackStore:
     def _variant_key(self, track_group_prefix: Prefix, track_id: TrackId, *, index: int) -> Key:
         validated_index = _expect_positive_int(index, field='index', context='variant key')
         object_name = f'{track_id}{_VARIANT_MODE_SEPARATOR}variant{_VARIANT_MODE_SEPARATOR}{validated_index}'
-        return S3Client.join(track_group_prefix, object_name + _TRACK_SUFFIX)
+        return S3Client.join(track_group_prefix, object_name)
 
     def _instrumental_variant_key(self, track_group_prefix: Prefix, track_id: TrackId, *, index: int) -> Key:
         validated_index = _expect_positive_int(index, field='index', context='instrumental variant key')
@@ -1705,7 +1763,7 @@ class TrackStore:
             f'{track_id}{_VARIANT_MODE_SEPARATOR}instrumental{_VARIANT_MODE_SEPARATOR}'
             f'variant{_VARIANT_MODE_SEPARATOR}{validated_index}'
         )
-        return S3Client.join(track_group_prefix, object_name + _TRACK_SUFFIX)
+        return S3Client.join(track_group_prefix, object_name)
 
     def _new_track_id(self, *, manifest: Manifest) -> TrackId:
         while True:
@@ -2020,20 +2078,6 @@ class TrackStore:
         updated_entry: ManifestEntry,
     ) -> Manifest:
         return Manifest([updated_entry if entry.id == updated_entry.id else entry for entry in manifest])
-
-    @staticmethod
-    def _s3_key_to_filename(storage_key: Key) -> Filename:
-        """Return a flat filename for TrackStore-generated keys.
-
-        This mapping is reversible only for TrackStore-generated keys that use
-        the store's own storage layout.
-        """
-        return _FILENAME_S3_DELIMITER_ESCAPE.join(S3Client.split(storage_key))
-
-    @staticmethod
-    def _filename_to_s3_key(filename: Filename) -> Key:
-        """Return the TrackStore storage key for a store-generated flat filename."""
-        return S3Client.join(*filename.split(_FILENAME_S3_DELIMITER_ESCAPE))
 
 
 def _uuid7() -> uuid.UUID:
