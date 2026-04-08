@@ -1,7 +1,7 @@
 import json
 import math
 import uuid
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from dataclasses import replace as dataclass_replace
 from enum import IntEnum, StrEnum
@@ -1350,6 +1350,157 @@ class TrackStore:
             ) is None:
                 raise
             raise sync_error from error
+
+    async def reorder(self, group: TrackGroup, track_ids: Sequence[TrackId]) -> None:
+        """Rewrite the authoritative order for exactly one existing sub-season.
+
+        This is a pure ordering operation within a single sub-season already
+        present in the provided group's manifest. The target sub-season is
+        derived from the resolved manifest entries for `track_ids`; it is not
+        passed explicitly.
+
+        `track_ids` defines the exact final authoritative order for that
+        sub-season. All provided ids must exist in the provided group's
+        manifest, must belong to the same sub-season, and must match exactly
+        the full set of track ids currently present in that sub-season. This
+        method does not move tracks between sub-seasons and does not remove any
+        tracks.
+
+        Only manifest `order` fields for that one sub-season are rewritten.
+        No S3 object mutations occur. If manifest persistence fails, the
+        underlying exception is propagated directly because no object sync
+        divergence can occur.
+        """
+        if not track_ids:
+            raise ValueError('reorder() requires at least one track id')
+
+        seen_track_ids: set[TrackId] = set()
+        for track_id in track_ids:
+            if track_id in seen_track_ids:
+                raise ValueError('reorder() track_ids must not contain duplicates')
+            seen_track_ids.add(track_id)
+
+        track_group_prefix = self._track_group_prefix(
+            universe=group.universe,
+            year=group.year,
+            season=group.season,
+        )
+        manifest = (await self._require_group_manifest(group, sub_season=None)).copy()
+        reordered_entries = [
+            self._require_manifest_entry(manifest, group=group, track_id=track_id) for track_id in track_ids
+        ]
+
+        sub_season = reordered_entries[0].sub_season
+        if any(entry.sub_season is not sub_season for entry in reordered_entries):
+            raise ValueError('reorder() track_ids must all belong to the same sub-season')
+
+        sub_season_track_ids = {entry.id for entry in manifest if entry.sub_season is sub_season}
+        if sub_season_track_ids != seen_track_ids:
+            raise ValueError('reorder() track_ids must match exactly the full set of track ids in the sub-season')
+
+        order_by_id = {track_id: index for index, track_id in enumerate(track_ids, start=1)}
+        rewritten_manifest = Manifest(
+            [
+                dataclass_replace(entry, order=order_by_id[entry.id]) if entry.id in order_by_id else entry
+                for entry in manifest
+            ]
+        )
+
+        await self._write_manifest_and_update_cache(
+            track_group_prefix=track_group_prefix,
+            manifest=rewritten_manifest,
+        )
+
+    async def move(
+        self,
+        group: TrackGroup,
+        track_ids: Sequence[TrackId],
+        *,
+        target_sub_season: SubSeason,
+    ) -> None:
+        """Relocate tracks across sub-seasons without mutating any S3 objects.
+
+        This is a pure cross-sub-season relocation operation. It does not act
+        as a reorder shortcut within the same sub-season; same-sub-season
+        reordering must use `reorder()`.
+
+        Input order is intentional and authoritative for the moved tracks
+        within `target_sub_season`. Moved tracks are appended to the end of the
+        target sub-season in the exact order supplied by `track_ids`, while
+        existing tracks already in `target_sub_season` keep their relative
+        order. Source sub-seasons are compacted after removal of moved tracks,
+        and the target sub-season is compacted after appending the moved
+        tracks. No tracks are removed.
+
+        No S3 object mutations occur. If manifest persistence fails, the
+        underlying exception is propagated directly because no object sync
+        divergence can occur.
+        """
+        if not track_ids:
+            raise ValueError('move() requires at least one track id')
+
+        seen_track_ids: set[TrackId] = set()
+        for track_id in track_ids:
+            if track_id in seen_track_ids:
+                raise ValueError('move() track_ids must not contain duplicates')
+            seen_track_ids.add(track_id)
+
+        track_group_prefix = self._track_group_prefix(
+            universe=group.universe,
+            year=group.year,
+            season=group.season,
+        )
+        manifest = (await self._require_group_manifest(group, sub_season=None)).copy()
+        moved_entries = [
+            self._require_manifest_entry(manifest, group=group, track_id=track_id) for track_id in track_ids
+        ]
+        if any(entry.sub_season is target_sub_season for entry in moved_entries):
+            raise ValueError(
+                'move() only supports actual cross-sub-season moves; same-sub-season reordering must use reorder()'
+            )
+
+        moved_track_ids = set(track_ids)
+        affected_sub_seasons = {target_sub_season, *(entry.sub_season for entry in moved_entries)}
+        order_by_id: dict[TrackId, int] = {}
+        sub_season_by_id: dict[TrackId, SubSeason] = {}
+
+        for sub_season in affected_sub_seasons:
+            if sub_season is target_sub_season:
+                remaining_entries = sorted(
+                    (entry for entry in manifest if entry.sub_season is sub_season and entry.id not in moved_track_ids),
+                    key=lambda entry: entry.order,
+                )
+                final_track_ids = [entry.id for entry in remaining_entries] + list(track_ids)
+                for index, track_id in enumerate(final_track_ids, start=1):
+                    order_by_id[track_id] = index
+                for track_id in track_ids:
+                    sub_season_by_id[track_id] = target_sub_season
+                continue
+
+            remaining_entries = sorted(
+                (entry for entry in manifest if entry.sub_season is sub_season and entry.id not in moved_track_ids),
+                key=lambda entry: entry.order,
+            )
+            for index, entry in enumerate(remaining_entries, start=1):
+                order_by_id[entry.id] = index
+
+        rewritten_manifest = Manifest(
+            [
+                dataclass_replace(
+                    entry,
+                    sub_season=sub_season_by_id.get(entry.id, entry.sub_season),
+                    order=order_by_id.get(entry.id, entry.order),
+                )
+                if entry.id in order_by_id or entry.id in sub_season_by_id
+                else entry
+                for entry in manifest
+            ]
+        )
+
+        await self._write_manifest_and_update_cache(
+            track_group_prefix=track_group_prefix,
+            manifest=rewritten_manifest,
+        )
 
     async def remove(self, group: TrackGroup, track_id: TrackId) -> None:
         """Remove one track and all related authoritative and cached objects.

@@ -2981,6 +2981,155 @@ async def test_remove_compacts_only_target_sub_season_order() -> None:
     )
 
 
+@pytest.mark.asyncio
+async def test_reorder_rewrites_only_target_sub_season_order() -> None:
+    group = _track_group()
+    manifest_key = _manifest_key(universe=group.universe, year=group.year, season=group.season)
+    s3_client = _FakeS3Client(
+        objects={
+            _presets_key(): _presets_bytes(),
+            manifest_key: _manifest_bytes(
+                [
+                    _entry(id=_UUID_1, title='a-first', sub_season=SubSeason.A, order=1),
+                    _entry(id=_UUID_2, title='a-second', sub_season=SubSeason.A, order=2),
+                    _entry(id=_UUID_3, title='b-first', sub_season=SubSeason.B, order=1),
+                ]
+            ),
+        }
+    )
+    store = _store(s3_client)
+
+    await store.reorder(group, [_UUID_2, _UUID_1])
+
+    assert json.loads(s3_client.objects[manifest_key].decode('utf-8')) == _manifest_payload(
+        [
+            _entry(id=_UUID_1, title='a-first', sub_season=SubSeason.A, order=2),
+            _entry(id=_UUID_2, title='a-second', sub_season=SubSeason.A, order=1),
+            _entry(id=_UUID_3, title='b-first', sub_season=SubSeason.B, order=1),
+        ]
+    )
+
+
+@pytest.mark.asyncio
+async def test_reorder_rejects_track_ids_from_multiple_sub_seasons() -> None:
+    group = _track_group()
+    manifest_key = _manifest_key(universe=group.universe, year=group.year, season=group.season)
+    s3_client = _FakeS3Client(
+        objects={
+            _presets_key(): _presets_bytes(),
+            manifest_key: _manifest_bytes(
+                [
+                    _entry(id=_UUID_1, sub_season=SubSeason.A, order=1),
+                    _entry(id=_UUID_2, sub_season=SubSeason.B, order=1),
+                ]
+            ),
+        }
+    )
+    store = _store(s3_client)
+
+    with pytest.raises(ValueError, match='reorder\\(\\) track_ids must all belong to the same sub-season'):
+        await store.reorder(group, [_UUID_1, _UUID_2])
+
+
+@pytest.mark.asyncio
+async def test_reorder_rejects_partial_sub_season_set() -> None:
+    group = _track_group()
+    manifest_key = _manifest_key(universe=group.universe, year=group.year, season=group.season)
+    s3_client = _FakeS3Client(
+        objects={
+            _presets_key(): _presets_bytes(),
+            manifest_key: _manifest_bytes(
+                [
+                    _entry(id=_UUID_1, sub_season=SubSeason.A, order=1),
+                    _entry(id=_UUID_2, sub_season=SubSeason.A, order=2),
+                    _entry(id=_UUID_3, sub_season=SubSeason.B, order=1),
+                ]
+            ),
+        }
+    )
+    store = _store(s3_client)
+
+    with pytest.raises(
+        ValueError,
+        match='reorder\\(\\) track_ids must match exactly the full set of track ids in the sub-season',
+    ):
+        await store.reorder(group, [_UUID_1])
+
+
+@pytest.mark.asyncio
+async def test_move_appends_tracks_to_target_in_input_order() -> None:
+    group = _track_group()
+    manifest_key = _manifest_key(universe=group.universe, year=group.year, season=group.season)
+    target_track_id = uuid.UUID('018f05c1-f1a3-7b34-8d29-1f53a1c9d0e4').hex
+    s3_client = _FakeS3Client(
+        objects={
+            _presets_key(): _presets_bytes(),
+            manifest_key: _manifest_bytes(
+                [
+                    _entry(id=_UUID_1, title='a-first', sub_season=SubSeason.A, order=1),
+                    _entry(id=_UUID_2, title='a-second', sub_season=SubSeason.A, order=2),
+                    _entry(id=target_track_id, title='b-first', sub_season=SubSeason.B, order=1),
+                    _entry(id=_UUID_3, title='b-second', sub_season=SubSeason.B, order=2),
+                ]
+            ),
+        }
+    )
+    store = _store(s3_client)
+
+    await store.move(group, [_UUID_2, _UUID_1], target_sub_season=SubSeason.B)
+
+    assert json.loads(s3_client.objects[manifest_key].decode('utf-8')) == _manifest_payload(
+        [
+            _entry(id=_UUID_1, title='a-first', sub_season=SubSeason.B, order=4),
+            _entry(id=_UUID_2, title='a-second', sub_season=SubSeason.B, order=3),
+            _entry(id=target_track_id, title='b-first', sub_season=SubSeason.B, order=1),
+            _entry(id=_UUID_3, title='b-second', sub_season=SubSeason.B, order=2),
+        ]
+    )
+
+
+@pytest.mark.asyncio
+async def test_move_rejects_same_sub_season_moves() -> None:
+    group = _track_group()
+    manifest_key = _manifest_key(universe=group.universe, year=group.year, season=group.season)
+    s3_client = _FakeS3Client(
+        objects={
+            _presets_key(): _presets_bytes(),
+            manifest_key: _manifest_bytes(
+                [
+                    _entry(id=_UUID_1, sub_season=SubSeason.A, order=1),
+                    _entry(id=_UUID_2, sub_season=SubSeason.B, order=1),
+                ]
+            ),
+        }
+    )
+    store = _store(s3_client)
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            'move\\(\\) only supports actual cross-sub-season moves; same-sub-season reordering must use reorder\\(\\)'
+        ),
+    ):
+        await store.move(group, [_UUID_1], target_sub_season=SubSeason.A)
+
+
+@pytest.mark.asyncio
+async def test_move_rejects_duplicate_track_ids() -> None:
+    group = _track_group()
+    manifest_key = _manifest_key(universe=group.universe, year=group.year, season=group.season)
+    s3_client = _FakeS3Client(
+        objects={
+            _presets_key(): _presets_bytes(),
+            manifest_key: _manifest_bytes([_entry(id=_UUID_1, sub_season=SubSeason.A, order=1)]),
+        }
+    )
+    store = _store(s3_client)
+
+    with pytest.raises(ValueError, match='move\\(\\) track_ids must not contain duplicates'):
+        await store.move(group, [_UUID_1, _UUID_1], target_sub_season=SubSeason.B)
+
+
 def _track_group(
     *, universe: TrackUniverse = TrackUniverse.WEST, year: int = 2026, season: Season = Season.S1
 ) -> TrackGroup:
