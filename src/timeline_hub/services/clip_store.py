@@ -14,6 +14,7 @@ from timeline_hub.infra.s3 import Key, Prefix, S3Client, S3ContentType, S3Object
 
 _CLIPS_PREFIX = 'clips'
 _MANIFEST_FILENAME = 'manifest.json'
+# Storage-contract suffix for persisted clip objects and normalized variants.
 _VIDEO_SUFFIX = '.mp4'
 _CLIP_GROUP_SEPARATOR = '-'
 
@@ -114,7 +115,10 @@ class FetchedClip:
 
 @dataclass(frozen=True, slots=True)
 class AudioNormalization:
-    """Audio-normalization settings applied during clip fetch."""
+    """Audio-normalization settings applied during clip fetch.
+
+    Normalization produces MP4 output.
+    """
 
     loudness: float
     bitrate: int
@@ -472,6 +476,10 @@ class ClipStore:
     normalized clip is tracked for a clip id; untracked normalized objects may
     still exist in storage temporarily after failed cache writes and are
     treated as stale cache.
+
+    Clips are stored as `.mp4` objects with MIME type `video/mp4`.
+    `ClipStore` expects MP4-compatible input bytes, and all returned clip
+    bytes are MP4.
     """
 
     def __init__(self, s3_client: S3Client) -> None:
@@ -545,6 +553,10 @@ class ClipStore:
         Writes to the same `ClipGroup` are assumed to be sequential
         (single-writer). Concurrent writes are not supported and may lead to
         manifest overwrite and orphaned clips.
+
+        `clips` must contain MP4-encoded video bytes. `store()` does not
+        perform format validation, and behavior is undefined for non-MP4
+        input.
 
         Raises:
             ManifestCorruptedError: If the clip-group manifest exists but is malformed.
@@ -663,6 +675,9 @@ class ClipStore:
 
         Filtered results preserve the subgroup's canonical current manifest
         order.
+
+        Returned `FetchedClip.bytes` are always MP4, for both raw fetches and
+        audio-normalized fetches.
 
         Raises:
             ClipGroupNotFoundError: If the requested logical clip group has no matching clips.
