@@ -17,6 +17,7 @@ from timeline_hub.services.clip_store import (
     ClipSubGroup,
     DuplicateClipIdsError,
     FetchedClip,
+    InvalidClipIdentityError,
     Manifest,
     ManifestCorruptedError,
     ManifestEntry,
@@ -144,7 +145,7 @@ def test_clip_identity_string_round_trips() -> None:
     ],
 )
 def test_string_to_clip_identity_rejects_malformed_values(identity: str, message: str) -> None:
-    with pytest.raises(ValueError, match=re.escape(message)):
+    with pytest.raises(InvalidClipIdentityError, match=re.escape(message)):
         ClipStore.string_to_clip_identity(identity)
 
 

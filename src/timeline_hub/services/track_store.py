@@ -646,6 +646,10 @@ class TrackInvalidAudioFormatError(ValueError):
         super().__init__(f'Track audio format is invalid for track id {self.track_id}: {self.reason}')
 
 
+class InvalidTrackIdentityError(ValueError):
+    """Raised when an encoded track identity string is invalid."""
+
+
 class TrackManifestSyncError(RuntimeError):
     """Raised when staged track-store writes are not synchronized back into manifest state.
 
@@ -2178,39 +2182,44 @@ class TrackStore:
         separately.
         """
         if not isinstance(value, str):
-            raise ValueError('track identity `value` must be a string')
+            raise InvalidTrackIdentityError('track identity `value` must be a string')
         if '.' in value:
-            raise ValueError('track identity `value` must not contain extensions')
+            raise InvalidTrackIdentityError('track identity `value` must not contain extensions')
 
         parts = value.split('--')
         if len(parts) != 2:
-            raise ValueError("track identity `value` must contain exactly one '--' separator")
+            raise InvalidTrackIdentityError("track identity `value` must contain exactly one '--' separator")
 
         group_text, track_id_text = parts
         if not group_text or not track_id_text or group_text.endswith('-') or track_id_text.startswith('-'):
-            raise ValueError("track identity `value` must contain exactly one '--' separator")
+            raise InvalidTrackIdentityError("track identity `value` must contain exactly one '--' separator")
 
         try:
             universe_text, year_text, season_text = group_text.split('-')
         except ValueError as error:
-            raise ValueError('track identity `value` has malformed group segment') from error
+            raise InvalidTrackIdentityError('track identity `value` has malformed group segment') from error
 
         try:
             universe = TrackUniverse(universe_text)
         except ValueError as error:
-            raise ValueError(f'track identity `value` has unsupported universe: {universe_text}') from error
+            raise InvalidTrackIdentityError(
+                f'track identity `value` has unsupported universe: {universe_text}'
+            ) from error
 
         try:
             year = int(year_text)
         except ValueError as error:
-            raise ValueError('track identity `value` has invalid year') from error
+            raise InvalidTrackIdentityError('track identity `value` has invalid year') from error
 
         try:
             season = Season(int(season_text))
         except ValueError as error:
-            raise ValueError('track identity `value` has invalid season') from error
+            raise InvalidTrackIdentityError('track identity `value` has invalid season') from error
 
-        track_id = _parse_uuid7(track_id_text, field='value', context='track identity')
+        try:
+            track_id = _parse_uuid7(track_id_text, field='value', context='track identity')
+        except ValueError as error:
+            raise InvalidTrackIdentityError(str(error)) from error
         return TrackGroup(universe=universe, year=year, season=season), track_id
 
     async def _require_group_manifest(self, group: TrackGroup, *, sub_season: SubSeason | None) -> Manifest:

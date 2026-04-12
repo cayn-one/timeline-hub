@@ -10,6 +10,7 @@ from timeline_hub.services.track_store import (
     AppliedPreset,
     FetchedVariant,
     FetchedVariants,
+    InvalidTrackIdentityError,
     Manifest,
     ManifestEntry,
     Preset,
@@ -1030,7 +1031,7 @@ def test_track_identity_string_round_trips() -> None:
     ],
 )
 def test_string_to_track_identity_rejects_malformed_values(identity: str, message: str) -> None:
-    with pytest.raises(ValueError, match=re.escape(message)):
+    with pytest.raises(InvalidTrackIdentityError, match=re.escape(message)):
         TrackStore.string_to_track_identity(identity)
 
 

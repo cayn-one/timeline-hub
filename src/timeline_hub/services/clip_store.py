@@ -362,6 +362,10 @@ class ClipIdsNotInSubGroupError(ValueError):
         super().__init__(f'Clip ids are not present in requested sub-group: {list(self.clip_ids)}')
 
 
+class InvalidClipIdentityError(ValueError):
+    """Raised when an encoded clip identity string is invalid."""
+
+
 class ManifestCorruptedError(RuntimeError):
     """Raised when `manifest.json` exists but cannot be decoded or validated."""
 
@@ -991,60 +995,64 @@ class ClipStore:
         abstraction, and this parser does not tolerate paths or extensions.
         """
         if not isinstance(value, str):
-            raise ValueError('clip identity `value` must be a string')
+            raise InvalidClipIdentityError('clip identity `value` must be a string')
         if '/' in value:
-            raise ValueError('clip identity `value` must not contain path separators')
+            raise InvalidClipIdentityError('clip identity `value` must not contain path separators')
         if '.' in value:
-            raise ValueError('clip identity `value` must not contain extensions')
+            raise InvalidClipIdentityError('clip identity `value` must not contain extensions')
 
         parts = value.split('--')
         if len(parts) != 3:
-            raise ValueError("clip identity `value` must contain exactly two '--' separators")
+            raise InvalidClipIdentityError("clip identity `value` must contain exactly two '--' separators")
 
         group_text, sub_group_text, clip_id_text = parts
         if not group_text or not sub_group_text or not clip_id_text:
-            raise ValueError("clip identity `value` must contain exactly two '--' separators")
+            raise InvalidClipIdentityError("clip identity `value` must contain exactly two '--' separators")
 
         try:
             universe_text, year_text, season_text = group_text.split(_CLIP_GROUP_SEPARATOR)
         except ValueError as error:
-            raise ValueError('clip identity `value` has malformed group segment') from error
+            raise InvalidClipIdentityError('clip identity `value` has malformed group segment') from error
 
         try:
             sub_season_text, scope_text = sub_group_text.split(_CLIP_GROUP_SEPARATOR)
         except ValueError as error:
-            raise ValueError('clip identity `value` has malformed sub-group segment') from error
+            raise InvalidClipIdentityError('clip identity `value` has malformed sub-group segment') from error
 
         try:
             universe = Universe(universe_text)
         except ValueError as error:
-            raise ValueError(f'clip identity `value` has unsupported universe: {universe_text}') from error
+            raise InvalidClipIdentityError(
+                f'clip identity `value` has unsupported universe: {universe_text}'
+            ) from error
 
         try:
             year = int(year_text)
         except ValueError as error:
-            raise ValueError('clip identity `value` has invalid year') from error
+            raise InvalidClipIdentityError('clip identity `value` has invalid year') from error
 
         try:
             season = Season(int(season_text))
         except ValueError as error:
-            raise ValueError('clip identity `value` has invalid season') from error
+            raise InvalidClipIdentityError('clip identity `value` has invalid season') from error
 
         try:
             sub_season = SubSeason(sub_season_text)
         except ValueError as error:
-            raise ValueError(f'clip identity `value` has unsupported sub_season: {sub_season_text}') from error
+            raise InvalidClipIdentityError(
+                f'clip identity `value` has unsupported sub_season: {sub_season_text}'
+            ) from error
 
         try:
             scope = Scope(scope_text)
         except ValueError as error:
-            raise ValueError(f'clip identity `value` has unsupported scope: {scope_text}') from error
+            raise InvalidClipIdentityError(f'clip identity `value` has unsupported scope: {scope_text}') from error
 
         try:
             clip_id = _parse_uuid7(clip_id_text, field='id')
         except ValueError as error:
             message = str(error).replace('manifest `id`', 'clip identity `value`')
-            raise ValueError(message) from error
+            raise InvalidClipIdentityError(message) from error
 
         return (
             ClipGroup(universe=universe, year=year, season=season),
