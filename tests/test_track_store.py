@@ -1386,14 +1386,14 @@ async def test_shared_preset_store_cache_is_reused_across_track_store_instances(
     _patch_probe_audio_sample_rate(monkeypatch)
 
     await first_store.store(
+        TrackGroup(universe=TrackUniverse.WEST, year=2026, season=Season.S1),
+        SubSeason.A,
         _track(),
-        group=TrackGroup(universe=TrackUniverse.WEST, year=2026, season=Season.S1),
-        sub_season=SubSeason.A,
     )
     await second_store.store(
+        TrackGroup(universe=TrackUniverse.WEST, year=2026, season=Season.S1),
+        SubSeason.A,
         _track(),
-        group=TrackGroup(universe=TrackUniverse.WEST, year=2026, season=Season.S1),
-        sub_season=SubSeason.A,
     )
 
     assert s3_client.get_calls.count(_presets_key()) == 1
@@ -1683,9 +1683,9 @@ async def test_store_creates_new_group_and_manifest_entry(monkeypatch: pytest.Mo
     store = _store(s3_client)
 
     result = await store.store(
+        TrackGroup(universe=TrackUniverse.WEST, year=2026, season=Season.S1),
+        SubSeason.A,
         _track(artists=('artist one', 'artist two'), title='Track Title'),
-        group=TrackGroup(universe=TrackUniverse.WEST, year=2026, season=Season.S1),
-        sub_season=SubSeason.A,
     )
 
     manifest_key = _manifest_key(universe=TrackUniverse.WEST, year=2026, season=Season.S1)
@@ -1726,9 +1726,9 @@ async def test_store_with_cover_bytes_persists_album_id_equal_to_track_id(
     store = _store(s3_client)
 
     await store.store(
+        group,
+        SubSeason.A,
         _track(cover_bytes=b'cover-bytes'),
-        group=group,
-        sub_season=SubSeason.A,
     )
 
     manifest_payload = json.loads(s3_client.objects[manifest_key].decode('utf-8'))
@@ -1757,9 +1757,9 @@ async def test_store_reuses_cover_from_existing_album_and_persists_provided_albu
     store = _store(s3_client)
 
     await store.store(
+        group,
+        SubSeason.B,
         _track(title='second track', cover_bytes=None, album_id=_UUID_1),
-        group=group,
-        sub_season=SubSeason.B,
     )
 
     manifest_payload = json.loads(s3_client.objects[manifest_key].decode('utf-8'))
@@ -1782,9 +1782,9 @@ async def test_store_with_missing_album_source_raises_value_error_before_writes(
 
     with pytest.raises(ValueError, match=f'Album id {_UUID_1} does not exist in group west-2026-1'):
         await store.store(
+            group,
+            SubSeason.A,
             _track(cover_bytes=None, album_id=_UUID_1),
-            group=group,
-            sub_season=SubSeason.A,
         )
 
     assert probe_calls == [b'track']
@@ -1809,9 +1809,9 @@ async def test_store_initializes_preset_from_current_default_preset(monkeypatch:
     store = _store(s3_client)
 
     await store.store(
+        TrackGroup(universe=TrackUniverse.WEST, year=2026, season=Season.S1),
+        SubSeason.A,
         _track(),
-        group=TrackGroup(universe=TrackUniverse.WEST, year=2026, season=Season.S1),
-        sub_season=SubSeason.A,
     )
 
     manifest_key = _manifest_key(universe=TrackUniverse.WEST, year=2026, season=Season.S1)
@@ -1864,9 +1864,9 @@ async def test_store_uses_dense_order_within_sub_season_only(monkeypatch: pytest
     )
 
     await store.store(
+        TrackGroup(universe=TrackUniverse.WEST, year=2026, season=Season.S1),
+        SubSeason.A,
         _track(),
-        group=TrackGroup(universe=TrackUniverse.WEST, year=2026, season=Season.S1),
-        sub_season=SubSeason.A,
     )
 
     assert json.loads(store._s3_client.objects[manifest_key].decode('utf-8')) == _manifest_payload(
@@ -1921,9 +1921,9 @@ async def test_store_propagates_raw_error_when_track_upload_fails(
 
     with pytest.raises(RuntimeError, match=re.escape(f'boom putting {track_key}')) as excinfo:
         await store.store(
+            TrackGroup(universe=TrackUniverse.WEST, year=2026, season=Season.S1),
+            SubSeason.A,
             _track(),
-            group=TrackGroup(universe=TrackUniverse.WEST, year=2026, season=Season.S1),
-            sub_season=SubSeason.A,
         )
 
     assert excinfo.value.__cause__ is None
@@ -1950,9 +1950,9 @@ async def test_store_raises_sync_error_and_keeps_uploaded_track_when_cover_uploa
 
     with pytest.raises(TrackManifestSyncError, match='cover_upload') as excinfo:
         await store.store(
+            TrackGroup(universe=TrackUniverse.WEST, year=2026, season=Season.S1),
+            SubSeason.A,
             _track(),
-            group=TrackGroup(universe=TrackUniverse.WEST, year=2026, season=Season.S1),
-            sub_season=SubSeason.A,
         )
 
     assert excinfo.value.stage == 'cover_upload'
@@ -1988,9 +1988,9 @@ async def test_store_raises_sync_error_and_keeps_uploaded_objects_when_manifest_
 
     with pytest.raises(TrackManifestSyncError, match='manifest_write') as excinfo:
         await store.store(
+            TrackGroup(universe=TrackUniverse.WEST, year=2026, season=Season.S1),
+            SubSeason.A,
             _track(),
-            group=TrackGroup(universe=TrackUniverse.WEST, year=2026, season=Season.S1),
-            sub_season=SubSeason.A,
         )
 
     assert excinfo.value.stage == 'manifest_write'
@@ -2019,9 +2019,9 @@ async def test_store_rejects_non_48k_audio_before_writes(monkeypatch: pytest.Mon
 
     with pytest.raises(TrackInvalidAudioFormatError, match='Audio sample rate must be 48000 Hz, got 44100') as excinfo:
         await store.store(
+            TrackGroup(universe=TrackUniverse.WEST, year=2026, season=Season.S1),
+            SubSeason.A,
             _track(audio_bytes=b'bad-track'),
-            group=TrackGroup(universe=TrackUniverse.WEST, year=2026, season=Season.S1),
-            sub_season=SubSeason.A,
         )
 
     assert excinfo.value.track_id is None

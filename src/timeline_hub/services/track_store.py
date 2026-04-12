@@ -1040,10 +1040,10 @@ class TrackStore:
 
     async def store(
         self,
-        track: Track,
-        *,
         group: TrackGroup,
         sub_season: SubSeason,
+        track: Track,
+        *,
         preset_id: PresetId | None = None,
     ) -> None:
         """Store one original track plus its mandatory per-track cover object.
