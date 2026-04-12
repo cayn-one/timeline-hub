@@ -60,6 +60,7 @@ from timeline_hub.handlers.router import on_dummy_button
 from timeline_hub.services.clip_store import (
     AudioNormalization,
     ClipGroup,
+    ClipInfo,
     ClipStore,
     ClipSubGroup,
     FetchedClip,
@@ -162,15 +163,15 @@ class _RetrieveClipStore:
 
             yield [FetchedClip(id=clip.id, file=_mp4_file(b'normalized:' + clip.file.data)) for clip in batch]
 
-    async def list_sub_groups(self, group: ClipGroup) -> list[ClipSubGroup]:
-        return list(self.sub_groups)
+    async def list_clips(self, group: ClipGroup) -> dict[ClipSubGroup, list[ClipInfo]]:
+        return {sub_group: [] for sub_group in self.sub_groups}
 
 
 class _NoListClipStore:
     def __init__(self) -> None:
         self.store = AsyncMock(return_value=StoreResult(stored_count=0, duplicate_count=0))
         self.list_groups = AsyncMock(side_effect=AssertionError('store flow must not call list_groups'))
-        self.list_sub_groups = AsyncMock(side_effect=AssertionError('store flow must not call list_sub_groups'))
+        self.list_clips = AsyncMock(side_effect=AssertionError('store flow must not call list_clips'))
 
 
 class _ProduceClipStore:
@@ -1186,7 +1187,7 @@ async def test_compact_action_resends_only_videos_by_file_id_in_original_order()
     clip_store = SimpleNamespace(
         compact=AsyncMock(side_effect=AssertionError('Compact must not use ClipStore.compact')),
         list_groups=AsyncMock(side_effect=AssertionError('Compact must not use ClipStore.list_groups')),
-        list_sub_groups=AsyncMock(side_effect=AssertionError('Compact must not use ClipStore.list_sub_groups')),
+        list_clips=AsyncMock(side_effect=AssertionError('Compact must not use ClipStore.list_clips')),
         reconcile=AsyncMock(side_effect=AssertionError('Compact must not use ClipStore.reconcile')),
         store=AsyncMock(side_effect=AssertionError('Compact must not use ClipStore.store')),
     )
@@ -2270,7 +2271,7 @@ async def test_store_entry_places_newest_year_in_top_right_slot() -> None:
     _assert_no_dummy_buttons(reply_markup)
     assert _keyboard_rows(reply_markup) == [['West'], ['East'], ['Back']]
     services.clip_store.list_groups.assert_not_awaited()
-    services.clip_store.list_sub_groups.assert_not_awaited()
+    services.clip_store.list_clips.assert_not_awaited()
     assert state.data['buffer_version'] == 0
 
 
@@ -3792,7 +3793,7 @@ async def test_store_back_becomes_stale_when_buffer_version_changes() -> None:
 
     message.edit_text.assert_awaited_once_with('Selection is no longer available', reply_markup=None)
     services.clip_store.list_groups.assert_not_awaited()
-    services.clip_store.list_sub_groups.assert_not_awaited()
+    services.clip_store.list_clips.assert_not_awaited()
     assert state.current_state is None
     assert state.clear_count == 1
 

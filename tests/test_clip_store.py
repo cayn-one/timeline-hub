@@ -12,6 +12,7 @@ from timeline_hub.services.clip_store import (
     ClipGroup,
     ClipGroupNotFoundError,
     ClipIdsNotInSubGroupError,
+    ClipInfo,
     ClipManifestSyncError,
     ClipStore,
     ClipSubGroup,
@@ -1295,7 +1296,7 @@ async def test_list_groups_fails_on_malformed_prefix() -> None:
 
 
 @pytest.mark.asyncio
-async def test_list_sub_groups_returns_unique_pairs() -> None:
+async def test_list_clips_returns_unique_sub_groups_as_keys() -> None:
     manifest_key = _manifest_key(year=2024, season=Season.S1, universe=Universe.WEST)
     store = ClipStore(
         _FakeS3Client(
@@ -1332,16 +1333,21 @@ async def test_list_sub_groups_returns_unique_pairs() -> None:
         )
     )
 
-    assert await store.list_sub_groups(
-        ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1),
-    ) == [
+    result = await store.list_clips(ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1))
+
+    assert list(result.keys()) == [
         ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.EXTRA),
         ClipSubGroup(sub_season=SubSeason.A, scope=Scope.COLLECTION),
+    ]
+    assert result[ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.EXTRA)] == [ClipInfo(id=_UUID_4)]
+    assert result[ClipSubGroup(sub_season=SubSeason.A, scope=Scope.COLLECTION)] == [
+        ClipInfo(id=_UUID_1),
+        ClipInfo(id=_UUID_2),
     ]
 
 
 @pytest.mark.asyncio
-async def test_list_sub_groups_returns_sorted_pairs() -> None:
+async def test_list_clips_returns_sorted_sub_groups() -> None:
     manifest_key = _manifest_key(year=2024, season=Season.S1, universe=Universe.WEST)
     store = ClipStore(
         _FakeS3Client(
@@ -1378,9 +1384,9 @@ async def test_list_sub_groups_returns_sorted_pairs() -> None:
         )
     )
 
-    assert await store.list_sub_groups(
-        ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1),
-    ) == [
+    result = await store.list_clips(ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1))
+
+    assert list(result.keys()) == [
         ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.EXTRA),
         ClipSubGroup(sub_season=SubSeason.B, scope=Scope.COLLECTION),
         ClipSubGroup(sub_season=SubSeason.B, scope=Scope.SOURCE),
@@ -1388,11 +1394,67 @@ async def test_list_sub_groups_returns_sorted_pairs() -> None:
 
 
 @pytest.mark.asyncio
-async def test_list_sub_groups_fails_on_missing_manifest() -> None:
+async def test_list_clips_returns_clips_sorted_within_sub_group() -> None:
+    manifest_key = _manifest_key(year=2024, season=Season.S1, universe=Universe.WEST)
+    store = ClipStore(
+        _FakeS3Client(
+            {
+                manifest_key: _manifest_bytes(
+                    [
+                        ManifestEntry(
+                            id=_UUID_4,
+                            video_hash=_HASH_C,
+                            sub_season=SubSeason.A,
+                            scope=Scope.COLLECTION,
+                            batch=2,
+                            order=2,
+                        ),
+                        ManifestEntry(
+                            id=_UUID_2,
+                            video_hash=_HASH_B,
+                            sub_season=SubSeason.A,
+                            scope=Scope.COLLECTION,
+                            batch=1,
+                            order=2,
+                        ),
+                        ManifestEntry(
+                            id=_UUID_1,
+                            video_hash=_HASH_A,
+                            sub_season=SubSeason.A,
+                            scope=Scope.COLLECTION,
+                            batch=1,
+                            order=1,
+                        ),
+                        ManifestEntry(
+                            id=_UUID_3,
+                            video_hash=_HASH_D,
+                            sub_season=SubSeason.A,
+                            scope=Scope.COLLECTION,
+                            batch=2,
+                            order=1,
+                        ),
+                    ]
+                )
+            }
+        )
+    )
+
+    result = await store.list_clips(ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1))
+
+    assert result[ClipSubGroup(sub_season=SubSeason.A, scope=Scope.COLLECTION)] == [
+        ClipInfo(id=_UUID_1),
+        ClipInfo(id=_UUID_2),
+        ClipInfo(id=_UUID_3),
+        ClipInfo(id=_UUID_4),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_list_clips_fails_on_missing_manifest() -> None:
     store = ClipStore(_FakeS3Client())
 
     with pytest.raises(ClipGroupNotFoundError) as excinfo:
-        await store.list_sub_groups(ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1))
+        await store.list_clips(ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1))
 
     assert excinfo.value.year == 2024
     assert excinfo.value.season is Season.S1
@@ -1402,12 +1464,12 @@ async def test_list_sub_groups_fails_on_missing_manifest() -> None:
 
 
 @pytest.mark.asyncio
-async def test_list_sub_groups_fails_on_corrupted_manifest() -> None:
+async def test_list_clips_fails_on_corrupted_manifest() -> None:
     manifest_key = _manifest_key(year=2024, season=Season.S1, universe=Universe.WEST)
     store = ClipStore(_FakeS3Client({manifest_key: b'{"clips": []}'}))
 
     with pytest.raises(ManifestCorruptedError):
-        await store.list_sub_groups(ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1))
+        await store.list_clips(ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1))
 
 
 @pytest.mark.asyncio

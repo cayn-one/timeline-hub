@@ -737,7 +737,7 @@ async def _retrieve_sub_groups(
     clip_group: ClipGroup,
 ) -> list[ClipSubGroup] | None:
     try:
-        return await services.clip_store.list_sub_groups(clip_group)
+        return list((await services.clip_store.list_clips(clip_group)).keys())
     except ClipGroupNotFoundError:
         return None
 

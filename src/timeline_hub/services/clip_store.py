@@ -111,6 +111,13 @@ class ClipSubGroup:
 
 
 @dataclass(frozen=True, slots=True)
+class ClipInfo:
+    """Minimal read model for a persisted clip."""
+
+    id: ClipId
+
+
+@dataclass(frozen=True, slots=True)
 class FetchedClip:
     """Fetched clip payload identified only by clip id."""
 
@@ -507,8 +514,8 @@ class ClipStore:
         clip_groups = [self._parse_clip_group_prefix(prefix) for prefix in clip_group_prefixes]
         return sorted(clip_groups, key=lambda group: (group.universe.order(), group.year, int(group.season)))
 
-    async def list_sub_groups(self, group: ClipGroup) -> list[ClipSubGroup]:
-        """List unique sub-groups for a clip group from its manifest."""
+    async def list_clips(self, group: ClipGroup) -> dict[ClipSubGroup, list[ClipInfo]]:
+        """List clips grouped by sub-group for a clip group from its manifest."""
         clip_group_prefix = self._clip_group_prefix(
             universe=group.universe,
             year=group.year,
@@ -526,14 +533,17 @@ class ClipStore:
                 scope=None,
             ) from error
 
-        sub_groups = {ClipSubGroup(entry.sub_season, entry.scope) for entry in manifest}
-        return sorted(
-            sub_groups,
+        sorted_sub_groups = sorted(
+            {ClipSubGroup(entry.sub_season, entry.scope) for entry in manifest},
             key=lambda sub_group: (
                 sub_group.sub_season.order(),
                 sub_group.scope.value,
             ),
         )
+        return {
+            sub_group: [ClipInfo(id=entry.id) for entry in self._sorted_sub_group_entries(manifest, sub_group)]
+            for sub_group in sorted_sub_groups
+        }
 
     async def store(
         self,
