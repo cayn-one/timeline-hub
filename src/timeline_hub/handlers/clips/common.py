@@ -149,7 +149,7 @@ def selection_labels(
         labels.append(format_selection_value(year))
     if season is not UNSET:
         labels.append(format_selection_value(season))
-    if sub_season is not UNSET and sub_season is not SubSeason.NONE:
+    if sub_season is not UNSET and sub_season != SubSeason.NONE:
         labels.append(format_selection_value(sub_season))
     if scope is not UNSET:
         labels.append(format_selection_value(scope))
@@ -323,7 +323,7 @@ def split_sub_season_buttons(sub_seasons: Sequence[SubSeason]) -> tuple[list[Sub
     regular_buttons = [
         sub_season
         for sub_season in reversed(tuple(SubSeason))
-        if sub_season in sub_seasons and sub_season is not SubSeason.NONE
+        if sub_season in sub_seasons and sub_season != SubSeason.NONE
     ]
     return regular_buttons, special_top
 
