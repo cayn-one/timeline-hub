@@ -693,13 +693,13 @@ class ClipStore:
         *,
         clip_ids: Sequence[ClipId] | None = None,
         audio_normalization: AudioNormalization | None = None,
-    ) -> AsyncIterator[list[FetchedClip]]:
+    ) -> AsyncIterator[tuple[FetchedClip, ...]]:
         """Fetch clips for a clip sub-group in preserved batch order.
 
-        The iterator yields one list per stored batch. Batches are ordered by
-        increasing `batch`, and clips inside each batch are ordered by
-        increasing `order`. When `clip_ids` is provided, validation and
-        resolution are strictly local to the provided `(clip_group,
+        The iterator yields one immutable tuple snapshot per stored batch.
+        Batches are ordered by increasing `batch`, and clips inside each
+        batch are ordered by increasing `order`. When `clip_ids` is provided,
+        validation and resolution are strictly local to the provided `(clip_group,
         clip_sub_group)`. No cross-group or cross-subgroup lookup is
         performed. Unknown ids are ids not present in the manifest of the
         provided `clip_group`.
@@ -782,7 +782,7 @@ class ClipStore:
                             file=FileBytes(data=clip_bytes, extension=Extension.MP4),
                         )
                     )
-                yield clip_batch
+                yield tuple(clip_batch)
                 continue
 
             clip_batch, manifest = await self._fetch_normalized_batch(
@@ -791,7 +791,7 @@ class ClipStore:
                 batch_entries_list,
                 audio_normalization=audio_normalization,
             )
-            yield clip_batch
+            yield tuple(clip_batch)
 
     async def reconcile(
         self,

@@ -684,7 +684,7 @@ async def _send_fetched_clip_batches(
     chat_id: ChatId,
     group: ClipGroup,
     sub_group: ClipSubGroup,
-    clip_batches: AsyncIterator[list[FetchedClip]],
+    clip_batches: AsyncIterator[tuple[FetchedClip, ...]],
 ) -> None:
     async for batch in clip_batches:
         await _send_stored_clip_batch(

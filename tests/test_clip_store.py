@@ -441,14 +441,14 @@ async def test_fetch_returns_grouped_clips_with_portable_filenames(
     ]
 
     assert batches == [
-        [
+        (
             FetchedClip(id=_UUID_1, file=_mp4_file(b'batch-1-first')),
             FetchedClip(id=_UUID_2, file=_mp4_file(b'batch-1-second')),
-        ],
-        [
+        ),
+        (
             FetchedClip(id=_UUID_3, file=_mp4_file(b'batch-2-first')),
             FetchedClip(id=_UUID_4, file=_mp4_file(b'batch-2-second')),
-        ],
+        ),
     ]
     assert all(clip.file.extension is Extension.MP4 for batch in batches for clip in batch)
 
@@ -536,14 +536,14 @@ async def test_fetch_with_audio_normalization_generates_normalized_twins_and_upd
         (b'batch-2-second', -14, 128),
     ]
     assert batches == [
-        [
+        (
             FetchedClip(id=_UUID_1, file=_mp4_file(b'normalized:batch-1-first')),
             FetchedClip(id=_UUID_2, file=_mp4_file(b'normalized:batch-1-second')),
-        ],
-        [
+        ),
+        (
             FetchedClip(id=_UUID_3, file=_mp4_file(b'normalized:batch-2-first')),
             FetchedClip(id=_UUID_4, file=_mp4_file(b'normalized:batch-2-second')),
-        ],
+        ),
     ]
     assert all(clip.file.extension is Extension.MP4 for batch in batches for clip in batch)
     assert s3_client.objects[normalized_key_1] == b'normalized:batch-1-first'
@@ -657,10 +657,10 @@ async def test_fetch_with_same_audio_normalization_reuses_existing_normalized_tw
     ]
 
     assert batches == [
-        [
+        (
             FetchedClip(id=_UUID_1, file=_mp4_file(b'normalized-first')),
             FetchedClip(id=_UUID_2, file=_mp4_file(b'normalized-second')),
-        ]
+        )
     ]
     assert s3_client.put_calls == []
     assert s3_client.get_calls == [manifest_key, normalized_key_1, normalized_key_2]
@@ -730,10 +730,10 @@ async def test_fetch_with_changed_audio_normalization_overwrites_stable_normaliz
         (b'raw-second', -18, 192),
     ]
     assert batches == [
-        [
+        (
             FetchedClip(id=_UUID_1, file=_mp4_file(b'new:raw-first')),
             FetchedClip(id=_UUID_2, file=_mp4_file(b'new:raw-second')),
-        ]
+        )
     ]
     assert s3_client.objects[normalized_key_1] == b'new:raw-first'
     assert s3_client.objects[normalized_key_2] == b'new:raw-second'
@@ -998,7 +998,7 @@ async def test_fetch_regenerates_missing_normalized_twin_when_manifest_says_it_e
     ]
 
     assert calls == [(b'raw-first', -14, 128)]
-    assert batches == [[FetchedClip(id=_UUID_1, file=_mp4_file(b'regenerated:raw-first'))]]
+    assert batches == [(FetchedClip(id=_UUID_1, file=_mp4_file(b'regenerated:raw-first')),)]
     assert s3_client.objects[normalized_key_1] == b'regenerated:raw-first'
     assert json.loads(s3_client.objects[manifest_key].decode('utf-8')) == _manifest_payload(
         [
@@ -1079,8 +1079,8 @@ async def test_fetch_with_clip_ids_returns_only_requested_sub_group_subset_in_ma
     ]
 
     assert batches == [
-        [FetchedClip(id=_UUID_1, file=_mp4_file(b'batch-1-first'))],
-        [FetchedClip(id=_UUID_3, file=_mp4_file(b'batch-2-first'))],
+        (FetchedClip(id=_UUID_1, file=_mp4_file(b'batch-1-first')),),
+        (FetchedClip(id=_UUID_3, file=_mp4_file(b'batch-2-first')),),
     ]
 
 
