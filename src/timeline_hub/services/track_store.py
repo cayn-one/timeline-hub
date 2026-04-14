@@ -8,7 +8,7 @@ from enum import IntEnum, StrEnum
 from typing import Self, TypeVar
 
 from timeline_hub.infra.ffmpeg import create_audio_variant, probe_audio_sample_rate
-from timeline_hub.infra.s3 import Key, Prefix, S3Client, S3ContentType, S3ObjectNotFoundError
+from timeline_hub.infra.s3 import Key, Prefix, S3BatchDeleteError, S3Client, S3ContentType, S3ObjectNotFoundError
 from timeline_hub.types import Extension, FileBytes, InvalidExtensionError
 
 _TRACKS_PREFIX = 'tracks'
@@ -722,27 +722,36 @@ class TrackRemoveManifestSyncError(RuntimeError):
         stage: str,
         track_ids: Iterable[TrackId],
         touched_keys: Iterable[Key],
+        all_keys: Iterable[Key] | None = None,
         manifest_key: Key,
         manifest_committed: bool,
         logical_state: str,
+        failure_detail: str | None = None,
     ) -> None:
         self.operation = operation
         self.stage = stage
         self.track_ids = tuple(track_ids)
         self.track_id = self.track_ids[0] if len(self.track_ids) == 1 else None
         self.touched_keys = tuple(touched_keys)
+        self.all_keys = tuple(all_keys) if all_keys is not None else None
         self.manifest_key = manifest_key
         self.manifest_committed = manifest_committed
         self.logical_state = logical_state
+        self.failure_detail = failure_detail
         manifest_status = (
             'manifest has already been committed'
             if self.manifest_committed
             else 'manifest commit failed before cleanup started'
         )
+        key_context = f'touched/attempted keys: {list(self.touched_keys)}'
+        if self.all_keys is not None:
+            key_context += f'; all cleanup keys: {list(self.all_keys)}'
+        if self.failure_detail is not None:
+            key_context += f'; failure detail: {self.failure_detail}'
         super().__init__(
             f'Track {self.operation} failed at stage={self.stage} for track ids {list(self.track_ids)}; '
             f'{manifest_status}; manifest key: {self.manifest_key}; {self.logical_state}; '
-            f'touched/failed keys: {list(self.touched_keys)}. '
+            f'{key_context}. '
             'Manual cleanup or inspection may be required for the listed keys.'
         )
 
@@ -2017,12 +2026,43 @@ class TrackStore:
                     f'Logical state remains unchanged for sub_season={_format_sub_season(sub_season)} because '
                     'cleanup did not start.'
                 ),
+                failure_detail=repr(error),
             )
             sync_error.add_note(f'Reconcile manifest commit error: {error!r}')
             raise sync_error from error
 
         if not removed_entries:
             return ReconcileResult(updated=len(track_ids), removed=0)
+
+        all_keys: list[Key] = []
+        for removed_entry in removed_entries:
+            all_keys.extend(
+                [
+                    self._track_key(track_group_prefix, removed_entry.id),
+                    self._cover_key(track_group_prefix, removed_entry.id),
+                ]
+            )
+            if removed_entry.has_instrumental:
+                all_keys.append(self._instrumental_key(track_group_prefix, removed_entry.id))
+            if removed_entry.has_variants:
+                all_keys.extend(
+                    self._variant_storage_keys(
+                        track_group_prefix=track_group_prefix,
+                        track_id=removed_entry.id,
+                        variant_count=removed_entry.preset.variant_count,
+                        instrumental=False,
+                    )
+                )
+            if removed_entry.has_instrumental_variants:
+                all_keys.extend(
+                    self._variant_storage_keys(
+                        track_group_prefix=track_group_prefix,
+                        track_id=removed_entry.id,
+                        variant_count=removed_entry.preset.variant_count,
+                        instrumental=True,
+                    )
+                )
+            all_keys[:] = list(self._merge_touched_keys(touched_keys=all_keys))
 
         touched_keys: list[Key] = []
         removed_track_ids = [entry.id for entry in removed_entries]
@@ -2031,6 +2071,7 @@ class TrackStore:
                 track_group_prefix=track_group_prefix,
                 entry=removed_entry,
                 touched_keys=touched_keys,
+                all_keys=all_keys,
                 operation='reconcile cleanup',
                 track_ids=removed_track_ids,
                 manifest_key=manifest_key,
@@ -2104,15 +2145,42 @@ class TrackStore:
                 manifest_key=manifest_key,
                 manifest_committed=False,
                 logical_state='Logical state remains unchanged because authoritative cleanup did not start.',
+                failure_detail=repr(error),
             )
             sync_error.add_note(f'Remove manifest commit error: {error!r}')
             raise sync_error from error
+
+        all_keys = [
+            self._track_key(track_group_prefix, track_id),
+            self._cover_key(track_group_prefix, track_id),
+        ]
+        if entry.has_instrumental:
+            all_keys.append(self._instrumental_key(track_group_prefix, track_id))
+        if entry.has_variants:
+            all_keys.extend(
+                self._variant_storage_keys(
+                    track_group_prefix=track_group_prefix,
+                    track_id=track_id,
+                    variant_count=entry.preset.variant_count,
+                    instrumental=False,
+                )
+            )
+        if entry.has_instrumental_variants:
+            all_keys.extend(
+                self._variant_storage_keys(
+                    track_group_prefix=track_group_prefix,
+                    track_id=track_id,
+                    variant_count=entry.preset.variant_count,
+                    instrumental=True,
+                )
+            )
 
         touched_keys: list[Key] = []
         await self._delete_authoritative_track_objects(
             track_group_prefix=track_group_prefix,
             entry=entry,
             touched_keys=touched_keys,
+            all_keys=all_keys,
             operation='remove cleanup',
             track_ids=[track_id],
             manifest_key=manifest_key,
@@ -2170,16 +2238,28 @@ class TrackStore:
                 manifest_key=manifest_key,
                 manifest_committed=False,
                 logical_state='Logical state remains unchanged because instrumental cleanup did not start.',
+                failure_detail=repr(error),
             )
             sync_error.add_note(f'Remove instrumental manifest write error: {error!r}')
             raise sync_error from error
 
         touched_keys: list[Key] = []
         instrumental_key = self._instrumental_key(track_group_prefix, track_id)
+        all_keys = [instrumental_key]
+        if entry.has_instrumental_variants:
+            all_keys.extend(
+                self._variant_storage_keys(
+                    track_group_prefix=track_group_prefix,
+                    track_id=track_id,
+                    variant_count=entry.preset.variant_count,
+                    instrumental=True,
+                )
+            )
         await self._delete_key_for_cleanup(
             key=instrumental_key,
             stage='instrumental_delete',
             touched_keys=touched_keys,
+            all_keys=all_keys,
             operation='remove_instrumental cleanup',
             track_ids=[track_id],
             manifest_key=manifest_key,
@@ -2196,6 +2276,7 @@ class TrackStore:
                 keys=instrumental_variant_keys,
                 stage='instrumental_variant_delete',
                 touched_keys=touched_keys,
+                all_keys=all_keys,
                 operation='remove_instrumental cleanup',
                 track_ids=[track_id],
                 manifest_key=manifest_key,
@@ -2677,6 +2758,7 @@ class TrackStore:
             manifest_key=manifest_key,
             manifest_committed=False,
             logical_state='Logical state may still follow the previous manifest because cleanup did not complete.',
+            failure_detail=repr(error),
         )
         sync_error.add_note(f'{note_prefix}: {error!r}')
         return sync_error
@@ -2757,6 +2839,7 @@ class TrackStore:
         track_group_prefix: Prefix,
         entry: ManifestEntry,
         touched_keys: list[Key],
+        all_keys: Sequence[Key],
         operation: str,
         track_ids: Sequence[TrackId],
         manifest_key: Key,
@@ -2772,6 +2855,7 @@ class TrackStore:
                 key=key,
                 stage=stage,
                 touched_keys=touched_keys,
+                all_keys=all_keys,
                 operation=operation,
                 track_ids=track_ids,
                 manifest_key=manifest_key,
@@ -2784,6 +2868,7 @@ class TrackStore:
                 key=instrumental_key,
                 stage='instrumental_delete',
                 touched_keys=touched_keys,
+                all_keys=all_keys,
                 operation=operation,
                 track_ids=track_ids,
                 manifest_key=manifest_key,
@@ -2801,6 +2886,7 @@ class TrackStore:
                 keys=original_variant_keys,
                 stage='original_variant_delete',
                 touched_keys=touched_keys,
+                all_keys=all_keys,
                 operation=operation,
                 track_ids=track_ids,
                 manifest_key=manifest_key,
@@ -2818,6 +2904,7 @@ class TrackStore:
                 keys=instrumental_variant_keys,
                 stage='instrumental_variant_delete',
                 touched_keys=touched_keys,
+                all_keys=all_keys,
                 operation=operation,
                 track_ids=track_ids,
                 manifest_key=manifest_key,
@@ -2830,6 +2917,7 @@ class TrackStore:
         key: Key,
         stage: str,
         touched_keys: list[Key],
+        all_keys: Sequence[Key],
         operation: str,
         track_ids: Sequence[TrackId],
         manifest_key: Key,
@@ -2844,9 +2932,11 @@ class TrackStore:
                 stage=stage,
                 track_ids=track_ids,
                 touched_keys=touched_keys,
+                all_keys=all_keys,
                 manifest_key=manifest_key,
                 manifest_committed=True,
                 logical_state=logical_state,
+                failure_detail=repr(error),
             ) from error
 
     async def _delete_keys_for_cleanup(
@@ -2855,24 +2945,43 @@ class TrackStore:
         keys: list[Key],
         stage: str,
         touched_keys: list[Key],
+        all_keys: Sequence[Key],
         operation: str,
         track_ids: Sequence[TrackId],
         manifest_key: Key,
         logical_state: str,
     ) -> None:
-        touched_keys[:] = list(self._merge_touched_keys(touched_keys=touched_keys, assume_touched_keys=keys))
         try:
             await self._s3_client.delete_keys(keys)
+        except S3BatchDeleteError as error:
+            if error.deleted_keys:
+                touched_keys[:] = list(
+                    self._merge_touched_keys(touched_keys=touched_keys, assume_touched_keys=error.deleted_keys)
+                )
+            raise TrackRemoveManifestSyncError(
+                operation=operation,
+                stage=stage,
+                track_ids=track_ids,
+                touched_keys=touched_keys,
+                all_keys=all_keys,
+                manifest_key=manifest_key,
+                manifest_committed=True,
+                logical_state=logical_state,
+                failure_detail=repr(error),
+            ) from error
         except Exception as error:
             raise TrackRemoveManifestSyncError(
                 operation=operation,
                 stage=stage,
                 track_ids=track_ids,
                 touched_keys=touched_keys,
+                all_keys=all_keys,
                 manifest_key=manifest_key,
                 manifest_committed=True,
                 logical_state=logical_state,
+                failure_detail=repr(error),
             ) from error
+        touched_keys[:] = list(self._merge_touched_keys(touched_keys=touched_keys, assume_touched_keys=keys))
 
     async def _commit_manifest_state(
         self,
