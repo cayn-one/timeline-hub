@@ -162,6 +162,14 @@ class FetchedVariants:
     instrumental_variants: tuple[FetchedVariant, ...] | None
 
 
+@dataclass(frozen=True, slots=True)
+class ReconcileResult:
+    """Public result for authoritative sub-season reconciliation."""
+
+    updated: int
+    removed: int
+
+
 class SubSeason(StrEnum):
     """Track sub-season identifier."""
 
@@ -1897,6 +1905,137 @@ class TrackStore:
             manifest=rewritten_manifest,
         )
 
+    async def reconcile(
+        self,
+        group: TrackGroup,
+        sub_season: SubSeason,
+        *,
+        track_ids: Sequence[TrackId],
+    ) -> ReconcileResult:
+        """Authoritatively align one selected `sub_season` to the provided final order.
+
+        Reconcile treats the selected `sub_season` as the authoritative area to
+        rewrite. The provided `track_ids` define the complete final state for
+        that sub-season: their order becomes canonical, omitted tracks currently
+        in that sub-season are removed from authoritative storage, and tracks
+        from other sub-seasons in the same group may be moved in. No new tracks
+        are created.
+
+        Important:
+            The target sub-season cannot be reconciled to an empty state.
+            `track_ids` must contain at least one id. Clearing a sub-season
+            must be performed explicitly via removal operations.
+
+        Validation is strict and completes before any mutation. If authoritative
+        object deletions succeed but a later delete or manifest write fails, the
+        operation raises the existing TrackStore-style sync error with touched
+        keys so recovery remains explicit and operationally honest.
+
+        Raises:
+            TrackManifestCorruptedError: If the target group's manifest exists but is malformed.
+            TrackGroupNotFoundError: If the target group's manifest does not exist.
+            ValueError: If `track_ids` is empty, contains duplicates, or refers to an unknown track id.
+            TrackRemoveManifestSyncError: If one or more authoritative deletions are applied but a later stage fails.
+        """
+        if not track_ids:
+            raise ValueError('reconcile() requires at least one track id')
+
+        seen_track_ids: set[TrackId] = set()
+        for track_id in track_ids:
+            if track_id in seen_track_ids:
+                raise ValueError('reconcile() track_ids must not contain duplicates')
+            seen_track_ids.add(track_id)
+
+        track_group_prefix = self._track_group_prefix(
+            universe=group.universe,
+            year=group.year,
+            season=group.season,
+        )
+        manifest = (await self._require_group_manifest(group, sub_season=None)).copy()
+        reconciled_entries = [
+            self._require_manifest_entry(manifest, group=group, track_id=track_id) for track_id in track_ids
+        ]
+
+        reconciled_track_ids = set(track_ids)
+        current_sub_season_entries = sorted(
+            (entry for entry in manifest if entry.sub_season == sub_season),
+            key=lambda entry: entry.order,
+        )
+        removed_entries = [entry for entry in current_sub_season_entries if entry.id not in reconciled_track_ids]
+        removed_track_ids = {entry.id for entry in removed_entries}
+        rewritten_entries_by_id = self._build_dense_sub_season_entries(
+            reconciled_entries,
+            sub_season=sub_season,
+        )
+
+        affected_source_sub_seasons = {
+            entry.sub_season for entry in reconciled_entries if entry.sub_season != sub_season
+        }
+        for source_sub_season in affected_source_sub_seasons:
+            remaining_source_entries = sorted(
+                (
+                    entry
+                    for entry in manifest
+                    if entry.sub_season == source_sub_season and entry.id not in reconciled_track_ids
+                ),
+                key=lambda entry: entry.order,
+            )
+            rewritten_entries_by_id.update(
+                self._build_dense_sub_season_entries(
+                    remaining_source_entries,
+                    sub_season=source_sub_season,
+                )
+            )
+
+        rewritten_manifest = Manifest(
+            [rewritten_entries_by_id.get(entry.id, entry) for entry in manifest if entry.id not in removed_track_ids]
+        )
+
+        if not removed_entries:
+            await self._write_manifest_and_update_cache(
+                track_group_prefix=track_group_prefix,
+                manifest=rewritten_manifest,
+            )
+            return ReconcileResult(updated=len(track_ids), removed=0)
+
+        manifest_key = self._manifest_key(track_group_prefix)
+        touched_keys: list[Key] = []
+        for removed_entry in removed_entries:
+            await self._delete_authoritative_track_objects(
+                track_group_prefix=track_group_prefix,
+                entry=removed_entry,
+                touched_keys=touched_keys,
+                manifest_key=manifest_key,
+            )
+
+        try:
+            await self._write_manifest_and_update_cache(
+                track_group_prefix=track_group_prefix,
+                manifest=rewritten_manifest,
+            )
+        except Exception as error:
+            if (
+                sync_error := self._build_remove_sync_error(
+                    error,
+                    stage='manifest_write',
+                    track_id=removed_entries[0].id,
+                    touched_keys=touched_keys,
+                    manifest_key=manifest_key,
+                    note_prefix='Reconcile manifest write error',
+                )
+            ) is None:
+                raise
+            sync_error.add_note(
+                f'Reconcile sub_season={_format_sub_season(sub_season)} removed track ids: '
+                f'{[entry.id for entry in removed_entries]}'
+            )
+            raise sync_error from error
+
+        return ReconcileResult(
+            updated=len(track_ids),
+            removed=len(removed_entries),
+        )
+
     async def remove(self, group: TrackGroup, track_id: TrackId) -> None:
         """Remove one track and all related authoritative and cached objects.
 
@@ -1922,103 +2061,14 @@ class TrackStore:
         manifest = (await self._require_group_manifest(group, sub_season=None)).copy()
         entry = self._require_manifest_entry(manifest, group=group, track_id=track_id)
 
-        track_key = self._track_key(track_group_prefix, track_id)
-        cover_key = self._cover_key(track_group_prefix, track_id)
-        instrumental_key = self._instrumental_key(track_group_prefix, track_id)
         manifest_key = self._manifest_key(track_group_prefix)
         touched_keys: list[Key] = []
-
-        # Remove only the object families implied by authoritative manifest state.
-        for key, stage, note_prefix in (
-            (track_key, 'track_delete', 'Original track delete error'),
-            (cover_key, 'cover_delete', 'Cover delete error'),
-        ):
-            try:
-                await self._s3_client.delete_key(key)
-            except Exception as error:
-                if (
-                    sync_error := self._build_remove_sync_error(
-                        error,
-                        stage=stage,
-                        track_id=track_id,
-                        touched_keys=touched_keys,
-                        assume_touched_keys=[key],
-                        manifest_key=manifest_key,
-                        note_prefix=note_prefix,
-                    )
-                ) is None:
-                    raise
-                raise sync_error from error
-            touched_keys.append(key)
-
-        if entry.has_instrumental:
-            try:
-                await self._s3_client.delete_key(instrumental_key)
-            except Exception as error:
-                if (
-                    sync_error := self._build_remove_sync_error(
-                        error,
-                        stage='instrumental_delete',
-                        track_id=track_id,
-                        touched_keys=touched_keys,
-                        assume_touched_keys=[instrumental_key],
-                        manifest_key=manifest_key,
-                        note_prefix='Instrumental delete error',
-                    )
-                ) is None:
-                    raise
-                raise sync_error from error
-            touched_keys.append(instrumental_key)
-
-        if entry.has_variants:
-            original_variant_keys = self._variant_storage_keys(
-                track_group_prefix=track_group_prefix,
-                track_id=track_id,
-                variant_count=entry.preset.variant_count,
-                instrumental=False,
-            )
-            try:
-                await self._s3_client.delete_keys(original_variant_keys)
-            except Exception as error:
-                if (
-                    sync_error := self._build_remove_sync_error(
-                        error,
-                        stage='original_variant_delete',
-                        track_id=track_id,
-                        touched_keys=touched_keys,
-                        assume_touched_keys=original_variant_keys,
-                        manifest_key=manifest_key,
-                        note_prefix='Original variant delete error',
-                    )
-                ) is None:
-                    raise
-                raise sync_error from error
-            touched_keys.extend(original_variant_keys)
-
-        if entry.has_instrumental_variants:
-            instrumental_variant_keys = self._variant_storage_keys(
-                track_group_prefix=track_group_prefix,
-                track_id=track_id,
-                variant_count=entry.preset.variant_count,
-                instrumental=True,
-            )
-            try:
-                await self._s3_client.delete_keys(instrumental_variant_keys)
-            except Exception as error:
-                if (
-                    sync_error := self._build_remove_sync_error(
-                        error,
-                        stage='instrumental_variant_delete',
-                        track_id=track_id,
-                        touched_keys=touched_keys,
-                        assume_touched_keys=instrumental_variant_keys,
-                        manifest_key=manifest_key,
-                        note_prefix='Instrumental variant delete error',
-                    )
-                ) is None:
-                    raise
-                raise sync_error from error
-            touched_keys.extend(instrumental_variant_keys)
+        await self._delete_authoritative_track_objects(
+            track_group_prefix=track_group_prefix,
+            entry=entry,
+            touched_keys=touched_keys,
+            manifest_key=manifest_key,
+        )
 
         remaining_entries = [manifest_entry for manifest_entry in manifest if manifest_entry.id != track_id]
         compacted_order_by_id: dict[TrackId, int] = {}
@@ -2693,6 +2743,119 @@ class TrackStore:
         updated_entry: ManifestEntry,
     ) -> Manifest:
         return Manifest([updated_entry if entry.id == updated_entry.id else entry for entry in manifest])
+
+    def _build_dense_sub_season_entries(
+        self,
+        entries: Sequence[ManifestEntry],
+        *,
+        sub_season: SubSeason,
+    ) -> dict[TrackId, ManifestEntry]:
+        return {
+            entry.id: dataclass_replace(entry, sub_season=sub_season, order=index)
+            for index, entry in enumerate(entries, start=1)
+        }
+
+    async def _delete_authoritative_track_objects(
+        self,
+        *,
+        track_group_prefix: Prefix,
+        entry: ManifestEntry,
+        touched_keys: list[Key],
+        manifest_key: Key,
+    ) -> None:
+        track_id = entry.id
+
+        for key, stage, note_prefix in (
+            (self._track_key(track_group_prefix, track_id), 'track_delete', 'Original track delete error'),
+            (self._cover_key(track_group_prefix, track_id), 'cover_delete', 'Cover delete error'),
+        ):
+            try:
+                await self._s3_client.delete_key(key)
+            except Exception as error:
+                if (
+                    sync_error := self._build_remove_sync_error(
+                        error,
+                        stage=stage,
+                        track_id=track_id,
+                        touched_keys=touched_keys,
+                        assume_touched_keys=[key],
+                        manifest_key=manifest_key,
+                        note_prefix=note_prefix,
+                    )
+                ) is None:
+                    raise
+                raise sync_error from error
+            touched_keys.append(key)
+
+        if entry.has_instrumental:
+            instrumental_key = self._instrumental_key(track_group_prefix, track_id)
+            try:
+                await self._s3_client.delete_key(instrumental_key)
+            except Exception as error:
+                if (
+                    sync_error := self._build_remove_sync_error(
+                        error,
+                        stage='instrumental_delete',
+                        track_id=track_id,
+                        touched_keys=touched_keys,
+                        assume_touched_keys=[instrumental_key],
+                        manifest_key=manifest_key,
+                        note_prefix='Instrumental delete error',
+                    )
+                ) is None:
+                    raise
+                raise sync_error from error
+            touched_keys.append(instrumental_key)
+
+        if entry.has_variants:
+            original_variant_keys = self._variant_storage_keys(
+                track_group_prefix=track_group_prefix,
+                track_id=track_id,
+                variant_count=entry.preset.variant_count,
+                instrumental=False,
+            )
+            try:
+                await self._s3_client.delete_keys(original_variant_keys)
+            except Exception as error:
+                if (
+                    sync_error := self._build_remove_sync_error(
+                        error,
+                        stage='original_variant_delete',
+                        track_id=track_id,
+                        touched_keys=touched_keys,
+                        assume_touched_keys=original_variant_keys,
+                        manifest_key=manifest_key,
+                        note_prefix='Original variant delete error',
+                    )
+                ) is None:
+                    raise
+                raise sync_error from error
+            touched_keys.extend(original_variant_keys)
+
+        if entry.has_instrumental_variants:
+            instrumental_variant_keys = self._variant_storage_keys(
+                track_group_prefix=track_group_prefix,
+                track_id=track_id,
+                variant_count=entry.preset.variant_count,
+                instrumental=True,
+            )
+            try:
+                await self._s3_client.delete_keys(instrumental_variant_keys)
+            except Exception as error:
+                if (
+                    sync_error := self._build_remove_sync_error(
+                        error,
+                        stage='instrumental_variant_delete',
+                        track_id=track_id,
+                        touched_keys=touched_keys,
+                        assume_touched_keys=instrumental_variant_keys,
+                        manifest_key=manifest_key,
+                        note_prefix='Instrumental variant delete error',
+                    )
+                ) is None:
+                    raise
+                raise sync_error from error
+            touched_keys.extend(instrumental_variant_keys)
 
 
 def _uuid7() -> uuid.UUID:

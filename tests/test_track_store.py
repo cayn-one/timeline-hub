@@ -19,6 +19,7 @@ from timeline_hub.services.track_store import (
     PresetRecord,
     Presets,
     PresetStore,
+    ReconcileResult,
     Season,
     SubSeason,
     Track,
@@ -3495,6 +3496,337 @@ async def test_move_rejects_duplicate_track_ids() -> None:
 
     with pytest.raises(ValueError, match='move\\(\\) track_ids must not contain duplicates'):
         await store.move(group, track_ids=[_UUID_1, _UUID_1], target_sub_season=SubSeason.B)
+
+
+@pytest.mark.asyncio
+async def test_reconcile_rewrites_selected_sub_season_authoritatively() -> None:
+    group = _track_group()
+    store = _store(_FakeS3Client())
+    manifest_key = _manifest_key(universe=group.universe, year=group.year, season=group.season)
+    removed_track_id = uuid.UUID('018f05c1-f1a3-7b34-8d29-1f53a1c9d0e4').hex
+    moved_in_track_id = uuid.UUID('018f05c1-f1a3-7b34-8d29-1f53a1c9d0e5').hex
+    unaffected_track_id = uuid.UUID('018f05c1-f1a3-7b34-8d29-1f53a1c9d0e6').hex
+    removed_preset = _sample_stored_presets()[0].preset
+    removed_original_variant_objects = _variant_storage_objects(
+        store,
+        group=group,
+        track_id=removed_track_id,
+        preset=removed_preset,
+        payload_prefix='removed-original',
+    )
+    removed_instrumental_variant_objects = _variant_storage_objects(
+        store,
+        group=group,
+        track_id=removed_track_id,
+        preset=removed_preset,
+        payload_prefix='removed-instrumental',
+        instrumental=True,
+    )
+    s3_client = _FakeS3Client(
+        objects={
+            _presets_key(): _presets_bytes(),
+            manifest_key: _manifest_bytes(
+                [
+                    _entry(id=_UUID_1, title='keep-first', sub_season=SubSeason.A, order=1),
+                    _entry(
+                        id=removed_track_id,
+                        title='remove-me',
+                        sub_season=SubSeason.A,
+                        order=2,
+                        has_variants=True,
+                        has_instrumental=True,
+                        has_instrumental_variants=True,
+                    ),
+                    _entry(id=_UUID_2, title='keep-third', sub_season=SubSeason.A, order=3),
+                    _entry(id=moved_in_track_id, title='move-in', sub_season=SubSeason.B, order=1),
+                    _entry(id=unaffected_track_id, title='stay-b', sub_season=SubSeason.B, order=2),
+                    _entry(id=_UUID_3, title='stay-c', sub_season=SubSeason.C, order=1),
+                ]
+            ),
+            _track_key(
+                universe=group.universe,
+                year=group.year,
+                season=group.season,
+                track_id=removed_track_id,
+            ): b'removed-track',
+            _cover_key(
+                universe=group.universe,
+                year=group.year,
+                season=group.season,
+                track_id=removed_track_id,
+            ): b'removed-cover',
+            _instrumental_key(
+                universe=group.universe,
+                year=group.year,
+                season=group.season,
+                track_id=removed_track_id,
+            ): b'removed-instrumental',
+            **removed_original_variant_objects,
+            **removed_instrumental_variant_objects,
+        }
+    )
+    store = _store(s3_client)
+
+    result = await store.reconcile(
+        group,
+        SubSeason.A,
+        track_ids=[_UUID_2, moved_in_track_id, _UUID_1],
+    )
+
+    assert result == ReconcileResult(updated=3, removed=1)
+    assert json.loads(s3_client.objects[manifest_key].decode('utf-8')) == _manifest_payload(
+        [
+            _entry(id=_UUID_1, title='keep-first', sub_season=SubSeason.A, order=3),
+            _entry(id=_UUID_2, title='keep-third', sub_season=SubSeason.A, order=1),
+            _entry(id=moved_in_track_id, title='move-in', sub_season=SubSeason.A, order=2),
+            _entry(id=unaffected_track_id, title='stay-b', sub_season=SubSeason.B, order=1),
+            _entry(id=_UUID_3, title='stay-c', sub_season=SubSeason.C, order=1),
+        ]
+    )
+    assert (
+        _track_key(universe=group.universe, year=group.year, season=group.season, track_id=removed_track_id)
+        not in s3_client.objects
+    )
+    assert (
+        _cover_key(universe=group.universe, year=group.year, season=group.season, track_id=removed_track_id)
+        not in s3_client.objects
+    )
+    assert (
+        _instrumental_key(
+            universe=group.universe,
+            year=group.year,
+            season=group.season,
+            track_id=removed_track_id,
+        )
+        not in s3_client.objects
+    )
+    assert all(key not in s3_client.objects for key in removed_original_variant_objects)
+    assert all(key not in s3_client.objects for key in removed_instrumental_variant_objects)
+    assert s3_client.delete_keys_calls == [
+        tuple(removed_original_variant_objects),
+        tuple(removed_instrumental_variant_objects),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_reconcile_pure_reorder_rewrites_only_target_sub_season_order() -> None:
+    group = _track_group()
+    manifest_key = _manifest_key(universe=group.universe, year=group.year, season=group.season)
+    s3_client = _FakeS3Client(
+        objects={
+            _presets_key(): _presets_bytes(),
+            manifest_key: _manifest_bytes(
+                [
+                    _entry(id=_UUID_1, title='first', sub_season=SubSeason.A, order=1),
+                    _entry(id=_UUID_2, title='second', sub_season=SubSeason.A, order=2),
+                    _entry(id=_UUID_3, title='third', sub_season=SubSeason.A, order=3),
+                ]
+            ),
+        }
+    )
+    store = _store(s3_client)
+
+    result = await store.reconcile(group, SubSeason.A, track_ids=[_UUID_3, _UUID_1, _UUID_2])
+
+    assert result == ReconcileResult(updated=3, removed=0)
+    assert json.loads(s3_client.objects[manifest_key].decode('utf-8')) == _manifest_payload(
+        [
+            _entry(id=_UUID_1, title='first', sub_season=SubSeason.A, order=2),
+            _entry(id=_UUID_2, title='second', sub_season=SubSeason.A, order=3),
+            _entry(id=_UUID_3, title='third', sub_season=SubSeason.A, order=1),
+        ]
+    )
+    assert s3_client.delete_keys_calls == []
+
+
+@pytest.mark.asyncio
+async def test_reconcile_pure_move_in_compacts_source_sub_season() -> None:
+    group = _track_group()
+    manifest_key = _manifest_key(universe=group.universe, year=group.year, season=group.season)
+    moved_track_id = uuid.UUID('018f05c1-f1a3-7b34-8d29-1f53a1c9d0e7').hex
+    remaining_source_track_id = uuid.UUID('018f05c1-f1a3-7b34-8d29-1f53a1c9d0e8').hex
+    s3_client = _FakeS3Client(
+        objects={
+            _presets_key(): _presets_bytes(),
+            manifest_key: _manifest_bytes(
+                [
+                    _entry(id=_UUID_1, title='target-first', sub_season=SubSeason.A, order=1),
+                    _entry(id=moved_track_id, title='move-in', sub_season=SubSeason.B, order=1),
+                    _entry(id=remaining_source_track_id, title='stay-source', sub_season=SubSeason.B, order=2),
+                    _entry(id=_UUID_2, title='stay-c', sub_season=SubSeason.C, order=1),
+                ]
+            ),
+        }
+    )
+    store = _store(s3_client)
+
+    result = await store.reconcile(group, SubSeason.A, track_ids=[_UUID_1, moved_track_id])
+
+    assert result == ReconcileResult(updated=2, removed=0)
+    assert json.loads(s3_client.objects[manifest_key].decode('utf-8')) == _manifest_payload(
+        [
+            _entry(id=_UUID_1, title='target-first', sub_season=SubSeason.A, order=1),
+            _entry(id=moved_track_id, title='move-in', sub_season=SubSeason.A, order=2),
+            _entry(id=remaining_source_track_id, title='stay-source', sub_season=SubSeason.B, order=1),
+            _entry(id=_UUID_2, title='stay-c', sub_season=SubSeason.C, order=1),
+        ]
+    )
+
+
+@pytest.mark.asyncio
+async def test_reconcile_pure_removal_deletes_omitted_tracks() -> None:
+    group = _track_group()
+    manifest_key = _manifest_key(universe=group.universe, year=group.year, season=group.season)
+    removed_track_id = uuid.UUID('018f05c1-f1a3-7b34-8d29-1f53a1c9d0e9').hex
+    removed_track_key = _track_key(
+        universe=group.universe,
+        year=group.year,
+        season=group.season,
+        track_id=removed_track_id,
+    )
+    removed_cover_key = _cover_key(
+        universe=group.universe,
+        year=group.year,
+        season=group.season,
+        track_id=removed_track_id,
+    )
+    s3_client = _FakeS3Client(
+        objects={
+            _presets_key(): _presets_bytes(),
+            manifest_key: _manifest_bytes(
+                [
+                    _entry(id=_UUID_1, title='keep', sub_season=SubSeason.A, order=1),
+                    _entry(id=removed_track_id, title='remove', sub_season=SubSeason.A, order=2),
+                    _entry(id=_UUID_2, title='stay-b', sub_season=SubSeason.B, order=1),
+                ]
+            ),
+            removed_track_key: b'removed-track',
+            removed_cover_key: b'removed-cover',
+        }
+    )
+    store = _store(s3_client)
+
+    result = await store.reconcile(group, SubSeason.A, track_ids=[_UUID_1])
+
+    assert result == ReconcileResult(updated=1, removed=1)
+    assert removed_track_key not in s3_client.objects
+    assert removed_cover_key not in s3_client.objects
+    assert json.loads(s3_client.objects[manifest_key].decode('utf-8')) == _manifest_payload(
+        [
+            _entry(id=_UUID_1, title='keep', sub_season=SubSeason.A, order=1),
+            _entry(id=_UUID_2, title='stay-b', sub_season=SubSeason.B, order=1),
+        ]
+    )
+
+
+@pytest.mark.asyncio
+async def test_reconcile_rejects_empty_input() -> None:
+    store = _store(_FakeS3Client())
+
+    with pytest.raises(ValueError, match='reconcile\\(\\) requires at least one track id'):
+        await store.reconcile(_track_group(), SubSeason.A, track_ids=[])
+
+
+@pytest.mark.asyncio
+async def test_reconcile_rejects_duplicate_track_ids() -> None:
+    group = _track_group()
+    manifest_key = _manifest_key(universe=group.universe, year=group.year, season=group.season)
+    s3_client = _FakeS3Client(
+        objects={
+            _presets_key(): _presets_bytes(),
+            manifest_key: _manifest_bytes([_entry(id=_UUID_1, sub_season=SubSeason.A, order=1)]),
+        }
+    )
+    store = _store(s3_client)
+
+    with pytest.raises(ValueError, match='reconcile\\(\\) track_ids must not contain duplicates'):
+        await store.reconcile(group, SubSeason.A, track_ids=[_UUID_1, _UUID_1])
+
+
+@pytest.mark.asyncio
+async def test_reconcile_rejects_unknown_track_ids() -> None:
+    group = _track_group()
+    manifest_key = _manifest_key(universe=group.universe, year=group.year, season=group.season)
+    unknown_track_id = uuid.UUID('018f05c1-f1a3-7b34-8d29-1f53a1c9d0ea').hex
+    s3_client = _FakeS3Client(
+        objects={
+            _presets_key(): _presets_bytes(),
+            manifest_key: _manifest_bytes([_entry(id=_UUID_1, sub_season=SubSeason.A, order=1)]),
+        }
+    )
+    store = _store(s3_client)
+
+    with pytest.raises(ValueError, match=f'Track id {unknown_track_id} does not exist in group'):
+        await store.reconcile(group, SubSeason.A, track_ids=[unknown_track_id])
+
+
+@pytest.mark.asyncio
+async def test_reconcile_wraps_partial_delete_failure_as_sync_error() -> None:
+    group = _track_group()
+    manifest_key = _manifest_key(universe=group.universe, year=group.year, season=group.season)
+    first_removed_id = uuid.UUID('018f05c1-f1a3-7b34-8d29-1f53a1c9d0eb').hex
+    second_removed_id = uuid.UUID('018f05c1-f1a3-7b34-8d29-1f53a1c9d0ec').hex
+    first_removed_track_key = _track_key(
+        universe=group.universe,
+        year=group.year,
+        season=group.season,
+        track_id=first_removed_id,
+    )
+    first_removed_cover_key = _cover_key(
+        universe=group.universe,
+        year=group.year,
+        season=group.season,
+        track_id=first_removed_id,
+    )
+    second_removed_track_key = _track_key(
+        universe=group.universe,
+        year=group.year,
+        season=group.season,
+        track_id=second_removed_id,
+    )
+    second_removed_cover_key = _cover_key(
+        universe=group.universe,
+        year=group.year,
+        season=group.season,
+        track_id=second_removed_id,
+    )
+    original_manifest = _manifest_bytes(
+        [
+            _entry(id=first_removed_id, title='remove-first', sub_season=SubSeason.A, order=1),
+            _entry(id=second_removed_id, title='remove-second', sub_season=SubSeason.A, order=2),
+            _entry(id=_UUID_1, title='keep', sub_season=SubSeason.A, order=3),
+        ]
+    )
+    s3_client = _FakeS3Client(
+        objects={
+            _presets_key(): _presets_bytes(),
+            manifest_key: original_manifest,
+            first_removed_track_key: b'track-1',
+            first_removed_cover_key: b'cover-1',
+            second_removed_track_key: b'track-2',
+            second_removed_cover_key: b'cover-2',
+        },
+        delete_failures={second_removed_cover_key},
+    )
+    store = _store(s3_client)
+
+    with pytest.raises(TrackRemoveManifestSyncError, match='cover_delete') as excinfo:
+        await store.reconcile(group, SubSeason.A, track_ids=[_UUID_1])
+
+    assert excinfo.value.stage == 'cover_delete'
+    assert excinfo.value.track_id == second_removed_id
+    assert excinfo.value.touched_keys == (
+        first_removed_track_key,
+        first_removed_cover_key,
+        second_removed_track_key,
+        second_removed_cover_key,
+    )
+    assert excinfo.value.manifest_key == manifest_key
+    assert first_removed_track_key not in s3_client.objects
+    assert first_removed_cover_key not in s3_client.objects
+    assert second_removed_track_key not in s3_client.objects
+    assert second_removed_cover_key in s3_client.objects
+    assert s3_client.objects[manifest_key] == original_manifest
 
 
 def _track_group(
