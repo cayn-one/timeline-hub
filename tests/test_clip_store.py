@@ -2769,12 +2769,12 @@ async def test_reconcile_reorders_and_rebatches_target_sub_group() -> None:
     store = ClipStore(s3_client)
 
     result = await store.reconcile(
-        [
+        ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1),
+        ClipSubGroup(sub_season=SubSeason.A, scope=Scope.COLLECTION),
+        clip_id_batches=[
             [_UUID_3, _UUID_1],
             [_UUID_2],
         ],
-        group=ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1),
-        sub_group=ClipSubGroup(sub_season=SubSeason.A, scope=Scope.COLLECTION),
     )
 
     assert result == ReconcileResult(updated=3, removed=0)
@@ -2866,11 +2866,11 @@ async def test_reconcile_moves_from_other_sub_group_and_deletes_omitted_clip() -
     store = ClipStore(s3_client)
 
     result = await store.reconcile(
-        [
+        ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1),
+        ClipSubGroup(sub_season=SubSeason.A, scope=Scope.COLLECTION),
+        clip_id_batches=[
             [_UUID_3, _UUID_2],
         ],
-        group=ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1),
-        sub_group=ClipSubGroup(sub_season=SubSeason.A, scope=Scope.COLLECTION),
     )
 
     assert result == ReconcileResult(updated=2, removed=1)
@@ -2923,9 +2923,9 @@ async def test_reconcile_rejects_duplicate_clip_ids() -> None:
 
     with pytest.raises(DuplicateClipIdsError):
         await store.reconcile(
-            [[_UUID_1, _UUID_1]],
-            group=ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1),
-            sub_group=ClipSubGroup(sub_season=SubSeason.A, scope=Scope.COLLECTION),
+            ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1),
+            ClipSubGroup(sub_season=SubSeason.A, scope=Scope.COLLECTION),
+            clip_id_batches=[[_UUID_1, _UUID_1]],
         )
 
 
@@ -2933,11 +2933,23 @@ async def test_reconcile_rejects_duplicate_clip_ids() -> None:
 async def test_reconcile_rejects_empty_clip_id_batches() -> None:
     store = ClipStore(_FakeS3Client())
 
-    with pytest.raises(ValueError, match='`clip_id_batches` must contain at least one clip id'):
+    with pytest.raises(ValueError, match='reconcile\\(\\) clip_id_batches must not contain empty batches'):
         await store.reconcile(
-            [[]],
-            group=ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1),
-            sub_group=ClipSubGroup(sub_season=SubSeason.A, scope=Scope.COLLECTION),
+            ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1),
+            ClipSubGroup(sub_season=SubSeason.A, scope=Scope.COLLECTION),
+            clip_id_batches=[[]],
+        )
+
+
+@pytest.mark.asyncio
+async def test_reconcile_rejects_empty_inner_batch_in_mixed_input() -> None:
+    store = ClipStore(_FakeS3Client())
+
+    with pytest.raises(ValueError, match='reconcile\\(\\) clip_id_batches must not contain empty batches'):
+        await store.reconcile(
+            ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1),
+            ClipSubGroup(sub_season=SubSeason.A, scope=Scope.COLLECTION),
+            clip_id_batches=[[_UUID_1], [], [_UUID_2]],
         )
 
 
@@ -2965,9 +2977,9 @@ async def test_reconcile_rejects_unknown_clip_ids() -> None:
 
     with pytest.raises(UnknownClipsError, match=_UUID_4):
         await store.reconcile(
-            [[_UUID_4]],
-            group=ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1),
-            sub_group=ClipSubGroup(sub_season=SubSeason.A, scope=Scope.COLLECTION),
+            ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1),
+            ClipSubGroup(sub_season=SubSeason.A, scope=Scope.COLLECTION),
+            clip_id_batches=[[_UUID_4]],
         )
 
 
@@ -2995,9 +3007,9 @@ async def test_reconcile_rejects_clip_ids_missing_from_provided_group_manifest()
 
     with pytest.raises(UnknownClipsError, match=_UUID_4):
         await store.reconcile(
-            [[_UUID_4]],
-            group=ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1),
-            sub_group=ClipSubGroup(sub_season=SubSeason.A, scope=Scope.COLLECTION),
+            ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1),
+            ClipSubGroup(sub_season=SubSeason.A, scope=Scope.COLLECTION),
+            clip_id_batches=[[_UUID_4]],
         )
 
 
@@ -3037,9 +3049,9 @@ async def test_reconcile_updates_cache_even_if_removed_delete_fails() -> None:
 
     with pytest.raises(ReconcileDeleteError, match=clip_key_1) as excinfo:
         await store.reconcile(
-            [[_UUID_2]],
-            group=ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1),
-            sub_group=ClipSubGroup(sub_season=SubSeason.A, scope=Scope.COLLECTION),
+            ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1),
+            ClipSubGroup(sub_season=SubSeason.A, scope=Scope.COLLECTION),
+            clip_id_batches=[[_UUID_2]],
         )
 
     assert excinfo.value.failed_keys == (clip_key_1,)

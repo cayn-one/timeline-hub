@@ -3683,9 +3683,9 @@ async def test_reconcile_scope_selection_uses_stored_clip_id_batches_without_dow
     )
 
     clip_store.reconcile.assert_awaited_once_with(
-        clip_id_batches,
-        group=clip_group,
-        sub_group=ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.COLLECTION),
+        clip_group,
+        ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.COLLECTION),
+        clip_id_batches=clip_id_batches,
     )
     bot.get_file.assert_not_awaited()
     bot.download_file.assert_not_awaited()

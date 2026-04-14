@@ -818,10 +818,10 @@ class ClipStore:
 
     async def reconcile(
         self,
-        clip_id_batches: Sequence[Sequence[ClipId]],
-        *,
         group: ClipGroup,
         sub_group: ClipSubGroup,
+        *,
+        clip_id_batches: Sequence[Sequence[ClipId]],
     ) -> ReconcileResult:
         """Replace one sub-group with the provided clip-id manifest state.
 
@@ -837,19 +837,17 @@ class ClipStore:
         Untracked normalized objects are treated as stale cache, not storage state.
 
         Raises:
-            ValueError: If `clip_id_batches` is empty or all batches are empty.
+            ValueError: If `clip_id_batches` is empty, contains empty batches, or otherwise contains no clip ids.
             DuplicateClipIdsError: If the provided clip ids contain duplicates.
             UnknownClipsError: If a parsed clip id is not present in the provided clip group's manifest.
             ClipGroupNotFoundError: If the requested clip group has no manifest.
             ManifestCorruptedError: If the clip-group manifest exists but is malformed.
             ReconcileDeleteError: If one or more removed clip objects cannot be deleted after the manifest rewrite.
         """
-        if not clip_id_batches or all(not batch for batch in clip_id_batches):
-            raise ValueError('`clip_id_batches` must contain at least one clip id')
-
-        clip_ids = [clip_id for batch in clip_id_batches for clip_id in batch]
-        if not clip_ids:
-            raise ValueError('`clip_id_batches` must contain at least one clip id')
+        clip_ids = self._flatten_clip_id_batches(
+            clip_id_batches,
+            operation='reconcile()',
+        )
         if len(set(clip_ids)) != len(clip_ids):
             raise DuplicateClipIdsError(clip_ids=clip_ids)
 

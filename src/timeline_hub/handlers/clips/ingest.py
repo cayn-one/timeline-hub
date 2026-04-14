@@ -920,9 +920,9 @@ async def _on_reconcile_select(
 
             try:
                 result = await services.clip_store.reconcile(
-                    clip_id_batches,
-                    group=clip_group,
-                    sub_group=clip_sub_group,
+                    clip_group,
+                    clip_sub_group,
+                    clip_id_batches=clip_id_batches,
                 )
             except DuplicateClipIdsError:
                 await message.answer(text="Can't reconcile duplicates")
