@@ -480,7 +480,7 @@ class Manifest:
 
     def next_order(self, *, sub_season: SubSeason) -> int:
         """Return the next dense 1-based order within the provided sub-season."""
-        return max((entry.order for entry in self._entries if entry.sub_season is sub_season), default=0) + 1
+        return max((entry.order for entry in self._entries if entry.sub_season == sub_season), default=0) + 1
 
     def to_dict(self) -> dict[str, list[dict[str, object]]]:
         """Convert the manifest into its JSON-compatible storage shape."""
@@ -1802,10 +1802,10 @@ class TrackStore:
         ]
 
         sub_season = reordered_entries[0].sub_season
-        if any(entry.sub_season is not sub_season for entry in reordered_entries):
+        if any(entry.sub_season != sub_season for entry in reordered_entries):
             raise ValueError('reorder() track_ids must all belong to the same sub-season')
 
-        sub_season_track_ids = {entry.id for entry in manifest if entry.sub_season is sub_season}
+        sub_season_track_ids = {entry.id for entry in manifest if entry.sub_season == sub_season}
         if sub_season_track_ids != seen_track_ids:
             raise ValueError('reorder() track_ids must match exactly the full set of track ids in the sub-season')
 
@@ -1865,7 +1865,7 @@ class TrackStore:
         moved_entries = [
             self._require_manifest_entry(manifest, group=group, track_id=track_id) for track_id in track_ids
         ]
-        if any(entry.sub_season is target_sub_season for entry in moved_entries):
+        if any(entry.sub_season == target_sub_season for entry in moved_entries):
             raise ValueError(
                 'move() only supports actual cross-sub-season moves; same-sub-season reordering must use reorder()'
             )
@@ -1876,9 +1876,9 @@ class TrackStore:
         sub_season_by_id: dict[TrackId, SubSeason] = {}
 
         for sub_season in affected_sub_seasons:
-            if sub_season is target_sub_season:
+            if sub_season == target_sub_season:
                 remaining_entries = sorted(
-                    (entry for entry in manifest if entry.sub_season is sub_season and entry.id not in moved_track_ids),
+                    (entry for entry in manifest if entry.sub_season == sub_season and entry.id not in moved_track_ids),
                     key=lambda entry: entry.order,
                 )
                 final_track_ids = [entry.id for entry in remaining_entries] + list(track_ids)
@@ -1889,7 +1889,7 @@ class TrackStore:
                 continue
 
             remaining_entries = sorted(
-                (entry for entry in manifest if entry.sub_season is sub_season and entry.id not in moved_track_ids),
+                (entry for entry in manifest if entry.sub_season == sub_season and entry.id not in moved_track_ids),
                 key=lambda entry: entry.order,
             )
             for index, entry in enumerate(remaining_entries, start=1):
@@ -2009,7 +2009,7 @@ class TrackStore:
             sync_error = TrackRemoveManifestSyncError(
                 operation='reconcile',
                 stage='manifest_delete' if len(rewritten_manifest) == 0 else 'manifest_write',
-                track_ids=[entry.id for entry in removed_entries],
+                track_ids=track_ids,
                 touched_keys=[manifest_key],
                 manifest_key=manifest_key,
                 manifest_committed=False,
@@ -2074,7 +2074,7 @@ class TrackStore:
         compacted_order_by_id: dict[TrackId, int] = {}
         next_order = 1
         for manifest_entry in sorted(
-            (item for item in remaining_entries if item.sub_season is entry.sub_season),
+            (item for item in remaining_entries if item.sub_season == entry.sub_season),
             key=lambda item: item.order,
         ):
             compacted_order_by_id[manifest_entry.id] = next_order
