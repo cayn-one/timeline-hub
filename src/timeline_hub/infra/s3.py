@@ -77,9 +77,11 @@ class S3BatchDeleteError(S3OperationError):
         bucket: str,
         keys: list[Key],
         delete_errors: list[dict[str, Any]],
+        deleted_keys: list[Key] | None = None,
     ) -> None:
         self.keys = keys
         self.delete_errors = delete_errors
+        self.deleted_keys = list(deleted_keys or [])
         super().__init__(
             (
                 f'S3 batch delete failed for keys {keys} in bucket {bucket}: '
@@ -559,17 +561,20 @@ class S3Client:
                 bucket=self._config.bucket,
                 keys=list(keys),
                 delete_errors=[{'exception': repr(error)}],
+                deleted_keys=[],
             ) from error
 
+        deleted_keys = [entry['Key'] for entry in response.get('Deleted', []) if 'Key' in entry]
         errors = response.get('Errors', [])
         if errors:
             raise S3BatchDeleteError(
                 bucket=self._config.bucket,
                 keys=list(keys),
                 delete_errors=errors,
+                deleted_keys=deleted_keys,
             )
 
-        return len(response.get('Deleted', []))
+        return len(deleted_keys)
 
     async def _put_object(
         self,
