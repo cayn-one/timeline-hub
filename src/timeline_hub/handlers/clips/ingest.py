@@ -28,7 +28,6 @@ from timeline_hub.handlers.clips.common import (
     download_video_bytes,
     dummy_button,
     ensure_three_rows,
-    format_store_summary,
     handle_stale_selection,
     parse_scope,
     parse_season,
@@ -39,10 +38,10 @@ from timeline_hub.handlers.clips.common import (
     selection_labels,
     selection_text,
     set_flow_context,
+    store_summary_kwargs,
     three_row_keyboard,
     validate_flow_state,
 )
-from timeline_hub.handlers.clips.delivery import audio_normalization_from_settings, send_fetched_clip_batches
 from timeline_hub.handlers.clips.flow import (
     FlowMenuDefinition,
     flow_selection_labels,
@@ -58,6 +57,7 @@ from timeline_hub.handlers.clips.flow import (
     year_option_universe,
 )
 from timeline_hub.handlers.clips.route_planning import RouteBatch, plan_route_batches
+from timeline_hub.handlers.clips.store_execution import execute_store_or_produce
 from timeline_hub.services.clip_store import (
     ClipGroup,
     ClipId,
@@ -372,7 +372,7 @@ async def on_intake_action(
                 route_batches=route_batches,
                 on_batch_stored=update_route_progress,
             )
-            await message.answer(**_store_summary_kwargs(route_result.store_result))
+            await message.answer(**store_summary_kwargs(route_result.store_result))
 
             for clip_group in route_result.compact_groups:
                 try:
@@ -806,45 +806,15 @@ async def _on_store_select(
             await state.clear()
 
             if flow is _STORE_FLOW or flow is _PRODUCE_FLOW:
-                result = await _store_buffered_clips(
+                await execute_store_or_produce(
                     bot=bot,
-                    chat_id=message.chat.id,
+                    message=message,
                     services=services,
+                    settings=settings,
                     clip_group=clip_group,
                     clip_sub_group=clip_sub_group,
+                    produce=flow is _PRODUCE_FLOW,
                 )
-
-                await message.answer(**_store_summary_kwargs(result))
-
-                if result.stored_count > 0 and _should_compact_after_store(scope):
-                    try:
-                        await services.clip_store.compact(
-                            clip_group,
-                            clip_sub_group,
-                            batch_size=_TELEGRAM_MEDIA_GROUP_LIMIT,
-                        )
-                    except Exception:
-                        logger.exception(
-                            'Post-store clip compaction failed for {} {}',
-                            clip_group,
-                            clip_sub_group,
-                        )
-                        raise
-
-                if flow is _PRODUCE_FLOW and result.stored_count > 0:
-                    await send_fetched_clip_batches(
-                        bot=bot,
-                        chat_id=message.chat.id,
-                        group=clip_group,
-                        sub_group=clip_sub_group,
-                        clip_batches=services.clip_store.fetch(
-                            clip_group,
-                            clip_sub_group,
-                            clip_ids=result.clip_ids,
-                            audio_normalization=audio_normalization_from_settings(settings=settings),
-                        ),
-                    )
-                    await bot.send_message(chat_id=message.chat.id, text='Done')
                 return
 
 
@@ -1107,30 +1077,6 @@ async def _show_reconcile_scope_menu(
     )
 
 
-async def _store_buffered_clips(
-    *,
-    bot: Bot,
-    chat_id: ChatId,
-    services: Services,
-    clip_group: ClipGroup,
-    clip_sub_group: ClipSubGroup,
-) -> StoreResult:
-    result = StoreResult(stored_count=0, duplicate_count=0)
-    message_groups = services.chat_message_buffer.flush_grouped(chat_id)
-
-    for message_group in message_groups:
-        clip_file_batch = await _message_group_to_clip_files(bot=bot, message_group=message_group)
-        if not clip_file_batch:
-            continue
-        result += await services.clip_store.store(
-            clip_group,
-            clip_sub_group,
-            clips=clip_file_batch,
-        )
-
-    return result
-
-
 async def _store_route_batches(
     *,
     bot: Bot,
@@ -1171,26 +1117,6 @@ async def _store_route_batches(
         store_result=result,
         compact_groups=compact_groups,
     )
-
-
-async def _message_group_to_clip_files(
-    *,
-    bot: Bot,
-    message_group: MessageGroup,
-) -> list[FileBytes]:
-    clips: list[FileBytes] = []
-
-    for message in message_group:
-        if message.video is None:
-            continue
-        clips.append(
-            FileBytes(
-                data=await download_video_bytes(bot, file_id=message.video.file_id),
-                extension=Extension.MP4,
-            )
-        )
-
-    return clips
 
 
 async def _video_messages_to_clip_files(
@@ -1609,20 +1535,6 @@ async def _invalidate_intake_buffer(
     await message.edit_text(text, reply_markup=None)
 
 
-def _store_summary_kwargs(result: StoreResult) -> dict[str, Any]:
-    summary = format_store_summary(result)
-    if summary == 'Nothing changed':
-        return {'text': summary}
-
-    parts: list[object] = []
-    for index, line in enumerate(summary.splitlines()):
-        if index > 0:
-            parts.append('\n')
-        label, value = line.split(': ', maxsplit=1)
-        parts.extend([f'{label}: ', Bold(value)])
-    return Text(*parts).as_kwargs()
-
-
 def _reconcile_summary_kwargs(result: ReconcileResult) -> dict[str, Any]:
     if result.updated == 0 and result.removed == 0:
         return {'text': 'Nothing changed'}
@@ -1648,20 +1560,6 @@ def _selection_flow_for_mode(mode: object) -> FlowMenuDefinition | None:
     if mode == _RECONCILE_FLOW.mode:
         return _RECONCILE_FLOW
     return None
-
-
-def _should_compact_after_store(scope: Scope) -> bool:
-    """Return the handler-level post-store compaction policy for intake flows.
-
-    Intake decides whether to compact after storing. `Scope.COLLECTION` keeps
-    its original stored grouping, while `Scope.EXTRA` and `Scope.SOURCE`
-    compact after store. `Produce` must follow the same post-store compaction
-    policy as `Store`.
-
-    `ClipStore.fetch()` only reflects the current manifest layout; it does not
-    decide whether compaction should happen.
-    """
-    return scope in {Scope.EXTRA, Scope.SOURCE}
 
 
 def _is_intake_buffer_state_valid(

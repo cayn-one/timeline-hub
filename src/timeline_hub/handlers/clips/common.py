@@ -378,6 +378,20 @@ def format_store_summary(result: StoreResult) -> str:
     return '\n'.join(lines)
 
 
+def store_summary_kwargs(result: StoreResult) -> dict[str, Any]:
+    summary = format_store_summary(result)
+    if summary == 'Nothing changed':
+        return {'text': summary}
+
+    parts: list[Any] = []
+    for index, line in enumerate(summary.splitlines()):
+        if index > 0:
+            parts.append('\n')
+        label, value = line.split(': ', maxsplit=1)
+        parts.extend([f'{label}: ', Bold(value)])
+    return Text(*parts).as_kwargs()
+
+
 def callback_message(callback: CallbackQuery) -> Message | None:
     message = callback.message
     if message is None or isinstance(message, InaccessibleMessage):

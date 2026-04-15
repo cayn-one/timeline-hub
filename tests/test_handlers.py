@@ -11,6 +11,7 @@ import timeline_hub.handlers.clips.delivery as delivery_module
 import timeline_hub.handlers.clips.ingest as intake_module
 import timeline_hub.handlers.clips.retrieve as retrieve_module
 import timeline_hub.handlers.clips.route_planning as route_planning_module
+import timeline_hub.handlers.clips.store_execution as store_execution_module
 from timeline_hub.handlers.clips.common import (
     ALL_SCOPES_CALLBACK_VALUE,
     DUMMY_BUTTON_TEXT,
@@ -3339,7 +3340,7 @@ async def test_produce_scope_selection_stores_then_fetches_only_new_subset_via_s
     bot.download_file.side_effect = [BytesIO(b'one'), BytesIO(b'two'), BytesIO(b'three')]
 
     shared_helper = AsyncMock(side_effect=delivery_module.send_fetched_clip_batches)
-    monkeypatch.setattr(intake_module, 'send_fetched_clip_batches', shared_helper)
+    monkeypatch.setattr(store_execution_module, 'send_fetched_clip_batches', shared_helper)
 
     await on_intake_menu(
         callback,
