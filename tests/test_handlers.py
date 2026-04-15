@@ -31,8 +31,6 @@ from timeline_hub.handlers.clips.delivery import send_fetched_clip_batch
 from timeline_hub.handlers.clips.ingest import (
     IntakeAction,
     IntakeCallbackData,
-    ReorderCallbackData,
-    ReorderClipFlow,
     _column_right_to_left_two_row_keyboard,
     _reconcile_summary_kwargs,
     _show_store_scope_menu,
@@ -45,6 +43,7 @@ from timeline_hub.handlers.clips.ingest import (
     on_intake_menu,
     on_reorder_menu,
 )
+from timeline_hub.handlers.clips.reorder_flow import ReorderCallbackData, ReorderClipFlow
 from timeline_hub.handlers.clips.retrieve import (
     RetrieveCallbackData,
     RetrieveEntryAction,

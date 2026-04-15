@@ -9,7 +9,6 @@ from aiogram import Bot, F, Router
 from aiogram.enums import ChatType
 from aiogram.filters.callback_data import CallbackData
 from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaVideo, Message
 from aiogram.utils.formatting import Bold, Text
 from loguru import logger
@@ -22,11 +21,9 @@ from timeline_hub.handlers.clips.common import (
     STORE_STATE_BY_STEP,
     MenuAction,
     MenuStep,
-    back_button,
     callback_message,
     create_padding_line,
     download_video_bytes,
-    dummy_button,
     ensure_three_rows,
     handle_stale_selection,
     parse_scope,
@@ -37,7 +34,6 @@ from timeline_hub.handlers.clips.common import (
     selected_text,
     selection_labels,
     selection_text,
-    set_flow_context,
     store_summary_kwargs,
     three_row_keyboard,
     validate_flow_state,
@@ -57,6 +53,21 @@ from timeline_hub.handlers.clips.flow import (
     year_option_universe,
 )
 from timeline_hub.handlers.clips.reconcile_input import clip_id_batch_count, prepare_reconcile_clip_id_batches
+from timeline_hub.handlers.clips.reorder_flow import (
+    REORDER_FLOW_MODE,
+    REORDER_RESET_CALLBACK_VALUE,
+    ReorderCallbackData,
+    ReorderClipFlow,
+    parse_reorder_index,
+    reorder_final_kwargs,
+    reorder_selected_order_from_state,
+    reorder_selection_keyboard,
+    reorder_selection_kwargs,
+    reorder_total_clips_from_state,
+    reorder_validation_error,
+    reordered_video_messages,
+    show_reorder_selection_menu,
+)
 from timeline_hub.handlers.clips.route_planning import RouteBatch, plan_route_batches
 from timeline_hub.handlers.clips.store_execution import execute_store_or_produce
 from timeline_hub.services.clip_store import (
@@ -81,11 +92,7 @@ router = Router()
 _TELEGRAM_MEDIA_GROUP_LIMIT = 10
 _ROUTE_STORE_CHUNK_SIZE = 8
 _BUFFER_VERSION_KEY = 'buffer_version'
-_REORDER_FLOW_MODE = 'reorder'
 _PRODUCE_FLOW_MODE = 'produce'
-_REORDER_MAX_CLIPS = 16
-_REORDER_SELECTION_PROMPT = 'Select new order:'
-_REORDER_RESET_CALLBACK_VALUE = 'reset'
 _MIXED_GROUPS = 'mixed_groups'
 type IntakeShowMenu = Callable[..., Awaitable[bool]]
 
@@ -107,15 +114,6 @@ class IntakeActionCallbackData(CallbackData, prefix='clip_action'):
 class IntakeCallbackData(CallbackData, prefix='clip_intake'):
     action: MenuAction
     step: MenuStep
-    value: str
-
-
-class ReorderClipFlow(StatesGroup):
-    selecting = State()
-
-
-class ReorderCallbackData(CallbackData, prefix='clip_reorder'):
-    action: MenuAction
     value: str
 
 
@@ -214,7 +212,7 @@ async def on_intake_action(
                 await state.clear()
                 await message.edit_text('Selection is no longer available', reply_markup=None)
                 return
-            if (error_text := _reorder_validation_error(len(video_messages))) is not None:
+            if (error_text := reorder_validation_error(len(video_messages))) is not None:
                 await state.clear()
                 # Invalid clip counts are treated as a hard rejection rather than
                 # a valid interactive flow. We intentionally flush here to keep
@@ -223,7 +221,7 @@ async def on_intake_action(
                 await message.edit_text(error_text, reply_markup=None)
                 return
 
-            await _show_reorder_selection_menu(
+            await show_reorder_selection_menu(
                 message=message,
                 state=state,
                 settings=settings,
@@ -410,7 +408,7 @@ async def on_reorder_menu(
     if not await validate_flow_state(
         message=message,
         state=state,
-        expected_mode=_REORDER_FLOW_MODE,
+        expected_mode=REORDER_FLOW_MODE,
         expected_state=ReorderClipFlow.selecting,
     ):
         return
@@ -426,10 +424,10 @@ async def on_reorder_menu(
             return
 
         data = await state.get_data()
-        selected_order = _reorder_selected_order_from_state(data)
-        total_clips = _reorder_total_clips_from_state(data)
+        selected_order = reorder_selected_order_from_state(data)
+        total_clips = reorder_total_clips_from_state(data)
         if (
-            callback_data.value != _REORDER_RESET_CALLBACK_VALUE
+            callback_data.value != REORDER_RESET_CALLBACK_VALUE
             or selected_order is None
             or total_clips is None
             or not selected_order
@@ -447,21 +445,21 @@ async def on_reorder_menu(
 
         await state.update_data(selected_order=[])
         await message.edit_text(
-            **_reorder_selection_kwargs(
+            **reorder_selection_kwargs(
                 selected_order=[],
                 message_width=settings.message_width,
             ),
-            reply_markup=_reorder_selection_keyboard(
+            reply_markup=reorder_selection_keyboard(
                 total_clips=total_clips,
                 selected_order=[],
             ),
         )
         return
 
-    index = _parse_reorder_index(callback_data.value)
+    index = parse_reorder_index(callback_data.value)
     data = await state.get_data()
-    selected_order = _reorder_selected_order_from_state(data)
-    total_clips = _reorder_total_clips_from_state(data)
+    selected_order = reorder_selected_order_from_state(data)
+    total_clips = reorder_total_clips_from_state(data)
     if index is None or selected_order is None or total_clips is None:
         await handle_stale_selection(message=message, state=state)
         return
@@ -484,10 +482,10 @@ async def on_reorder_menu(
     updated_order = [*selected_order, index]
     if len(updated_order) == total_clips:
         await message.edit_text(
-            **_reorder_final_kwargs(updated_order),
+            **reorder_final_kwargs(updated_order),
             reply_markup=None,
         )
-        reordered_messages = _reordered_video_messages(
+        reordered_messages = reordered_video_messages(
             _buffered_video_messages(services.chat_message_buffer.flush_grouped(message.chat.id)),
             selected_order=updated_order,
             total_clips=total_clips,
@@ -502,11 +500,11 @@ async def on_reorder_menu(
 
     await state.update_data(selected_order=updated_order)
     await message.edit_text(
-        **_reorder_selection_kwargs(
+        **reorder_selection_kwargs(
             selected_order=updated_order,
             message_width=settings.message_width,
         ),
-        reply_markup=_reorder_selection_keyboard(
+        reply_markup=reorder_selection_keyboard(
             total_clips=total_clips,
             selected_order=updated_order,
         ),
@@ -1167,171 +1165,6 @@ def _buffered_video_messages(message_groups: Sequence[MessageGroup]) -> list[Mes
     # peek-time validation and final flush-time execution so non-video messages
     # are ignored with identical semantics in both phases.
     return [message for message_group in message_groups for message in message_group if message.video is not None]
-
-
-def _reorder_validation_error(total_clips: int) -> str | None:
-    if total_clips == 1:
-        return 'Unexpected number of clips'
-    if total_clips > _REORDER_MAX_CLIPS:
-        return 'Too many clips'
-    return None
-
-
-def _reorder_selection_keyboard(
-    *,
-    total_clips: int,
-    selected_order: Sequence[int],
-) -> InlineKeyboardMarkup:
-    buttons = [
-        _create_reorder_select_button(
-            index=index,
-            selected=index in set(selected_order),
-        )
-        for index in range(1, total_clips + 1)
-    ]
-    top_row: list[InlineKeyboardButton] = []
-    middle_row: list[InlineKeyboardButton] = []
-    for index, button in enumerate(reversed(buttons)):
-        if index % 2 == 0:
-            top_row.append(button)
-        else:
-            middle_row.append(button)
-    if total_clips % 2 != 0:
-        middle_row.insert(0, dummy_button())
-
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            top_row,
-            middle_row,
-            [_reorder_navigation_button(selected_order=selected_order)],
-        ]
-    )
-
-
-def _reorder_navigation_button(*, selected_order: Sequence[int]) -> InlineKeyboardButton:
-    if not selected_order:
-        return back_button(
-            callback_data=ReorderCallbackData(
-                action=MenuAction.BACK,
-                value='back',
-            ).pack()
-        )
-    return InlineKeyboardButton(
-        text='Reset',
-        callback_data=ReorderCallbackData(
-            action=MenuAction.BACK,
-            value=_REORDER_RESET_CALLBACK_VALUE,
-        ).pack(),
-    )
-
-
-def _create_reorder_select_button(*, index: int, selected: bool) -> InlineKeyboardButton:
-    return InlineKeyboardButton(
-        text=str(index),
-        style='primary' if selected else None,
-        callback_data=ReorderCallbackData(
-            action=MenuAction.SELECT,
-            value=str(index),
-        ).pack(),
-    )
-
-
-def _reorder_selected_content(selected_order: Sequence[int]) -> Text:
-    parts: list[object] = ['Selected: ', Bold('Reorder')]
-    if selected_order:
-        parts.extend([' -> '])
-        for index, value in enumerate(selected_order):
-            if index > 0:
-                parts.append(' ')
-            parts.append(Bold(str(value)))
-    return Text(*parts)
-
-
-def _reorder_selection_kwargs(
-    *,
-    selected_order: Sequence[int],
-    message_width: int,
-) -> dict[str, Any]:
-    return Text(
-        _reorder_selected_content(selected_order),
-        '\n',
-        create_padding_line(message_width),
-        '\n',
-        _REORDER_SELECTION_PROMPT,
-    ).as_kwargs()
-
-
-def _reorder_final_kwargs(selected_order: Sequence[int]) -> dict[str, Any]:
-    return _reorder_selected_content(selected_order).as_kwargs()
-
-
-async def _show_reorder_selection_menu(
-    *,
-    message: Message,
-    state: FSMContext,
-    settings: Settings,
-    total_clips: int,
-    buffer_version: int,
-) -> None:
-    await set_flow_context(
-        state=state,
-        mode=_REORDER_FLOW_MODE,
-        menu_message_id=message.message_id,
-        fsm_state=ReorderClipFlow.selecting,
-    )
-    await state.update_data(
-        selected_order=[],
-        total_clips=total_clips,
-        buffer_version=buffer_version,
-    )
-    await message.edit_text(
-        **_reorder_selection_kwargs(
-            selected_order=[],
-            message_width=settings.message_width,
-        ),
-        reply_markup=_reorder_selection_keyboard(
-            total_clips=total_clips,
-            selected_order=[],
-        ),
-    )
-
-
-def _reorder_selected_order_from_state(data: dict[str, object]) -> list[int] | None:
-    raw_selected_order = data.get('selected_order')
-    if not isinstance(raw_selected_order, list):
-        return None
-    selected_order: list[int] = []
-    for value in raw_selected_order:
-        if not isinstance(value, int):
-            return None
-        selected_order.append(value)
-    return selected_order
-
-
-def _reorder_total_clips_from_state(data: dict[str, object]) -> int | None:
-    total_clips = data.get('total_clips')
-    if isinstance(total_clips, int):
-        return total_clips
-    return None
-
-
-def _parse_reorder_index(value: str) -> int | None:
-    if not value.isdigit():
-        return None
-    return int(value)
-
-
-def _reordered_video_messages(
-    video_messages: Sequence[Message],
-    *,
-    selected_order: Sequence[int],
-    total_clips: int,
-) -> list[Message]:
-    # Fail fast if the flushed video set no longer matches the validated entry
-    # count; interactive reorder should never execute against drifted input.
-    if len(video_messages) != total_clips:
-        raise RuntimeError('Reorder buffer changed unexpectedly before completion')
-    return [video_messages[index - 1] for index in selected_order]
 
 
 async def _send_reordered_video_messages(
