@@ -67,10 +67,14 @@ from timeline_hub.handlers.tracks.retrieve import (
     RetrieveEntryCallbackData as TracksRetrieveEntryCallbackData,
 )
 from timeline_hub.handlers.tracks.retrieve import (
-    on_retrieve_entry as on_tracks_retrieve_entry,
+    TrackIntakeAction,
+    TrackIntakeActionCallbackData,
+    on_track_intake_action,
+    on_tracks,
+    try_dispatch_track_intake,
 )
 from timeline_hub.handlers.tracks.retrieve import (
-    on_tracks,
+    on_retrieve_entry as on_tracks_retrieve_entry,
 )
 from timeline_hub.services.clip_store import (
     AudioNormalization,
@@ -273,6 +277,8 @@ def _fake_message(
     message_id: int = 1,
     text: str | None = None,
     caption: str | None = None,
+    audio=None,
+    photo=None,
     video=None,
     media_group_id: str | None = None,
 ):
@@ -281,6 +287,8 @@ def _fake_message(
         message_id=message_id,
         text=text,
         video=video,
+        audio=audio,
+        photo=photo,
         media_group_id=media_group_id,
         caption=caption,
         caption_entities=None,
@@ -291,6 +299,10 @@ def _fake_message(
 
 
 def _fake_video(*, file_id: str, file_name: str | None) -> SimpleNamespace:
+    return SimpleNamespace(file_id=file_id, file_name=file_name)
+
+
+def _fake_audio(*, file_id: str, file_name: str | None) -> SimpleNamespace:
     return SimpleNamespace(file_id=file_id, file_name=file_name)
 
 
@@ -732,7 +744,93 @@ async def test_clip_action_selection_includes_store_button() -> None:
 
 
 @pytest.mark.asyncio
-async def test_text_only_buffered_batch_is_flushed_after_delayed_dispatch() -> None:
+async def test_audio_only_buffered_batch_shows_track_menu() -> None:
+    scheduler = _FakeScheduler()
+    buffer = ChatMessageBuffer()
+    services = _services(clip_store=SimpleNamespace(), scheduler=scheduler, buffer=buffer)
+    settings = _settings()
+    message = _fake_message(
+        chat_id=42,
+        message_id=1,
+        audio=_fake_audio(file_id='audio-1', file_name='track.mp3'),
+    )
+
+    await on_buffered_relevant_message(message, services, settings)
+    assert scheduler.job is not None
+
+    await scheduler.job()
+
+    expected = Text(
+        'Tracks: ',
+        Bold('1'),
+        '\n',
+        create_padding_line(settings.message_width),
+        '\n',
+        'Select action:',
+    ).as_kwargs()
+    _assert_format_kwargs(
+        message.answer.await_args.kwargs,
+        expected,
+    )
+    reply_markup = message.answer.await_args.kwargs['reply_markup']
+    _assert_three_rows(reply_markup)
+    assert _keyboard_rows(reply_markup) == [[DUMMY_BUTTON_TEXT], [DUMMY_BUTTON_TEXT], ['Cancel']]
+    assert [buffered_message.message_id for buffered_message in services.chat_message_buffer.peek(42)] == [1]
+
+
+@pytest.mark.asyncio
+async def test_mixed_buffered_batch_is_rejected_and_flushed() -> None:
+    scheduler = _FakeScheduler()
+    buffer = ChatMessageBuffer()
+    services = _services(clip_store=SimpleNamespace(), scheduler=scheduler, buffer=buffer)
+    settings = _settings()
+    first_message = _fake_message(chat_id=42, message_id=1, audio=_fake_audio(file_id='audio-1', file_name='one.mp3'))
+    second_message = _fake_message(chat_id=42, message_id=2, text='ignore me')
+    message = _fake_message(chat_id=42, message_id=3, video=_fake_video(file_id='video-1', file_name='clip.mp4'))
+
+    await on_buffered_relevant_message(first_message, services, settings)
+    await on_buffered_relevant_message(second_message, services, settings)
+    await on_buffered_relevant_message(message, services, settings)
+    assert scheduler.job is not None
+
+    await scheduler.job()
+
+    message.answer.assert_awaited_once_with(text="Can't dispatch mixed input")
+    assert services.chat_message_buffer.peek(42) == []
+
+
+@pytest.mark.asyncio
+async def test_multi_audio_buffered_batch_shows_track_menu_with_correct_count() -> None:
+    scheduler = _FakeScheduler()
+    buffer = ChatMessageBuffer()
+    services = _services(clip_store=SimpleNamespace(), scheduler=scheduler, buffer=buffer)
+    settings = _settings()
+    first_message = _fake_message(chat_id=42, message_id=1, audio=_fake_audio(file_id='audio-1', file_name='one.mp3'))
+    message = _fake_message(chat_id=42, message_id=2, audio=_fake_audio(file_id='audio-2', file_name='two.mp3'))
+
+    await on_buffered_relevant_message(first_message, services, settings)
+    await on_buffered_relevant_message(message, services, settings)
+    assert scheduler.job is not None
+
+    await scheduler.job()
+
+    expected = Text(
+        'Tracks: ',
+        Bold('2'),
+        '\n',
+        create_padding_line(settings.message_width),
+        '\n',
+        'Select action:',
+    ).as_kwargs()
+    _assert_format_kwargs(message.answer.await_args.kwargs, expected)
+    reply_markup = message.answer.await_args.kwargs['reply_markup']
+    _assert_three_rows(reply_markup)
+    assert _keyboard_rows(reply_markup) == [[DUMMY_BUTTON_TEXT], [DUMMY_BUTTON_TEXT], ['Cancel']]
+    assert [buffered_message.message_id for buffered_message in services.chat_message_buffer.peek(42)] == [1, 2]
+
+
+@pytest.mark.asyncio
+async def test_text_only_buffered_batch_shows_fallback_menu_without_flushing() -> None:
     scheduler = _FakeScheduler()
     buffer = ChatMessageBuffer()
     services = _services(clip_store=SimpleNamespace(), scheduler=scheduler, buffer=buffer)
@@ -749,8 +847,19 @@ async def test_text_only_buffered_batch_is_flushed_after_delayed_dispatch() -> N
 
     await scheduler.job()
 
-    message.answer.assert_not_awaited()
-    assert services.chat_message_buffer.peek(42) == []
+    expected = Text(
+        'Messages: ',
+        Bold('1'),
+        '\n',
+        create_padding_line(settings.message_width),
+        '\n',
+        'Select action:',
+    ).as_kwargs()
+    _assert_format_kwargs(message.answer.await_args.kwargs, expected)
+    reply_markup = message.answer.await_args.kwargs['reply_markup']
+    _assert_three_rows(reply_markup)
+    assert _keyboard_rows(reply_markup) == [[DUMMY_BUTTON_TEXT], [DUMMY_BUTTON_TEXT], ['Cancel']]
+    assert [buffered_message.message_id for buffered_message in services.chat_message_buffer.peek(42)] == [1]
 
 
 @pytest.mark.asyncio
@@ -769,6 +878,172 @@ async def test_try_dispatch_clip_intake_returns_false_without_videos() -> None:
     assert handled is False
     message.answer.assert_not_awaited()
     assert [buffered_message.message_id for buffered_message in services.chat_message_buffer.peek(42)] == [1]
+
+
+@pytest.mark.asyncio
+async def test_try_dispatch_track_intake_returns_false_without_audio() -> None:
+    message = _fake_message(chat_id=42, message_id=1, text='note')
+    buffer = ChatMessageBuffer()
+    buffer.append(message, chat_id=42)
+    services = _services(clip_store=SimpleNamespace(), buffer=buffer)
+
+    handled = await try_dispatch_track_intake(
+        message=message,
+        services=services,
+        settings=_settings(),
+    )
+
+    assert handled is False
+    message.answer.assert_not_awaited()
+    assert [buffered_message.message_id for buffered_message in services.chat_message_buffer.peek(42)] == [1]
+
+
+@pytest.mark.asyncio
+async def test_try_dispatch_track_intake_shows_menu_with_multiple_audio_messages() -> None:
+    message = _fake_message(chat_id=42, message_id=2, audio=_fake_audio(file_id='audio-2', file_name='two.mp3'))
+    buffer = ChatMessageBuffer()
+    buffer.append(
+        _fake_message(chat_id=42, message_id=1, audio=_fake_audio(file_id='audio-1', file_name='one.mp3')),
+        chat_id=42,
+    )
+    buffer.append(message, chat_id=42)
+    services = _services(clip_store=SimpleNamespace(), buffer=buffer)
+
+    handled = await try_dispatch_track_intake(
+        message=message,
+        services=services,
+        settings=_settings(),
+    )
+
+    assert handled is True
+    _assert_format_kwargs(
+        message.answer.await_args.kwargs,
+        Text(
+            'Tracks: ',
+            Bold('2'),
+            '\n',
+            create_padding_line(_settings().message_width),
+            '\n',
+            'Select action:',
+        ).as_kwargs(),
+    )
+    assert [buffered_message.message_id for buffered_message in services.chat_message_buffer.peek(42)] == [1, 2]
+
+
+@pytest.mark.asyncio
+async def test_track_intake_cancel_flushes_buffer() -> None:
+    message = _fake_message(text='Select action:', chat_id=42, message_id=15)
+    callback = _fake_callback(message)
+    state = _FakeState()
+    buffer = ChatMessageBuffer()
+    buffer.append(_fake_message(chat_id=42, message_id=1, text='note'), chat_id=42)
+    services = _services(clip_store=SimpleNamespace(), buffer=buffer)
+
+    await on_track_intake_action(
+        callback,
+        TrackIntakeActionCallbackData(
+            action=TrackIntakeAction.CANCEL,
+            buffer_version=buffer.version(42),
+        ),
+        state,
+        services,
+    )
+
+    callback.answer.assert_awaited_once()
+    message.edit_text.assert_awaited_once_with(
+        **Text('Selected: ', Bold('Cancel')).as_kwargs(),
+        reply_markup=None,
+    )
+    assert services.chat_message_buffer.peek(42) == []
+    assert state.current_state is None
+    assert state.clear_count == 1
+
+
+@pytest.mark.asyncio
+async def test_track_intake_cancel_becomes_stale_when_buffer_version_changes() -> None:
+    message = _fake_message(text='Select action:', chat_id=42, message_id=16)
+    callback = _fake_callback(message)
+    state = _FakeState()
+    buffer = ChatMessageBuffer()
+    buffer.append(
+        _fake_message(chat_id=42, message_id=1, audio=_fake_audio(file_id='audio-1', file_name='a.mp3')), chat_id=42
+    )
+    rendered_version = buffer.version(42)
+    buffer.append(_fake_message(chat_id=42, message_id=2, text='newer'), chat_id=42)
+    services = _services(clip_store=SimpleNamespace(), buffer=buffer)
+
+    await on_track_intake_action(
+        callback,
+        TrackIntakeActionCallbackData(
+            action=TrackIntakeAction.CANCEL,
+            buffer_version=rendered_version,
+        ),
+        state,
+        services,
+    )
+
+    callback.answer.assert_awaited_once()
+    message.edit_text.assert_awaited_once_with('Selection is no longer available', reply_markup=None)
+    assert [buffered_message.message_id for buffered_message in services.chat_message_buffer.peek(42)] == [1, 2]
+    assert state.current_state is None
+    assert state.clear_count == 1
+
+
+@pytest.mark.asyncio
+async def test_fallback_cancel_flushes_buffer_when_current() -> None:
+    message = _fake_message(text='Select action:', chat_id=42, message_id=17)
+    callback = _fake_callback(message)
+    state = _FakeState()
+    buffer = ChatMessageBuffer()
+    buffer.append(_fake_message(chat_id=42, message_id=1, text='note'), chat_id=42)
+    services = _services(clip_store=SimpleNamespace(), buffer=buffer)
+
+    await on_track_intake_action(
+        callback,
+        TrackIntakeActionCallbackData(
+            action=TrackIntakeAction.CANCEL,
+            buffer_version=buffer.version(42),
+        ),
+        state,
+        services,
+    )
+
+    callback.answer.assert_awaited_once()
+    message.edit_text.assert_awaited_once_with(
+        **Text('Selected: ', Bold('Cancel')).as_kwargs(),
+        reply_markup=None,
+    )
+    assert services.chat_message_buffer.peek(42) == []
+    assert state.current_state is None
+    assert state.clear_count == 1
+
+
+@pytest.mark.asyncio
+async def test_fallback_cancel_becomes_stale_when_buffer_version_changes() -> None:
+    message = _fake_message(text='Select action:', chat_id=42, message_id=18)
+    callback = _fake_callback(message)
+    state = _FakeState()
+    buffer = ChatMessageBuffer()
+    buffer.append(_fake_message(chat_id=42, message_id=1, text='note'), chat_id=42)
+    rendered_version = buffer.version(42)
+    buffer.append(_fake_message(chat_id=42, message_id=2, text='newer'), chat_id=42)
+    services = _services(clip_store=SimpleNamespace(), buffer=buffer)
+
+    await on_track_intake_action(
+        callback,
+        TrackIntakeActionCallbackData(
+            action=TrackIntakeAction.CANCEL,
+            buffer_version=rendered_version,
+        ),
+        state,
+        services,
+    )
+
+    callback.answer.assert_awaited_once()
+    message.edit_text.assert_awaited_once_with('Selection is no longer available', reply_markup=None)
+    assert [buffered_message.message_id for buffered_message in services.chat_message_buffer.peek(42)] == [1, 2]
+    assert state.current_state is None
+    assert state.clear_count == 1
 
 
 def test_intake_action_keyboard_uses_right_to_left_columns() -> None:
