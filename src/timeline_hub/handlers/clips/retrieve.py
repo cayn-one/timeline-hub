@@ -15,18 +15,12 @@ from timeline_hub.handlers.clips.common import (
     RETRIEVE_STATE_BY_STEP,
     MenuAction,
     MenuStep,
-    callback_message,
     encode_sub_season,
-    handle_stale_selection,
     parse_scope,
     parse_season,
     parse_sub_season,
     parse_universe,
     parse_year,
-    selected_text,
-    selection_text,
-    stacked_keyboard,
-    width_reserved_text,
 )
 from timeline_hub.handlers.clips.delivery import audio_normalization_from_settings, send_fetched_clip_batches
 from timeline_hub.handlers.clips.flow import (
@@ -47,6 +41,14 @@ from timeline_hub.handlers.clips.flow import (
     store_allowed_seasons,
     validate_menu_flow_state,
     year_option_universe,
+)
+from timeline_hub.handlers.menu import (
+    callback_message,
+    handle_stale_selection,
+    selected_text,
+    selection_text,
+    stacked_keyboard,
+    width_reserved_text,
 )
 from timeline_hub.services.clip_store import (
     ClipGroup,

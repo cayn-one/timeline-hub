@@ -14,7 +14,6 @@ import timeline_hub.handlers.clips.route_planning as route_planning_module
 import timeline_hub.handlers.clips.store_execution as store_execution_module
 from timeline_hub.handlers.clips.common import (
     ALL_SCOPES_CALLBACK_VALUE,
-    DUMMY_BUTTON_TEXT,
     FLOW_PULL,
     FLOW_RECONCILE,
     MenuAction,
@@ -22,9 +21,7 @@ from timeline_hub.handlers.clips.common import (
     ReconcileClipFlow,
     RetrieveClipFlow,
     StoreClipFlow,
-    create_padding_line,
     format_store_summary,
-    selected_text,
     selection_labels,
 )
 from timeline_hub.handlers.clips.delivery import send_fetched_clip_batch
@@ -59,6 +56,11 @@ from timeline_hub.handlers.clips.retrieve import (
 )
 from timeline_hub.handlers.clips.route_planning import parse_route_text
 from timeline_hub.handlers.intake import on_buffered_relevant_message
+from timeline_hub.handlers.menu import (
+    DUMMY_BUTTON_TEXT,
+    create_padding_line,
+    selected_text,
+)
 from timeline_hub.handlers.router import on_dummy_button, on_start_send_menu
 from timeline_hub.handlers.tracks.retrieve import (
     RetrieveEntryAction as TracksRetrieveEntryAction,

@@ -5,10 +5,10 @@ from aiogram.filters import Command
 from aiogram.types import CallbackQuery, ErrorEvent, KeyboardButton, Message, ReplyKeyboardMarkup
 from loguru import logger
 
-from timeline_hub.handlers.clips.common import DUMMY_CALLBACK_VALUE
 from timeline_hub.handlers.clips.ingest import router as clips_ingest_router
 from timeline_hub.handlers.clips.retrieve import router as clips_retrieve_router
 from timeline_hub.handlers.intake import router as intake_router
+from timeline_hub.handlers.menu import DUMMY_CALLBACK_VALUE
 from timeline_hub.handlers.tracks.retrieve import router as tracks_retrieve_router
 
 router = Router()

@@ -3,8 +3,8 @@ from aiogram.enums import ChatType
 from aiogram.types import InlineKeyboardButton, Message
 from aiogram.utils.formatting import Bold, Text
 
-from timeline_hub.handlers.clips.common import create_padding_line, dummy_button, stacked_keyboard
 from timeline_hub.handlers.clips.ingest import try_dispatch_clip_intake
+from timeline_hub.handlers.menu import create_padding_line, dummy_button, stacked_keyboard
 from timeline_hub.handlers.tracks.retrieve import (
     TrackIntakeAction,
     TrackIntakeActionCallbackData,

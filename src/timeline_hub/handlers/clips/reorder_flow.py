@@ -7,13 +7,8 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message
 from aiogram.utils.formatting import Bold, Text
 
-from timeline_hub.handlers.clips.common import (
-    MenuAction,
-    back_button,
-    create_padding_line,
-    dummy_button,
-    set_flow_context,
-)
+from timeline_hub.handlers.clips.common import MenuAction, set_flow_context
+from timeline_hub.handlers.menu import back_button, create_padding_line, dummy_button
 from timeline_hub.settings import Settings
 
 REORDER_FLOW_MODE = 'reorder'

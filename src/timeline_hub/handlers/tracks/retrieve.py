@@ -8,7 +8,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, InlineKeyboardButton, Message
 from aiogram.utils.formatting import Bold, Text
 
-from timeline_hub.handlers.clips.common import (
+from timeline_hub.handlers.menu import (
     callback_message,
     create_padding_line,
     dummy_button,

@@ -13,12 +13,14 @@ from timeline_hub.handlers.clips.common import (
     UNSET,
     MenuAction,
     MenuStep,
+    selection_labels,
+    set_flow_context,
+)
+from timeline_hub.handlers.menu import (
     back_button,
     fixed_option_keyboard,
     handle_stale_selection,
-    selection_labels,
     selection_text,
-    set_flow_context,
     validate_flow_state,
 )
 from timeline_hub.services.clip_store import ClipGroup, ClipSubGroup, Scope, Season, SubSeason, Universe
