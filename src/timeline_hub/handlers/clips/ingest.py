@@ -191,7 +191,7 @@ async def on_intake_action(
                 # Invalid clip counts are treated as a hard rejection rather than
                 # a valid interactive flow. We intentionally flush here to keep
                 # the UI stateless and require the user to resend clips.
-                services.chat_message_buffer.flush_grouped(message.chat.id)
+                services.chat_message_buffer.flush(message.chat.id)
                 await message.edit_text(error_text, reply_markup=None)
                 return
 
@@ -214,7 +214,7 @@ async def on_intake_action(
                 return
             if total_clips == 1:
                 await state.clear()
-                services.chat_message_buffer.flush_grouped(chat_id)
+                services.chat_message_buffer.flush(chat_id)
                 await message.edit_text('Unexpected number of clips', reply_markup=None)
                 return
 
@@ -230,7 +230,9 @@ async def on_intake_action(
                 **selected_text(selected='Compact'),
                 reply_markup=None,
             )
-            compact_messages = _buffered_video_messages(services.chat_message_buffer.flush_grouped(chat_id))
+            compact_message_groups = services.chat_message_buffer.peek_grouped(chat_id)
+            services.chat_message_buffer.flush(chat_id)
+            compact_messages = _buffered_video_messages(compact_message_groups)
             await _send_reordered_video_messages(
                 bot=bot,
                 chat_id=chat_id,
@@ -318,10 +320,9 @@ async def on_intake_action(
             # Route is a single-shot action: flush at entry, validate after flush,
             # never restore the buffer on failure. This is intentional to keep the
             # UI stateless and simple; users must resend clips if validation fails.
-            route_batches, error_text = plan_route_batches(
-                services.chat_message_buffer.flush_grouped(message.chat.id),
-                settings=settings,
-            )
+            route_message_groups = services.chat_message_buffer.peek_grouped(message.chat.id)
+            services.chat_message_buffer.flush(message.chat.id)
+            route_batches, error_text = plan_route_batches(route_message_groups, settings=settings)
             if error_text is not None:
                 await message.edit_text(error_text, reply_markup=None)
                 return
@@ -459,8 +460,10 @@ async def on_reorder_menu(
             **reorder_final_kwargs(updated_order),
             reply_markup=None,
         )
+        reordered_message_groups = services.chat_message_buffer.peek_grouped(message.chat.id)
+        services.chat_message_buffer.flush(message.chat.id)
         reordered_messages = reordered_video_messages(
-            _buffered_video_messages(services.chat_message_buffer.flush_grouped(message.chat.id)),
+            _buffered_video_messages(reordered_message_groups),
             selected_order=updated_order,
             total_clips=total_clips,
         )
@@ -1123,7 +1126,7 @@ def _has_buffered_videos(
     services: Services,
     chat_id: ChatId,
 ) -> bool:
-    return any(message.video is not None for message in services.chat_message_buffer.peek(chat_id))
+    return any(message.video is not None for message in services.chat_message_buffer.peek_raw(chat_id))
 
 
 def _store_year_options(*, current_year: int, min_year: int) -> list[int]:
@@ -1180,7 +1183,7 @@ def _intake_action_menu_kwargs(
     clip_count = clip_count_override
     if clip_count is None:
         clip_count = len(
-            [message for message in services.chat_message_buffer.peek(chat_id) if message.video is not None]
+            [message for message in services.chat_message_buffer.peek_raw(chat_id) if message.video is not None]
         )
     if clip_count == 0:
         return None

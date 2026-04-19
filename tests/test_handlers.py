@@ -800,7 +800,12 @@ async def test_valid_photo_audio_pairs_dispatch_to_track_menu() -> None:
     reply_markup = message.answer.await_args.kwargs['reply_markup']
     _assert_three_rows(reply_markup)
     assert _keyboard_rows(reply_markup) == [['Store'], [DUMMY_BUTTON_TEXT], ['Cancel']]
-    assert [buffered_message.message_id for buffered_message in services.chat_message_buffer.peek(42)] == [1, 2, 3, 4]
+    assert [buffered_message.message_id for buffered_message in services.chat_message_buffer.peek_raw(42)] == [
+        1,
+        2,
+        3,
+        4,
+    ]
 
 
 @pytest.mark.asyncio
@@ -842,7 +847,12 @@ async def test_valid_out_of_order_appended_track_batch_dispatches_in_message_ord
     reply_markup = message.answer.await_args.kwargs['reply_markup']
     _assert_three_rows(reply_markup)
     assert _keyboard_rows(reply_markup) == [['Store'], [DUMMY_BUTTON_TEXT], ['Cancel']]
-    assert [buffered_message.message_id for buffered_message in services.chat_message_buffer.peek(42)] == [2, 1, 4, 3]
+    assert [buffered_message.message_id for buffered_message in services.chat_message_buffer.peek_raw(42)] == [
+        2,
+        1,
+        4,
+        3,
+    ]
 
 
 @pytest.mark.asyncio
@@ -863,7 +873,7 @@ async def test_mixed_buffered_batch_is_rejected_and_flushed() -> None:
     await scheduler.job()
 
     message.answer.assert_awaited_once_with(text="Can't dispatch mixed input")
-    assert services.chat_message_buffer.peek(42) == []
+    assert services.chat_message_buffer.peek_raw(42) == []
 
 
 @pytest.mark.asyncio
@@ -881,7 +891,7 @@ async def test_invalid_track_batch_order_sends_cant_dispatch_input() -> None:
     await scheduler.job()
 
     message.answer.assert_awaited_once_with(text="Can't dispatch input")
-    assert services.chat_message_buffer.peek(42) == []
+    assert services.chat_message_buffer.peek_raw(42) == []
 
 
 @pytest.mark.asyncio
@@ -899,7 +909,7 @@ async def test_photo_without_caption_sends_cant_dispatch_input() -> None:
     await scheduler.job()
 
     message.answer.assert_awaited_once_with(text="Can't dispatch input")
-    assert services.chat_message_buffer.peek(42) == []
+    assert services.chat_message_buffer.peek_raw(42) == []
 
 
 @pytest.mark.asyncio
@@ -917,7 +927,7 @@ async def test_single_line_caption_sends_cant_dispatch_input() -> None:
     await scheduler.job()
 
     message.answer.assert_awaited_once_with(text="Can't dispatch input")
-    assert services.chat_message_buffer.peek(42) == []
+    assert services.chat_message_buffer.peek_raw(42) == []
 
 
 @pytest.mark.asyncio
@@ -937,7 +947,7 @@ async def test_odd_number_of_track_candidate_messages_sends_cant_dispatch_input(
     await scheduler.job()
 
     message.answer.assert_awaited_once_with(text="Can't dispatch input")
-    assert services.chat_message_buffer.peek(42) == []
+    assert services.chat_message_buffer.peek_raw(42) == []
 
 
 @pytest.mark.asyncio
@@ -955,7 +965,7 @@ async def test_audio_only_batch_sends_cant_dispatch_input() -> None:
     await scheduler.job()
 
     message.answer.assert_awaited_once_with(text="Can't dispatch input")
-    assert services.chat_message_buffer.peek(42) == []
+    assert services.chat_message_buffer.peek_raw(42) == []
 
 
 @pytest.mark.asyncio
@@ -972,7 +982,7 @@ async def test_text_only_buffered_batch_shows_fallback_menu_without_flushing() -
 
     await on_buffered_relevant_message(message, services, settings)
     assert scheduler.job is not None
-    assert [buffered_message.message_id for buffered_message in services.chat_message_buffer.peek(42)] == [1]
+    assert [buffered_message.message_id for buffered_message in services.chat_message_buffer.peek_raw(42)] == [1]
 
     await scheduler.job()
 
@@ -988,7 +998,7 @@ async def test_text_only_buffered_batch_shows_fallback_menu_without_flushing() -
     reply_markup = message.answer.await_args.kwargs['reply_markup']
     _assert_three_rows(reply_markup)
     assert _keyboard_rows(reply_markup) == [[DUMMY_BUTTON_TEXT], [DUMMY_BUTTON_TEXT], ['Cancel']]
-    assert [buffered_message.message_id for buffered_message in services.chat_message_buffer.peek(42)] == [1]
+    assert [buffered_message.message_id for buffered_message in services.chat_message_buffer.peek_raw(42)] == [1]
 
 
 @pytest.mark.asyncio
@@ -1006,7 +1016,7 @@ async def test_try_dispatch_clip_intake_returns_false_without_videos() -> None:
 
     assert handled is False
     message.answer.assert_not_awaited()
-    assert [buffered_message.message_id for buffered_message in services.chat_message_buffer.peek(42)] == [1]
+    assert [buffered_message.message_id for buffered_message in services.chat_message_buffer.peek_raw(42)] == [1]
 
 
 @pytest.mark.asyncio
@@ -1024,7 +1034,7 @@ async def test_try_dispatch_track_intake_returns_false_without_audio() -> None:
 
     assert handled is False
     message.answer.assert_not_awaited()
-    assert [buffered_message.message_id for buffered_message in services.chat_message_buffer.peek(42)] == [1]
+    assert [buffered_message.message_id for buffered_message in services.chat_message_buffer.peek_raw(42)] == [1]
 
 
 @pytest.mark.asyncio
@@ -1081,7 +1091,7 @@ async def test_try_dispatch_track_intake_shows_menu_with_multiple_pairs() -> Non
         [DUMMY_BUTTON_TEXT],
         ['Cancel'],
     ]
-    assert [buffered_message.message_id for buffered_message in services.chat_message_buffer.peek(42)] == [
+    assert [buffered_message.message_id for buffered_message in services.chat_message_buffer.peek_raw(42)] == [
         1,
         2,
         3,
@@ -1114,7 +1124,7 @@ async def test_track_intake_cancel_flushes_buffer() -> None:
         **Text('Selected: ', Bold('Cancel')).as_kwargs(),
         reply_markup=None,
     )
-    assert services.chat_message_buffer.peek(42) == []
+    assert services.chat_message_buffer.peek_raw(42) == []
     assert state.current_state is None
     assert state.clear_count == 1
 
@@ -1145,7 +1155,7 @@ async def test_track_intake_cancel_becomes_stale_when_buffer_version_changes() -
 
     callback.answer.assert_awaited_once()
     message.edit_text.assert_awaited_once_with('Selection is no longer available', reply_markup=None)
-    assert [buffered_message.message_id for buffered_message in services.chat_message_buffer.peek(42)] == [1, 2]
+    assert [buffered_message.message_id for buffered_message in services.chat_message_buffer.peek_raw(42)] == [1, 2]
     assert state.current_state is None
     assert state.clear_count == 1
 
@@ -1175,7 +1185,7 @@ async def test_fallback_cancel_flushes_buffer_when_current() -> None:
         **Text('Selected: ', Bold('Cancel')).as_kwargs(),
         reply_markup=None,
     )
-    assert services.chat_message_buffer.peek(42) == []
+    assert services.chat_message_buffer.peek_raw(42) == []
     assert state.current_state is None
     assert state.clear_count == 1
 
@@ -1204,7 +1214,7 @@ async def test_fallback_cancel_becomes_stale_when_buffer_version_changes() -> No
 
     callback.answer.assert_awaited_once()
     message.edit_text.assert_awaited_once_with('Selection is no longer available', reply_markup=None)
-    assert [buffered_message.message_id for buffered_message in services.chat_message_buffer.peek(42)] == [1, 2]
+    assert [buffered_message.message_id for buffered_message in services.chat_message_buffer.peek_raw(42)] == [1, 2]
     assert state.current_state is None
     assert state.clear_count == 1
 
@@ -1297,7 +1307,7 @@ async def test_track_store_happy_path_stores_all_prepared_tracks_in_order(monkey
     assert second_call.kwargs['track'].cover == FileBytes(data=b'jpg-2', extension=Extension.JPG)
     assert second_call.kwargs['track'].audio == FileBytes(data=b'opus-2', extension=Extension.OPUS)
     menu_message.answer.assert_awaited_once_with(**Text('Stored: ', Bold('2')).as_kwargs())
-    assert services.chat_message_buffer.peek(42) == []
+    assert services.chat_message_buffer.peek_raw(42) == []
     assert state.current_state is None
 
 
@@ -1417,7 +1427,7 @@ async def test_track_store_caption_failure_invalidates_menu_and_skips_store() ->
 
     track_store.store.assert_not_awaited()
     menu_message.edit_text.assert_awaited_with('Not enough lines to extract artists and title', reply_markup=None)
-    assert services.chat_message_buffer.peek(42) == []
+    assert services.chat_message_buffer.peek_raw(42) == []
     assert state.current_state is None
 
 
@@ -1529,7 +1539,7 @@ async def test_track_store_mid_batch_preprocessing_failure_prevents_partial_stor
 
     track_store.store.assert_not_awaited()
     menu_message.edit_text.assert_awaited_with('Not enough lines to extract artists and title', reply_markup=None)
-    assert services.chat_message_buffer.peek(42) == []
+    assert services.chat_message_buffer.peek_raw(42) == []
 
 
 @pytest.mark.asyncio
@@ -1617,7 +1627,7 @@ async def test_track_store_partial_failure_reports_stored_titles_and_flushes_buf
 
     assert len(failing_store.calls) == 2
     menu_message.answer.assert_awaited_once_with(text='Storing failed\nStored titles:\nTitle 1')
-    assert services.chat_message_buffer.peek(42) == []
+    assert services.chat_message_buffer.peek_raw(42) == []
     assert state.current_state is None
     assert state.clear_count == 1
     log_exception.assert_called_once()
@@ -1660,7 +1670,7 @@ async def test_track_store_selection_becomes_stale_when_buffer_changes() -> None
     )
 
     menu_message.edit_text.assert_awaited_with('Selection is no longer available', reply_markup=None)
-    assert [buffered_message.message_id for buffered_message in services.chat_message_buffer.peek(42)] == [1, 2, 3]
+    assert [buffered_message.message_id for buffered_message in services.chat_message_buffer.peek_raw(42)] == [1, 2, 3]
 
 
 @pytest.mark.asyncio
@@ -1913,7 +1923,7 @@ async def test_reorder_action_opens_selection_menu_without_flushing_buffer() -> 
         _fake_message(chat_id=77, message_id=6, video=_fake_video(file_id='f5', file_name='five.mp4')),
     ]:
         buffer.append(buffered_message, chat_id=77)
-    buffer.flush_grouped = Mock(wraps=buffer.flush_grouped)
+    buffer.flush = Mock(wraps=buffer.flush)
     services = _services(clip_store=SimpleNamespace(), buffer=buffer)
     settings = _settings()
 
@@ -1927,7 +1937,7 @@ async def test_reorder_action_opens_selection_menu_without_flushing_buffer() -> 
     )
 
     callback.answer.assert_awaited_once()
-    buffer.flush_grouped.assert_not_called()
+    buffer.flush.assert_not_called()
     _assert_format_kwargs(
         message.edit_text.await_args.kwargs,
         _reorder_selected_kwargs(prompt='Select new order:', message_width=settings.message_width),
@@ -1938,7 +1948,7 @@ async def test_reorder_action_opens_selection_menu_without_flushing_buffer() -> 
     assert state.data['buffer_version'] == services.chat_message_buffer.version(77)
     assert state.data['selected_order'] == []
     assert state.data['total_clips'] == 5
-    assert [message.message_id for message in services.chat_message_buffer.peek(77)] == [1, 2, 3, 4, 5, 6]
+    assert [message.message_id for message in services.chat_message_buffer.peek_raw(77)] == [1, 2, 3, 4, 5, 6]
 
 
 @pytest.mark.asyncio
@@ -1951,7 +1961,7 @@ async def test_reorder_action_rejects_single_clip_and_flushes_buffer() -> None:
         _fake_message(chat_id=77, message_id=1, video=_fake_video(file_id='f1', file_name='one.mp4')),
         chat_id=77,
     )
-    buffer.flush_grouped = Mock(wraps=buffer.flush_grouped)
+    buffer.flush = Mock(wraps=buffer.flush)
     services = _services(clip_store=SimpleNamespace(), buffer=buffer)
 
     await on_intake_action(
@@ -1963,9 +1973,9 @@ async def test_reorder_action_rejects_single_clip_and_flushes_buffer() -> None:
         state,
     )
 
-    buffer.flush_grouped.assert_called_once_with(77)
+    buffer.flush.assert_called_once_with(77)
     message.edit_text.assert_awaited_once_with('Unexpected number of clips', reply_markup=None)
-    assert services.chat_message_buffer.peek(77) == []
+    assert services.chat_message_buffer.peek_raw(77) == []
 
 
 @pytest.mark.asyncio
@@ -1983,7 +1993,7 @@ async def test_reorder_action_rejects_too_many_clips_and_flushes_buffer() -> Non
             ),
             chat_id=77,
         )
-    buffer.flush_grouped = Mock(wraps=buffer.flush_grouped)
+    buffer.flush = Mock(wraps=buffer.flush)
     services = _services(clip_store=SimpleNamespace(), buffer=buffer)
 
     await on_intake_action(
@@ -1995,9 +2005,9 @@ async def test_reorder_action_rejects_too_many_clips_and_flushes_buffer() -> Non
         state,
     )
 
-    buffer.flush_grouped.assert_called_once_with(77)
+    buffer.flush.assert_called_once_with(77)
     message.edit_text.assert_awaited_once_with('Too many clips', reply_markup=None)
-    assert services.chat_message_buffer.peek(77) == []
+    assert services.chat_message_buffer.peek_raw(77) == []
 
 
 @pytest.mark.asyncio
@@ -2117,7 +2127,7 @@ async def test_reorder_reset_clears_selection_and_restores_back_button() -> None
     assert state.data['selected_order'] == []
     assert state.data['buffer_version'] == buffer.version(77)
     assert state.data['total_clips'] == 5
-    assert [message.message_id for message in services.chat_message_buffer.peek(77)] == [1, 2, 3, 4, 5]
+    assert [message.message_id for message in services.chat_message_buffer.peek_raw(77)] == [1, 2, 3, 4, 5]
 
 
 @pytest.mark.asyncio
@@ -2236,7 +2246,7 @@ async def test_reorder_back_with_empty_buffer_flushes_and_shows_no_clips_receive
     )
 
     message.edit_text.assert_awaited_once_with('No clips received', reply_markup=None)
-    assert services.chat_message_buffer.peek(77) == []
+    assert services.chat_message_buffer.peek_raw(77) == []
     assert state.current_state is None
     assert state.data == {}
 
@@ -2279,7 +2289,7 @@ async def test_reorder_selection_becomes_stale_when_buffer_changes() -> None:
     )
 
     message.edit_text.assert_awaited_once_with('Selection is no longer available', reply_markup=None)
-    assert [message.message_id for message in services.chat_message_buffer.peek(77)] == [1, 2, 3]
+    assert [message.message_id for message in services.chat_message_buffer.peek_raw(77)] == [1, 2, 3]
     assert state.current_state is None
 
 
@@ -2298,7 +2308,7 @@ async def test_reorder_flow_resends_videos_by_file_id_in_selected_order() -> Non
         _fake_message(chat_id=77, message_id=6, video=_fake_video(file_id='f5', file_name='five.mp4')),
     ]:
         buffer.append(buffered_message, chat_id=77)
-    buffer.flush_grouped = Mock(wraps=buffer.flush_grouped)
+    buffer.flush = Mock(wraps=buffer.flush)
     services = _services(clip_store=SimpleNamespace(), buffer=buffer)
     bot = _RecordingBot()
     settings = _settings()
@@ -2317,7 +2327,7 @@ async def test_reorder_flow_resends_videos_by_file_id_in_selected_order() -> Non
         first_edit,
         _reorder_selected_kwargs(prompt='Select new order:', message_width=settings.message_width),
     )
-    buffer.flush_grouped.assert_not_called()
+    buffer.flush.assert_not_called()
 
     for value in ['3', '5', '4', '1', '2']:
         await on_reorder_menu(
@@ -2331,7 +2341,7 @@ async def test_reorder_flow_resends_videos_by_file_id_in_selected_order() -> Non
 
     assert state.current_state is None
     assert state.data == {}
-    buffer.flush_grouped.assert_called_once_with(77)
+    buffer.flush.assert_called_once_with(77)
     assert message.edit_text.await_args_list[-1].kwargs == {
         **_reorder_selected_kwargs(3, 5, 4, 1, 2),
         'reply_markup': None,
@@ -2354,7 +2364,7 @@ async def test_reorder_completion_flushes_only_at_completion_and_splits_large_re
             ),
             chat_id=77,
         )
-    buffer.flush_grouped = Mock(wraps=buffer.flush_grouped)
+    buffer.flush = Mock(wraps=buffer.flush)
     services = _services(clip_store=SimpleNamespace(), buffer=buffer)
     bot = _RecordingBot()
     settings = _settings()
@@ -2377,7 +2387,7 @@ async def test_reorder_completion_flushes_only_at_completion_and_splits_large_re
             settings,
             state,
         )
-        assert buffer.flush_grouped.call_count == 0
+        assert buffer.flush.call_count == 0
 
     await on_reorder_menu(
         callback,
@@ -2388,7 +2398,7 @@ async def test_reorder_completion_flushes_only_at_completion_and_splits_large_re
         state,
     )
 
-    buffer.flush_grouped.assert_called_once_with(77)
+    buffer.flush.assert_called_once_with(77)
     assert bot.events == [
         ('media_group', (77, ['f12', 'f11', 'f10', 'f9', 'f8', 'f7', 'f6', 'f5', 'f4', 'f3'])),
         ('media_group', (77, ['f2', 'f1'])),
@@ -2411,7 +2421,7 @@ async def test_compact_action_resends_only_videos_by_file_id_in_original_order()
         _fake_message(chat_id=77, message_id=7, video=_fake_video(file_id='f4', file_name='four.mp4')),
     ]:
         buffer.append(buffered_message, chat_id=77)
-    buffer.flush_grouped = Mock(wraps=buffer.flush_grouped)
+    buffer.flush = Mock(wraps=buffer.flush)
     clip_store = SimpleNamespace(
         compact=AsyncMock(side_effect=AssertionError('Compact must not use ClipStore.compact')),
         list_groups=AsyncMock(side_effect=AssertionError('Compact must not use ClipStore.list_groups')),
@@ -2438,8 +2448,8 @@ async def test_compact_action_resends_only_videos_by_file_id_in_original_order()
         **selected_text(selected='Compact'),
         reply_markup=None,
     )
-    buffer.flush_grouped.assert_called_once_with(77)
-    assert services.chat_message_buffer.peek(77) == []
+    buffer.flush.assert_called_once_with(77)
+    assert services.chat_message_buffer.peek_raw(77) == []
     assert state.current_state is None
     assert state.data == {}
     assert bot.events == [('media_group', (77, ['f1', 'f2', 'f3', 'f4']))]
@@ -2461,7 +2471,7 @@ async def test_compact_action_rejects_single_clip_and_flushes_buffer() -> None:
         chat_id=77,
     )
     buffer.append(_fake_message(chat_id=77, message_id=2, text='ignore me'), chat_id=77)
-    buffer.flush_grouped = Mock(wraps=buffer.flush_grouped)
+    buffer.flush = Mock(wraps=buffer.flush)
     services = _services(clip_store=SimpleNamespace(), buffer=buffer)
     bot = _RecordingBot()
 
@@ -2474,9 +2484,9 @@ async def test_compact_action_rejects_single_clip_and_flushes_buffer() -> None:
         state,
     )
 
-    buffer.flush_grouped.assert_called_once_with(77)
+    buffer.flush.assert_called_once_with(77)
     message.edit_text.assert_awaited_once_with('Unexpected number of clips', reply_markup=None)
-    assert services.chat_message_buffer.peek(77) == []
+    assert services.chat_message_buffer.peek_raw(77) == []
     assert bot.events == []
 
 
@@ -2488,7 +2498,7 @@ async def test_compact_action_treats_zero_videos_as_stale_without_flushing() -> 
     buffer = ChatMessageBuffer()
     buffer.append(_fake_message(chat_id=77, message_id=1, text='ignore me'), chat_id=77)
     buffer.append(_fake_message(chat_id=77, message_id=2, caption='still not a video'), chat_id=77)
-    buffer.flush_grouped = Mock(wraps=buffer.flush_grouped)
+    buffer.flush = Mock(wraps=buffer.flush)
     services = _services(clip_store=SimpleNamespace(), buffer=buffer)
     bot = _RecordingBot()
 
@@ -2501,9 +2511,9 @@ async def test_compact_action_treats_zero_videos_as_stale_without_flushing() -> 
         state,
     )
 
-    buffer.flush_grouped.assert_not_called()
+    buffer.flush.assert_not_called()
     message.edit_text.assert_awaited_once_with('Selection is no longer available', reply_markup=None)
-    assert [buffered_message.message_id for buffered_message in services.chat_message_buffer.peek(77)] == [1, 2]
+    assert [buffered_message.message_id for buffered_message in services.chat_message_buffer.peek_raw(77)] == [1, 2]
     assert bot.events == []
 
 
@@ -2522,7 +2532,7 @@ async def test_compact_action_allows_large_clip_counts_and_splits_batches_of_ten
             ),
             chat_id=77,
         )
-    buffer.flush_grouped = Mock(wraps=buffer.flush_grouped)
+    buffer.flush = Mock(wraps=buffer.flush)
     services = _services(clip_store=SimpleNamespace(), buffer=buffer)
     bot = _RecordingBot()
 
@@ -2535,7 +2545,7 @@ async def test_compact_action_allows_large_clip_counts_and_splits_batches_of_ten
         state,
     )
 
-    buffer.flush_grouped.assert_called_once_with(77)
+    buffer.flush.assert_called_once_with(77)
     assert bot.events == [
         ('media_group', (77, ['f1', 'f2', 'f3', 'f4', 'f5', 'f6', 'f7', 'f8', 'f9', 'f10'])),
         ('media_group', (77, ['f11', 'f12', 'f13', 'f14', 'f15', 'f16', 'f17'])),
@@ -2558,7 +2568,7 @@ async def test_compact_action_becomes_stale_when_buffer_version_changes() -> Non
             chat_id=77,
         )
     initial_version = buffer.version(77)
-    buffer.flush_grouped = Mock(wraps=buffer.flush_grouped)
+    buffer.flush = Mock(wraps=buffer.flush)
     buffer.version = Mock(side_effect=[initial_version, initial_version + 1])
     services = _services(clip_store=SimpleNamespace(), buffer=buffer)
     bot = _RecordingBot()
@@ -2572,9 +2582,9 @@ async def test_compact_action_becomes_stale_when_buffer_version_changes() -> Non
         state,
     )
 
-    buffer.flush_grouped.assert_not_called()
+    buffer.flush.assert_not_called()
     message.edit_text.assert_awaited_once_with('Selection is no longer available', reply_markup=None)
-    assert [buffered_message.message_id for buffered_message in services.chat_message_buffer.peek(77)] == [1, 2]
+    assert [buffered_message.message_id for buffered_message in services.chat_message_buffer.peek_raw(77)] == [1, 2]
     assert bot.events == []
 
 
@@ -2613,7 +2623,7 @@ async def test_route_action_stores_clips_in_caption_route_order_across_message_g
         ),
         chat_id=77,
     )
-    buffer.flush_grouped = Mock(wraps=buffer.flush_grouped)
+    buffer.flush = Mock(wraps=buffer.flush)
 
     clip_store = SimpleNamespace(
         store=AsyncMock(return_value=StoreResult(stored_count=3, duplicate_count=0)),
@@ -2639,8 +2649,8 @@ async def test_route_action_stores_clips_in_caption_route_order_across_message_g
     )
 
     callback.answer.assert_awaited_once()
-    buffer.flush_grouped.assert_called_once_with(77)
-    assert services.chat_message_buffer.peek(77) == []
+    buffer.flush.assert_called_once_with(77)
+    assert services.chat_message_buffer.peek_raw(77) == []
     clip_store.store.assert_awaited_once()
     stored_clips = clip_store.store.await_args.kwargs['clips']
     assert stored_clips == [_mp4_file(b'one'), _mp4_file(b'two'), _mp4_file(b'three')]
@@ -3055,7 +3065,7 @@ async def test_route_action_updates_active_route_from_standalone_text_and_clip_c
             batch_size=intake_module._TELEGRAM_MEDIA_GROUP_LIMIT,
         ),
     ]
-    assert services.chat_message_buffer.peek(77) == []
+    assert services.chat_message_buffer.peek_raw(77) == []
 
 
 @pytest.mark.asyncio
@@ -3086,7 +3096,7 @@ async def test_route_action_edits_missing_route_when_first_video_has_no_caption(
     clip_store.store.assert_not_awaited()
     clip_store.compact.assert_not_awaited()
     # Intentional UX: Route flushes once at entry and does not restore buffered clips on failure.
-    assert services.chat_message_buffer.peek(77) == []
+    assert services.chat_message_buffer.peek_raw(77) == []
 
 
 @pytest.mark.asyncio
@@ -3121,7 +3131,7 @@ async def test_route_action_edits_invalid_route_when_first_video_caption_is_inva
     message.answer.assert_not_awaited()
     clip_store.store.assert_not_awaited()
     clip_store.compact.assert_not_awaited()
-    assert services.chat_message_buffer.peek(77) == []
+    assert services.chat_message_buffer.peek_raw(77) == []
 
 
 @pytest.mark.asyncio
@@ -3171,7 +3181,7 @@ async def test_route_action_uses_latest_valid_pre_clip_text_before_first_video()
         ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.SOURCE),
         batch_size=intake_module._TELEGRAM_MEDIA_GROUP_LIMIT,
     )
-    assert services.chat_message_buffer.peek(77) == []
+    assert services.chat_message_buffer.peek_raw(77) == []
 
 
 @pytest.mark.asyncio
@@ -3216,7 +3226,7 @@ async def test_route_action_ignores_invalid_pre_clip_text_until_valid_route_text
         message.edit_text.await_args_list[1],
         ('East', '2024', '2', 'Source'),
     )
-    assert services.chat_message_buffer.peek(77) == []
+    assert services.chat_message_buffer.peek_raw(77) == []
 
 
 @pytest.mark.asyncio
@@ -3248,7 +3258,7 @@ async def test_route_action_edits_missing_route_when_pre_clip_text_is_not_a_rout
     message.answer.assert_not_awaited()
     clip_store.store.assert_not_awaited()
     clip_store.compact.assert_not_awaited()
-    assert services.chat_message_buffer.peek(77) == []
+    assert services.chat_message_buffer.peek_raw(77) == []
 
 
 @pytest.mark.asyncio
@@ -3561,7 +3571,7 @@ async def test_reconcile_entry_accepts_same_group_clips_from_different_sub_group
     assert state.data['clip_group'] == clip_group
     assert state.data['clip_id_batches'] == [[_CLIP_ID_1], [_CLIP_ID_2, _CLIP_ID_3]]
     assert state.data['buffer_version'] == pre_flush_buffer_version
-    assert [message.message_id for message in services.chat_message_buffer.peek(1)] == [1, 2, 3]
+    assert [message.message_id for message in services.chat_message_buffer.peek_raw(1)] == [1, 2, 3]
 
 
 @pytest.mark.asyncio
@@ -3622,7 +3632,7 @@ async def test_reconcile_entry_prefers_current_buffered_clips_over_stored_reconc
     )
     assert state.data['clip_group'] == clip_group
     assert state.data['clip_id_batches'] == [[_CLIP_ID_1], [_CLIP_ID_2, _CLIP_ID_3]]
-    assert [message.message_id for message in services.chat_message_buffer.peek(77)] == [1, 2, 3]
+    assert [message.message_id for message in services.chat_message_buffer.peek_raw(77)] == [1, 2, 3]
 
 
 @pytest.mark.asyncio
@@ -4917,7 +4927,7 @@ async def test_reconcile_scope_selection_uses_stored_clip_id_batches_without_dow
     )
     bot.get_file.assert_not_awaited()
     bot.download_file.assert_not_awaited()
-    assert services.chat_message_buffer.peek(77) == []
+    assert services.chat_message_buffer.peek_raw(77) == []
     message.answer.assert_awaited_once_with(
         **Text(
             'Updated: ',
@@ -5208,7 +5218,7 @@ async def test_reconcile_entry_with_missing_video_filename_fails_cleanly_without
 
     message.answer.assert_not_awaited()
     message.edit_text.assert_awaited_once_with("Can't reconcile not stored", reply_markup=None)
-    assert services.chat_message_buffer.peek(77) == []
+    assert services.chat_message_buffer.peek_raw(77) == []
     assert state.current_state is None
     assert state.data == {}
 
@@ -5276,7 +5286,7 @@ async def test_reconcile_entry_surfaces_parse_errors(
     message.answer.assert_not_awaited()
     message.edit_text.assert_awaited_once_with(expected_message, reply_markup=None)
     assert state.current_state is None
-    assert services.chat_message_buffer.peek(77) == []
+    assert services.chat_message_buffer.peek_raw(77) == []
     assert state.data == {}
 
 

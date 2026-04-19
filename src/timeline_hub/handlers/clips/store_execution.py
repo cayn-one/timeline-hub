@@ -75,7 +75,8 @@ async def _store_buffered_clips(
     clip_sub_group: ClipSubGroup,
 ) -> StoreResult:
     result = StoreResult(stored_count=0, duplicate_count=0)
-    message_groups = services.chat_message_buffer.flush_grouped(chat_id)
+    message_groups = services.chat_message_buffer.peek_grouped(chat_id)
+    services.chat_message_buffer.flush(chat_id)
 
     for message_group in message_groups:
         clip_file_batch = await _message_group_to_clip_files(bot=bot, message_group=message_group)

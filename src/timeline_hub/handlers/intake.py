@@ -26,7 +26,7 @@ async def on_buffered_relevant_message(
     services.chat_message_buffer.append(message, chat_id=chat_id)
 
     async def send_action_selection() -> None:
-        buffered_messages = services.chat_message_buffer.peek(chat_id)
+        buffered_messages = services.chat_message_buffer.peek_raw(chat_id)
         ordered_buffered_messages = services.chat_message_buffer.peek_flat(chat_id)
         has_audio = any(buffered_message.audio is not None for buffered_message in buffered_messages)
         has_video = any(
