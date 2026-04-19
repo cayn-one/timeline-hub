@@ -6,7 +6,7 @@ import os
 import tempfile
 from datetime import timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 _HASH_READ_SIZE = 64 * 1024
 
@@ -86,20 +86,25 @@ async def create_audio_variant(
     *,
     speed: float,
     reverb: float,
-    input_sample_rate: int = 48_000,
-    bitrate: int = 160,
+    input_sample_rate: int,
+    output_format: Literal['opus', 'mp3'] = 'opus',
+    opus_bitrate: int = 160,
+    mp3_quality: int = 1,
     timeout: timedelta = timedelta(seconds=30),
 ) -> bytes:
-    """Return an Opus audio variant generated from source audio bytes.
+    """Return an audio variant generated from source audio bytes.
 
     The input is treated as an ffmpeg-readable audio file. Typical caller
     inputs include formats such as `.opus`, `.mp3`, `.wav`, `.m4a`, or other
-    common audio formats supported by ffmpeg. The output is always encoded as
-    Opus in an Ogg container.
+    common audio formats supported by ffmpeg.
+
+    Output format is selected explicitly via `output_format`:
+    - `'opus'` -> Opus in an Ogg container (bitrate-controlled)
+    - `'mp3'` -> MP3 encoded with libmp3lame (VBR quality-controlled)
 
     Variant generation preserves the current project behavior:
     - for `speed < 1`, apply slowed playback by changing sample rate and
-      resampling back to 48 kHz
+      resampling back to the target output sample rate
     - for `speed >= 1`, apply volume boost, sped-up playback, and a limiter
     - if `reverb > 0`, apply echo reverb after resampling
     - if `reverb == 0`, no reverb is applied
@@ -109,7 +114,13 @@ async def create_audio_variant(
         speed: Playback speed multiplier. Must be > 0.
         reverb: Reverb intensity in the closed range 0..1.
         input_sample_rate: Source audio sample rate in Hz.
-        bitrate: Target Opus bitrate in kbps.
+        output_format: Target output format. Supported values are `'opus'`
+            and `'mp3'`.
+        opus_bitrate: Target Opus bitrate in kbps. Used only when
+            `output_format='opus'`.
+        mp3_quality: MP3 VBR quality level (LAME `-q:a`). Lower is higher
+            quality. Typical range is 0–9, with 2 being high quality.
+            Used only when `output_format='mp3'`.
         timeout: Maximum time allowed for the ffmpeg subprocess run.
 
     Raises:
@@ -140,13 +151,44 @@ async def create_audio_variant(
     if input_sample_rate < 1:
         raise ValueError('input_sample_rate must be >= 1')
 
-    if isinstance(bitrate, bool) or not isinstance(bitrate, int):
-        raise ValueError('bitrate must be an integer')
-    if bitrate < 1:
-        raise ValueError('bitrate must be >= 1')
+    if output_format not in {'opus', 'mp3'}:
+        raise ValueError("output_format must be 'opus' or 'mp3'")
+
+    if isinstance(opus_bitrate, bool) or not isinstance(opus_bitrate, int):
+        raise ValueError('opus_bitrate must be an integer')
+    if opus_bitrate < 1:
+        raise ValueError('opus_bitrate must be >= 1')
+
+    if isinstance(mp3_quality, bool) or not isinstance(mp3_quality, int):
+        raise ValueError('mp3_quality must be an integer')
+    if not 0 <= mp3_quality <= 9:
+        raise ValueError('mp3_quality must be in 0..9')
+
+    if output_format == 'opus':
+        output_suffix = '.opus'
+        output_sample_rate = 48_000
+        codec_args = (
+            '-c:a',
+            'libopus',
+            '-b:a',
+            f'{opus_bitrate}k',
+            '-vbr',
+            'on',
+            '-compression_level',
+            '10',
+        )
+    else:
+        output_suffix = '.mp3'
+        output_sample_rate = 44_100
+        codec_args = (
+            '-c:a',
+            'libmp3lame',
+            '-q:a',
+            str(mp3_quality),
+        )
 
     input_fd, input_name = tempfile.mkstemp(suffix='.audio')
-    output_fd, output_name = tempfile.mkstemp(suffix='.opus')
+    output_fd, output_name = tempfile.mkstemp(suffix=output_suffix)
     os.close(input_fd)
     os.close(output_fd)
 
@@ -155,8 +197,6 @@ async def create_audio_variant(
 
     try:
         input_path.write_bytes(audio_bytes)
-
-        output_sample_rate = 48_000
 
         if speed < 1.0:
             filter_parts = [
@@ -195,14 +235,7 @@ async def create_audio_variant(
             audio_filter,
             '-ar',
             str(output_sample_rate),
-            '-c:a',
-            'libopus',
-            '-b:a',
-            f'{bitrate}k',
-            '-vbr',
-            'on',
-            '-compression_level',
-            '10',
+            *codec_args,
             str(output_path),
         )
         await _run_ffmpeg(cmd, timeout)

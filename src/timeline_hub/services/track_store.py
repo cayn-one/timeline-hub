@@ -2573,6 +2573,8 @@ class TrackStore:
                 source_bytes,
                 speed=spec.speed,
                 reverb=spec.reverb,
+                input_sample_rate=48_000,
+                output_format='opus',
             )
             variant_key = self._variant_storage_key(
                 track_group_prefix=track_group_prefix,

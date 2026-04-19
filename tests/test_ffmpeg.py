@@ -16,6 +16,7 @@ async def test_create_audio_variant_rejects_empty_input() -> None:
             b'',
             speed=1.0,
             reverb=0.0,
+            input_sample_rate=48_000,
         )
 
 
@@ -49,7 +50,8 @@ async def test_create_audio_variant_builds_slowdown_filter_without_reverb(
         speed=0.75,
         reverb=0.0,
         input_sample_rate=44_100,
-        bitrate=96,
+        output_format='opus',
+        opus_bitrate=96,
         timeout=timedelta(seconds=12),
     )
 
@@ -102,6 +104,8 @@ async def test_create_audio_variant_builds_speedup_filter_with_reverb(
         b'source-audio',
         speed=1.25,
         reverb=0.4,
+        input_sample_rate=48_000,
+        output_format='opus',
         timeout=timedelta(seconds=5),
     )
 
@@ -135,6 +139,57 @@ async def test_create_audio_variant_builds_speedup_filter_with_reverb(
             observed_cmds[0][-1],
         )
     ]
+
+
+@pytest.mark.asyncio
+async def test_create_audio_variant_builds_mp3_output_args(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: dict[str, tuple[str, ...] | timedelta] = {}
+
+    async def _fake_run_ffmpeg(cmd: tuple[str, ...], timeout: timedelta) -> bytes:
+        observed['cmd'] = cmd
+        observed['run_timeout'] = timeout
+        Path(cmd[-1]).write_bytes(b'variant-audio')
+        return b''
+
+    monkeypatch.setattr(ffmpeg_module, '_run_ffmpeg', _fake_run_ffmpeg)
+
+    result = await ffmpeg_module.create_audio_variant(
+        b'source-audio',
+        speed=1.0,
+        reverb=0.0,
+        input_sample_rate=48_000,
+        output_format='mp3',
+        mp3_quality=4,
+        timeout=timedelta(seconds=7),
+    )
+
+    assert result == b'variant-audio'
+    assert observed['run_timeout'] == timedelta(seconds=7)
+    assert observed['cmd'] == (
+        'ffmpeg',
+        '-hide_banner',
+        '-loglevel',
+        'error',
+        '-nostats',
+        '-nostdin',
+        '-y',
+        '-threads',
+        '1',
+        '-i',
+        observed['cmd'][10],
+        '-vn',
+        '-af',
+        'volume=1.0,asetrate=48000*1.0,aresample=44100,alimiter=limit=0.95',
+        '-ar',
+        '44100',
+        '-c:a',
+        'libmp3lame',
+        '-q:a',
+        '4',
+        observed['cmd'][-1],
+    )
 
 
 @pytest.mark.asyncio
