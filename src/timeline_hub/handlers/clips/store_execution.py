@@ -1,4 +1,7 @@
+from typing import Any
+
 from aiogram import Bot
+from aiogram.fsm.context import FSMContext
 from aiogram.types import Message
 from loguru import logger
 
@@ -17,12 +20,20 @@ async def execute_store_or_produce(
     *,
     bot: Bot,
     message: Message,
+    state: FSMContext,
     services: Services,
     settings: Settings,
     clip_group: ClipGroup,
     clip_sub_group: ClipSubGroup,
+    selection_kwargs: dict[str, Any],
     produce: bool,
 ) -> StoreResult:
+    await message.edit_text(
+        **selection_kwargs,
+        reply_markup=None,
+    )
+    await state.clear()
+
     result = await _store_buffered_clips(
         bot=bot,
         chat_id=message.chat.id,

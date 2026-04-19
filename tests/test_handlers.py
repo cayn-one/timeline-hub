@@ -4471,13 +4471,21 @@ async def test_store_scope_selection_aggregates_results_and_sends_exact_summary(
         buffer_version=buffer.version(77),
     )
 
+    store_results = [
+        StoreResult(stored_count=1, duplicate_count=0),
+        StoreResult(stored_count=2, duplicate_count=2),
+    ]
+
+    async def _store_and_assert_collapsed(*args, **kwargs) -> StoreResult:
+        _assert_format_kwargs(
+            message.edit_text.await_args_list[-1].kwargs,
+            _selected_kwargs('Store', 'West', '2025', '1', 'Collection'),
+        )
+        assert message.edit_text.await_args_list[-1].kwargs['reply_markup'] is None
+        return store_results.pop(0)
+
     clip_store = SimpleNamespace(
-        store=AsyncMock(
-            side_effect=[
-                StoreResult(stored_count=1, duplicate_count=0),
-                StoreResult(stored_count=2, duplicate_count=2),
-            ]
-        ),
+        store=AsyncMock(side_effect=_store_and_assert_collapsed),
         compact=AsyncMock(),
     )
     services = _services(clip_store=clip_store, buffer=buffer)
@@ -4523,6 +4531,7 @@ async def test_store_scope_selection_aggregates_results_and_sends_exact_summary(
         ).as_kwargs()
     )
     assert state.current_state is None
+    assert state.clear_count == 1
 
 
 @pytest.mark.asyncio
@@ -4566,16 +4575,29 @@ async def test_produce_scope_selection_stores_then_fetches_only_new_subset_via_s
         buffer_version=buffer.version(77),
     )
 
+    store_results = [
+        StoreResult(stored_count=1, duplicate_count=0, clip_ids=(_CLIP_ID_1,)),
+        StoreResult(stored_count=2, duplicate_count=1, clip_ids=(_CLIP_ID_2, _CLIP_ID_3)),
+    ]
+
     clip_store = _ProduceClipStore(
-        store_results=[
-            StoreResult(stored_count=1, duplicate_count=0, clip_ids=(_CLIP_ID_1,)),
-            StoreResult(stored_count=2, duplicate_count=1, clip_ids=(_CLIP_ID_2, _CLIP_ID_3)),
-        ],
+        store_results=store_results,
         fetched_batches=[
             [FetchedClip(id=_CLIP_ID_1, file=_mp4_file(b'one'))],
             [FetchedClip(id=_CLIP_ID_2, file=_mp4_file(b'two')), FetchedClip(id=_CLIP_ID_3, file=_mp4_file(b'three'))],
         ],
     )
+    original_store = clip_store.store
+
+    async def _store_and_assert_collapsed(*args, **kwargs) -> StoreResult:
+        _assert_format_kwargs(
+            message.edit_text.await_args_list[-1].kwargs,
+            _selected_kwargs('Produce', 'West', '2025', '1', 'Extra'),
+        )
+        assert message.edit_text.await_args_list[-1].kwargs['reply_markup'] is None
+        return await original_store(*args, **kwargs)
+
+    clip_store.store = AsyncMock(side_effect=_store_and_assert_collapsed)
     services = _services(clip_store=clip_store, buffer=buffer)
 
     bot = AsyncMock()
@@ -4645,6 +4667,7 @@ async def test_produce_scope_selection_stores_then_fetches_only_new_subset_via_s
     assert [item.media.data for item in sent_media] == [b'normalized:two', b'normalized:three']
     bot.send_message.assert_awaited_once_with(chat_id=77, text='Done')
     assert state.current_state is None
+    assert state.clear_count == 1
 
 
 @pytest.mark.asyncio
@@ -4830,6 +4853,111 @@ async def test_store_scope_selection_does_not_compact_when_everything_is_duplica
         state,
     )
 
+    clip_store.compact.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_store_scope_selection_keeps_compaction_failure_behavior_after_immediate_collapse() -> None:
+    message = _fake_message(text='Select scope:', chat_id=77, message_id=54)
+    callback = _fake_callback(message)
+    state = _FakeState()
+    await state.set_state(StoreClipFlow.scope)
+    buffer = ChatMessageBuffer()
+    buffer.append(
+        _fake_message(chat_id=77, message_id=1, video=_fake_video(file_id='f1', file_name='one.mp4')),
+        chat_id=77,
+    )
+    await state.update_data(
+        mode='store',
+        menu_message_id=54,
+        year=2025,
+        season=Season.S1,
+        universe=Universe.WEST,
+        sub_season=SubSeason.NONE,
+        buffer_version=buffer.version(77),
+    )
+
+    async def _store_and_assert_collapsed(*args, **kwargs) -> StoreResult:
+        _assert_format_kwargs(
+            message.edit_text.await_args_list[-1].kwargs,
+            _selected_kwargs('Store', 'West', '2025', '1', 'Extra'),
+        )
+        assert message.edit_text.await_args_list[-1].kwargs['reply_markup'] is None
+        return StoreResult(stored_count=1, duplicate_count=0)
+
+    clip_store = SimpleNamespace(
+        store=AsyncMock(side_effect=_store_and_assert_collapsed),
+        compact=AsyncMock(side_effect=RuntimeError('boom')),
+    )
+    services = _services(clip_store=clip_store, buffer=buffer)
+
+    bot = AsyncMock()
+    bot.get_file.return_value = SimpleNamespace(file_path='path-1')
+    bot.download_file.return_value = BytesIO(b'one')
+
+    with pytest.raises(RuntimeError, match='boom'):
+        await on_intake_menu(
+            callback,
+            IntakeCallbackData(action=MenuAction.SELECT, step=MenuStep.SCOPE, value=Scope.EXTRA.value),
+            bot,
+            services,
+            _settings(),
+            state,
+        )
+
+    _assert_format_kwargs(
+        message.edit_text.await_args_list[-1].kwargs,
+        _selected_kwargs('Store', 'West', '2025', '1', 'Extra'),
+    )
+    assert message.edit_text.await_args_list[-1].kwargs['reply_markup'] is None
+    message.answer.assert_awaited_once_with(**Text('Stored: ', Bold('1')).as_kwargs())
+    assert state.clear_count == 1
+
+
+@pytest.mark.asyncio
+async def test_store_scope_selection_edit_text_failure_preserves_fsm_state() -> None:
+    message = _fake_message(text='Select scope:', chat_id=77, message_id=55)
+    message.edit_text = AsyncMock(side_effect=RuntimeError('boom'))
+    callback = _fake_callback(message)
+    state = _FakeState()
+    await state.set_state(StoreClipFlow.scope)
+    buffer = ChatMessageBuffer()
+    buffer.append(
+        _fake_message(chat_id=77, message_id=1, video=_fake_video(file_id='f1', file_name='one.mp4')),
+        chat_id=77,
+    )
+    await state.update_data(
+        mode='store',
+        menu_message_id=55,
+        year=2025,
+        season=Season.S1,
+        universe=Universe.WEST,
+        sub_season=SubSeason.NONE,
+        buffer_version=buffer.version(77),
+    )
+
+    clip_store = SimpleNamespace(
+        store=AsyncMock(),
+        compact=AsyncMock(),
+    )
+    services = _services(clip_store=clip_store, buffer=buffer)
+
+    bot = AsyncMock()
+
+    with pytest.raises(RuntimeError, match='boom'):
+        await on_intake_menu(
+            callback,
+            IntakeCallbackData(action=MenuAction.SELECT, step=MenuStep.SCOPE, value=Scope.COLLECTION.value),
+            bot,
+            services,
+            _settings(),
+            state,
+        )
+
+    assert state.current_state == StoreClipFlow.scope.state
+    assert state.clear_count == 0
+    assert [buffered_message.message_id for buffered_message in services.chat_message_buffer.peek_raw(77)] == [1]
+    clip_store.store.assert_not_awaited()
     clip_store.compact.assert_not_awaited()
 
 

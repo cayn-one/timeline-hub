@@ -764,29 +764,25 @@ async def _on_store_select(
             clip_group = ClipGroup(universe=universe, year=year, season=season)
             clip_sub_group = ClipSubGroup(sub_season=sub_season, scope=scope)
 
-            await message.edit_text(
-                **selection_text(
-                    selected=flow_selection_labels(
-                        flow,
-                        universe=universe,
-                        year=year,
-                        season=season,
-                        sub_season=sub_season,
-                        scope=scope,
-                    )
-                ),
-                reply_markup=None,
-            )
-            await state.clear()
-
             if flow is _STORE_FLOW or flow is _PRODUCE_FLOW:
                 await execute_store_or_produce(
                     bot=bot,
                     message=message,
+                    state=state,
                     services=services,
                     settings=settings,
                     clip_group=clip_group,
                     clip_sub_group=clip_sub_group,
+                    selection_kwargs=selection_text(
+                        selected=flow_selection_labels(
+                            flow,
+                            universe=universe,
+                            year=year,
+                            season=season,
+                            sub_season=sub_season,
+                            scope=scope,
+                        )
+                    ),
                     produce=flow is _PRODUCE_FLOW,
                 )
                 return
