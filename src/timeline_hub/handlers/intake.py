@@ -5,7 +5,7 @@ from aiogram.utils.formatting import Bold, Text
 
 from timeline_hub.handlers.clips.ingest import try_dispatch_clip_intake
 from timeline_hub.handlers.menu import create_padding_line, dummy_button, stacked_keyboard
-from timeline_hub.handlers.tracks.retrieve import (
+from timeline_hub.handlers.tracks.ingest import (
     TrackIntakeAction,
     TrackIntakeActionCallbackData,
     try_dispatch_track_intake,
@@ -81,7 +81,10 @@ def _is_valid_track_batch(messages: list[Message]) -> bool:
         if index % 2 == 0:
             if buffered_message.photo is None:
                 return False
-            if buffered_message.caption is None or not buffered_message.caption.strip():
+            if buffered_message.caption is None:
+                return False
+            lines = [line.strip() for line in buffered_message.caption.splitlines() if line.strip()]
+            if len(lines) < 2:
                 return False
             continue
 

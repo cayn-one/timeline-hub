@@ -32,8 +32,9 @@ class ChatMessageBuffer:
         return list(self._messages.get(chat_id, []))
 
     def peek_flat(self, chat_id: ChatId) -> Messages:
-        """Peek messages in authoritative `message_id` order."""
-        return sorted(self.peek(chat_id), key=lambda message: message.message_id)
+        """Return buffered messages flattened and sorted by `message_id` (authoritative order)."""
+        messages = self.peek(chat_id)
+        return sorted(messages, key=lambda message: message.message_id)
 
     def peek_grouped(self, chat_id: ChatId) -> MessageGroups:
         """Peek and group messages by contiguous `media_group_id`."""

@@ -16,6 +16,7 @@ from timeline_hub.infra.tasks import TaskFailure, TaskScheduler, TaskSupervisor
 from timeline_hub.services.clip_store import ClipStore
 from timeline_hub.services.container import Services
 from timeline_hub.services.message_buffer import ChatMessageBuffer
+from timeline_hub.services.track_store import Preset, PresetMode, PresetStore, TrackStore
 from timeline_hub.settings import Settings
 from timeline_hub.types import UserId
 
@@ -74,12 +75,18 @@ async def _main(settings: Settings) -> None:
                 superuser_ids=settings.superuser_ids,
             )
 
+        preset_store = PresetStore(
+            s3_client,
+            bootstrap_preset=_default_track_preset(),
+        )
+
         dp['services'] = Services(
             chat_message_buffer=ChatMessageBuffer(),
             task_scheduler=TaskScheduler(
                 task_supervisor=TaskSupervisor(on_failure=on_failure_stop),
             ),
             clip_store=ClipStore(s3_client),
+            track_store=TrackStore(s3_client, preset_store=preset_store),
         )
         dp['settings'] = settings
         dp['on_failure'] = on_failure_stop
@@ -118,6 +125,16 @@ def _configure_logging() -> None:
     )
     # Hide normal 'SIGINT` signal logs when shutting bot down
     logging.getLogger('aiogram').setLevel(logging.ERROR)
+
+
+def _default_track_preset() -> Preset:
+    return Preset(
+        name='Default',
+        slowed=PresetMode(step=0.08, levels=4),
+        sped_up=PresetMode(step=0.04, levels=2),
+        reverb_start=0.03,
+        reverb_step=0.02,
+    )
 
 
 def _parse_args() -> argparse.Namespace:

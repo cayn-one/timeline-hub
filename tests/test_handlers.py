@@ -12,6 +12,9 @@ import timeline_hub.handlers.clips.ingest as intake_module
 import timeline_hub.handlers.clips.retrieve as retrieve_module
 import timeline_hub.handlers.clips.route_planning as route_planning_module
 import timeline_hub.handlers.clips.store_execution as store_execution_module
+import timeline_hub.handlers.tracks.ingest as track_ingest_module
+import timeline_hub.handlers.tracks.store_execution as track_store_execution_module
+import timeline_hub.services.track_store as track_store_module
 from timeline_hub.handlers.clips.common import (
     ALL_SCOPES_CALLBACK_VALUE,
     FLOW_PULL,
@@ -62,6 +65,17 @@ from timeline_hub.handlers.menu import (
     selected_text,
 )
 from timeline_hub.handlers.router import on_dummy_button, on_start_send_menu
+from timeline_hub.handlers.tracks.ingest import (
+    TrackIntakeAction,
+    TrackIntakeActionCallbackData,
+    TrackStoreAction,
+    TrackStoreCallbackData,
+    TrackStoreFlow,
+    TrackStoreStep,
+    on_track_intake_action,
+    on_track_store_menu,
+    try_dispatch_track_intake,
+)
 from timeline_hub.handlers.tracks.retrieve import (
     RetrieveEntryAction as TracksRetrieveEntryAction,
 )
@@ -69,14 +83,10 @@ from timeline_hub.handlers.tracks.retrieve import (
     RetrieveEntryCallbackData as TracksRetrieveEntryCallbackData,
 )
 from timeline_hub.handlers.tracks.retrieve import (
-    TrackIntakeAction,
-    TrackIntakeActionCallbackData,
-    on_track_intake_action,
-    on_tracks,
-    try_dispatch_track_intake,
+    on_retrieve_entry as on_tracks_retrieve_entry,
 )
 from timeline_hub.handlers.tracks.retrieve import (
-    on_retrieve_entry as on_tracks_retrieve_entry,
+    on_tracks,
 )
 from timeline_hub.services.clip_store import (
     AudioNormalization,
@@ -243,6 +253,7 @@ class _ProduceClipStore:
 def _services(
     *,
     clip_store,
+    track_store=None,
     scheduler: _FakeScheduler | None = None,
     buffer: ChatMessageBuffer | None = None,
 ) -> Services:
@@ -250,6 +261,7 @@ def _services(
         task_scheduler=scheduler or _FakeScheduler(),
         chat_message_buffer=buffer or ChatMessageBuffer(),
         clip_store=clip_store,
+        track_store=track_store or SimpleNamespace(store=AsyncMock()),
     )
 
 
@@ -306,6 +318,10 @@ def _fake_video(*, file_id: str, file_name: str | None) -> SimpleNamespace:
 
 def _fake_audio(*, file_id: str, file_name: str | None) -> SimpleNamespace:
     return SimpleNamespace(file_id=file_id, file_name=file_name)
+
+
+def _fake_photo(*, file_id: str) -> list[SimpleNamespace]:
+    return [SimpleNamespace(file_id=file_id)]
 
 
 def _fake_callback(message) -> SimpleNamespace:
@@ -783,7 +799,7 @@ async def test_valid_photo_audio_pairs_dispatch_to_track_menu() -> None:
     _assert_format_kwargs(message.answer.await_args.kwargs, expected)
     reply_markup = message.answer.await_args.kwargs['reply_markup']
     _assert_three_rows(reply_markup)
-    assert _keyboard_rows(reply_markup) == [[DUMMY_BUTTON_TEXT], [DUMMY_BUTTON_TEXT], ['Cancel']]
+    assert _keyboard_rows(reply_markup) == [['Store'], [DUMMY_BUTTON_TEXT], ['Cancel']]
     assert [buffered_message.message_id for buffered_message in services.chat_message_buffer.peek(42)] == [1, 2, 3, 4]
 
 
@@ -825,7 +841,7 @@ async def test_valid_out_of_order_appended_track_batch_dispatches_in_message_ord
     _assert_format_kwargs(message.answer.await_args.kwargs, expected)
     reply_markup = message.answer.await_args.kwargs['reply_markup']
     _assert_three_rows(reply_markup)
-    assert _keyboard_rows(reply_markup) == [[DUMMY_BUTTON_TEXT], [DUMMY_BUTTON_TEXT], ['Cancel']]
+    assert _keyboard_rows(reply_markup) == [['Store'], [DUMMY_BUTTON_TEXT], ['Cancel']]
     assert [buffered_message.message_id for buffered_message in services.chat_message_buffer.peek(42)] == [2, 1, 4, 3]
 
 
@@ -874,6 +890,24 @@ async def test_photo_without_caption_sends_cant_dispatch_input() -> None:
     buffer = ChatMessageBuffer()
     services = _services(clip_store=SimpleNamespace(), scheduler=scheduler, buffer=buffer)
     first_message = _fake_message(chat_id=42, message_id=1, photo=[object()], caption=None)
+    message = _fake_message(chat_id=42, message_id=2, audio=_fake_audio(file_id='audio-1', file_name='one.mp3'))
+
+    await on_buffered_relevant_message(first_message, services, _settings())
+    await on_buffered_relevant_message(message, services, _settings())
+    assert scheduler.job is not None
+
+    await scheduler.job()
+
+    message.answer.assert_awaited_once_with(text="Can't dispatch input")
+    assert services.chat_message_buffer.peek(42) == []
+
+
+@pytest.mark.asyncio
+async def test_single_line_caption_sends_cant_dispatch_input() -> None:
+    scheduler = _FakeScheduler()
+    buffer = ChatMessageBuffer()
+    services = _services(clip_store=SimpleNamespace(), scheduler=scheduler, buffer=buffer)
+    first_message = _fake_message(chat_id=42, message_id=1, photo=[object()], caption='Title only')
     message = _fake_message(chat_id=42, message_id=2, audio=_fake_audio(file_id='audio-1', file_name='one.mp3'))
 
     await on_buffered_relevant_message(first_message, services, _settings())
@@ -994,11 +1028,28 @@ async def test_try_dispatch_track_intake_returns_false_without_audio() -> None:
 
 
 @pytest.mark.asyncio
-async def test_try_dispatch_track_intake_shows_menu_with_multiple_audio_messages() -> None:
-    message = _fake_message(chat_id=42, message_id=2, audio=_fake_audio(file_id='audio-2', file_name='two.mp3'))
+async def test_try_dispatch_track_intake_shows_menu_with_multiple_pairs() -> None:
+    message = _fake_message(chat_id=42, message_id=4, audio=_fake_audio(file_id='audio-2', file_name='two.mp3'))
     buffer = ChatMessageBuffer()
     buffer.append(
-        _fake_message(chat_id=42, message_id=1, audio=_fake_audio(file_id='audio-1', file_name='one.mp3')),
+        _fake_message(chat_id=42, message_id=1, photo=_fake_photo(file_id='photo-1'), caption='Artist\nTitle'),
+        chat_id=42,
+    )
+    buffer.append(
+        _fake_message(
+            chat_id=42,
+            message_id=2,
+            audio=_fake_audio(file_id='audio-1', file_name='one.mp3'),
+        ),
+        chat_id=42,
+    )
+    buffer.append(
+        _fake_message(
+            chat_id=42,
+            message_id=3,
+            photo=_fake_photo(file_id='photo-2'),
+            caption='Another Artist\nAnother Title',
+        ),
         chat_id=42,
     )
     buffer.append(message, chat_id=42)
@@ -1013,16 +1064,29 @@ async def test_try_dispatch_track_intake_shows_menu_with_multiple_audio_messages
     assert handled is True
     _assert_format_kwargs(
         message.answer.await_args.kwargs,
-        Text(
-            'Tracks: ',
-            Bold('2'),
-            '\n',
-            create_padding_line(_settings().message_width),
-            '\n',
-            'Select action:',
-        ).as_kwargs(),
+        {
+            **Text(
+                'Tracks: ',
+                Bold('2'),
+                '\n',
+                create_padding_line(_settings().message_width),
+                '\n',
+                'Select action:',
+            ).as_kwargs(),
+            'reply_markup': message.answer.await_args.kwargs['reply_markup'],
+        },
     )
-    assert [buffered_message.message_id for buffered_message in services.chat_message_buffer.peek(42)] == [1, 2]
+    assert _keyboard_rows(message.answer.await_args.kwargs['reply_markup']) == [
+        ['Store'],
+        [DUMMY_BUTTON_TEXT],
+        ['Cancel'],
+    ]
+    assert [buffered_message.message_id for buffered_message in services.chat_message_buffer.peek(42)] == [
+        1,
+        2,
+        3,
+        4,
+    ]
 
 
 @pytest.mark.asyncio
@@ -1042,6 +1106,7 @@ async def test_track_intake_cancel_flushes_buffer() -> None:
         ),
         state,
         services,
+        _settings(),
     )
 
     callback.answer.assert_awaited_once()
@@ -1075,6 +1140,7 @@ async def test_track_intake_cancel_becomes_stale_when_buffer_version_changes() -
         ),
         state,
         services,
+        _settings(),
     )
 
     callback.answer.assert_awaited_once()
@@ -1101,6 +1167,7 @@ async def test_fallback_cancel_flushes_buffer_when_current() -> None:
         ),
         state,
         services,
+        _settings(),
     )
 
     callback.answer.assert_awaited_once()
@@ -1132,6 +1199,7 @@ async def test_fallback_cancel_becomes_stale_when_buffer_version_changes() -> No
         ),
         state,
         services,
+        _settings(),
     )
 
     callback.answer.assert_awaited_once()
@@ -1139,6 +1207,681 @@ async def test_fallback_cancel_becomes_stale_when_buffer_version_changes() -> No
     assert [buffered_message.message_id for buffered_message in services.chat_message_buffer.peek(42)] == [1, 2]
     assert state.current_state is None
     assert state.clear_count == 1
+
+
+@pytest.mark.asyncio
+async def test_track_store_happy_path_stores_all_prepared_tracks_in_order(monkeypatch: pytest.MonkeyPatch) -> None:
+    settings = _settings()
+    track_store = SimpleNamespace(store=AsyncMock())
+    buffer = ChatMessageBuffer()
+    buffered_messages = [
+        _fake_message(chat_id=42, message_id=1, photo=_fake_photo(file_id='photo-1'), caption='Artist 1\nTitle 1'),
+        _fake_message(chat_id=42, message_id=2, audio=_fake_audio(file_id='audio-1', file_name='one.mp3')),
+        _fake_message(
+            chat_id=42,
+            message_id=3,
+            photo=_fake_photo(file_id='photo-2'),
+            caption='Artist 2\nArtist 3\nTitle 2',
+        ),
+        _fake_message(chat_id=42, message_id=4, audio=_fake_audio(file_id='audio-2', file_name='two.mp3')),
+    ]
+    for buffered_message in buffered_messages:
+        buffer.append(buffered_message, chat_id=42)
+    services = _services(clip_store=SimpleNamespace(), track_store=track_store, buffer=buffer)
+    menu_message = _fake_message(text='Select action:', chat_id=42, message_id=50)
+    store_callback = _fake_callback(menu_message)
+    state = _FakeState()
+    bot = SimpleNamespace(
+        get_file=AsyncMock(
+            side_effect=[
+                SimpleNamespace(file_path='photo-path-1'),
+                SimpleNamespace(file_path='audio-path-1'),
+                SimpleNamespace(file_path='photo-path-2'),
+                SimpleNamespace(file_path='audio-path-2'),
+            ]
+        ),
+        download_file=AsyncMock(
+            side_effect=[
+                BytesIO(b'cover-1'),
+                BytesIO(b'audio-1'),
+                BytesIO(b'cover-2'),
+                BytesIO(b'audio-2'),
+            ]
+        ),
+    )
+    monkeypatch.setattr(track_store_execution_module, 'to_jpg', Mock(side_effect=[b'jpg-1', b'jpg-2']))
+    monkeypatch.setattr(track_store_execution_module, 'to_opus', AsyncMock(side_effect=[b'opus-1', b'opus-2']))
+
+    await on_track_intake_action(
+        store_callback,
+        TrackIntakeActionCallbackData(
+            action=TrackIntakeAction.STORE,
+            buffer_version=buffer.version(42),
+        ),
+        state,
+        services,
+        settings,
+    )
+
+    year = date.today().year - 1
+    for callback_data in [
+        TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.UNIVERSE, value='west'),
+        TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.YEAR, value=str(year)),
+        TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.SEASON, value='1'),
+        TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.SUB_SEASON, value='A'),
+    ]:
+        await on_track_store_menu(
+            _fake_callback(menu_message),
+            callback_data,
+            state,
+            services,
+            settings,
+            bot,
+        )
+
+    assert track_store.store.await_count == 2
+    first_call, second_call = track_store.store.await_args_list
+    expected_group = track_store_module.TrackGroup(
+        universe=track_store_module.TrackUniverse.WEST,
+        year=year,
+        season=track_store_module.Season.S1,
+    )
+    assert first_call.args == (expected_group, track_store_module.SubSeason.A)
+    assert second_call.args == (expected_group, track_store_module.SubSeason.A)
+    assert first_call.kwargs['track'].artists == ('Artist 1',)
+    assert first_call.kwargs['track'].title == 'Title 1'
+    assert first_call.kwargs['track'].cover == FileBytes(data=b'jpg-1', extension=Extension.JPG)
+    assert first_call.kwargs['track'].audio == FileBytes(data=b'opus-1', extension=Extension.OPUS)
+    assert second_call.kwargs['track'].artists == ('Artist 2', 'Artist 3')
+    assert second_call.kwargs['track'].title == 'Title 2'
+    assert second_call.kwargs['track'].cover == FileBytes(data=b'jpg-2', extension=Extension.JPG)
+    assert second_call.kwargs['track'].audio == FileBytes(data=b'opus-2', extension=Extension.OPUS)
+    menu_message.answer.assert_awaited_once_with(**Text('Stored: ', Bold('2')).as_kwargs())
+    assert services.chat_message_buffer.peek(42) == []
+    assert state.current_state is None
+
+
+@pytest.mark.asyncio
+async def test_track_store_preserves_message_id_order_even_if_buffer_out_of_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings()
+    track_store = SimpleNamespace(store=AsyncMock())
+    buffer = ChatMessageBuffer()
+    for buffered_message in [
+        _fake_message(chat_id=42, message_id=2, audio=_fake_audio(file_id='audio-1', file_name='one.mp3')),
+        _fake_message(chat_id=42, message_id=1, photo=_fake_photo(file_id='photo-1'), caption='Artist 1\nTitle 1'),
+        _fake_message(chat_id=42, message_id=4, audio=_fake_audio(file_id='audio-2', file_name='two.mp3')),
+        _fake_message(chat_id=42, message_id=3, photo=_fake_photo(file_id='photo-2'), caption='Artist 2\nTitle 2'),
+    ]:
+        buffer.append(buffered_message, chat_id=42)
+    services = _services(clip_store=SimpleNamespace(), track_store=track_store, buffer=buffer)
+    menu_message = _fake_message(text='Select action:', chat_id=42, message_id=55)
+    state = _FakeState()
+    bot = SimpleNamespace(
+        get_file=AsyncMock(
+            side_effect=[
+                SimpleNamespace(file_path='photo-path-1'),
+                SimpleNamespace(file_path='audio-path-1'),
+                SimpleNamespace(file_path='photo-path-2'),
+                SimpleNamespace(file_path='audio-path-2'),
+            ]
+        ),
+        download_file=AsyncMock(
+            side_effect=[
+                BytesIO(b'cover-1'),
+                BytesIO(b'audio-1'),
+                BytesIO(b'cover-2'),
+                BytesIO(b'audio-2'),
+            ]
+        ),
+    )
+    monkeypatch.setattr(track_store_execution_module, 'to_jpg', Mock(side_effect=[b'jpg-1', b'jpg-2']))
+    monkeypatch.setattr(track_store_execution_module, 'to_opus', AsyncMock(side_effect=[b'opus-1', b'opus-2']))
+
+    await on_track_intake_action(
+        _fake_callback(menu_message),
+        TrackIntakeActionCallbackData(
+            action=TrackIntakeAction.STORE,
+            buffer_version=buffer.version(42),
+        ),
+        state,
+        services,
+        settings,
+    )
+
+    year = date.today().year - 1
+    for callback_data in [
+        TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.UNIVERSE, value='west'),
+        TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.YEAR, value=str(year)),
+        TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.SEASON, value='1'),
+        TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.SUB_SEASON, value='A'),
+    ]:
+        await on_track_store_menu(
+            _fake_callback(menu_message),
+            callback_data,
+            state,
+            services,
+            settings,
+            bot,
+        )
+
+    first_call, second_call = track_store.store.await_args_list
+    assert first_call.kwargs['track'].artists == ('Artist 1',)
+    assert first_call.kwargs['track'].title == 'Title 1'
+    assert second_call.kwargs['track'].artists == ('Artist 2',)
+    assert second_call.kwargs['track'].title == 'Title 2'
+
+
+@pytest.mark.asyncio
+async def test_track_store_caption_failure_invalidates_menu_and_skips_store() -> None:
+    settings = _settings()
+    track_store = SimpleNamespace(store=AsyncMock())
+    buffer = ChatMessageBuffer()
+    for buffered_message in [
+        _fake_message(chat_id=42, message_id=1, photo=_fake_photo(file_id='photo-1'), caption='Title only'),
+        _fake_message(chat_id=42, message_id=2, audio=_fake_audio(file_id='audio-1', file_name='one.mp3')),
+    ]:
+        buffer.append(buffered_message, chat_id=42)
+    services = _services(clip_store=SimpleNamespace(), track_store=track_store, buffer=buffer)
+    menu_message = _fake_message(text='Select action:', chat_id=42, message_id=60)
+    state = _FakeState()
+    bot = SimpleNamespace(get_file=AsyncMock(), download_file=AsyncMock())
+
+    await on_track_intake_action(
+        _fake_callback(menu_message),
+        TrackIntakeActionCallbackData(
+            action=TrackIntakeAction.STORE,
+            buffer_version=buffer.version(42),
+        ),
+        state,
+        services,
+        settings,
+    )
+
+    year = date.today().year - 1
+    for callback_data in [
+        TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.UNIVERSE, value='west'),
+        TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.YEAR, value=str(year)),
+        TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.SEASON, value='1'),
+        TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.SUB_SEASON, value='A'),
+    ]:
+        await on_track_store_menu(
+            _fake_callback(menu_message),
+            callback_data,
+            state,
+            services,
+            settings,
+            bot,
+        )
+
+    track_store.store.assert_not_awaited()
+    menu_message.edit_text.assert_awaited_with('Not enough lines to extract artists and title', reply_markup=None)
+    assert services.chat_message_buffer.peek(42) == []
+    assert state.current_state is None
+
+
+@pytest.mark.asyncio
+async def test_track_store_validation_failure_does_not_download_files() -> None:
+    settings = _settings()
+    track_store = SimpleNamespace(store=AsyncMock())
+    buffer = ChatMessageBuffer()
+    for buffered_message in [
+        _fake_message(chat_id=42, message_id=1, photo=_fake_photo(file_id='photo-1'), caption='Artist 1\nTitle 1'),
+        _fake_message(chat_id=42, message_id=2, audio=_fake_audio(file_id='audio-1', file_name='one.mp3')),
+        _fake_message(chat_id=42, message_id=3, photo=_fake_photo(file_id='photo-2'), caption='Broken title'),
+        _fake_message(chat_id=42, message_id=4, audio=_fake_audio(file_id='audio-2', file_name='two.mp3')),
+    ]:
+        buffer.append(buffered_message, chat_id=42)
+    services = _services(clip_store=SimpleNamespace(), track_store=track_store, buffer=buffer)
+    menu_message = _fake_message(text='Select action:', chat_id=42, message_id=65)
+    state = _FakeState()
+    bot = SimpleNamespace(get_file=AsyncMock(), download_file=AsyncMock())
+
+    await on_track_intake_action(
+        _fake_callback(menu_message),
+        TrackIntakeActionCallbackData(
+            action=TrackIntakeAction.STORE,
+            buffer_version=buffer.version(42),
+        ),
+        state,
+        services,
+        settings,
+    )
+
+    year = date.today().year - 1
+    for callback_data in [
+        TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.UNIVERSE, value='west'),
+        TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.YEAR, value=str(year)),
+        TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.SEASON, value='1'),
+        TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.SUB_SEASON, value='A'),
+    ]:
+        await on_track_store_menu(
+            _fake_callback(menu_message),
+            callback_data,
+            state,
+            services,
+            settings,
+            bot,
+        )
+
+    bot.get_file.assert_not_awaited()
+    bot.download_file.assert_not_awaited()
+    track_store.store.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_track_store_mid_batch_preprocessing_failure_prevents_partial_store(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings()
+    track_store = SimpleNamespace(store=AsyncMock())
+    buffer = ChatMessageBuffer()
+    buffered_messages = [
+        _fake_message(chat_id=42, message_id=1, photo=_fake_photo(file_id='photo-1'), caption='Artist 1\nTitle 1'),
+        _fake_message(chat_id=42, message_id=2, audio=_fake_audio(file_id='audio-1', file_name='one.mp3')),
+        _fake_message(chat_id=42, message_id=3, photo=_fake_photo(file_id='photo-2'), caption='Broken title'),
+        _fake_message(chat_id=42, message_id=4, audio=_fake_audio(file_id='audio-2', file_name='two.mp3')),
+    ]
+    for buffered_message in buffered_messages:
+        buffer.append(buffered_message, chat_id=42)
+    services = _services(clip_store=SimpleNamespace(), track_store=track_store, buffer=buffer)
+    menu_message = _fake_message(text='Select action:', chat_id=42, message_id=70)
+    state = _FakeState()
+    bot = SimpleNamespace(
+        get_file=AsyncMock(
+            side_effect=[
+                SimpleNamespace(file_path='photo-path-1'),
+                SimpleNamespace(file_path='audio-path-1'),
+            ]
+        ),
+        download_file=AsyncMock(side_effect=[BytesIO(b'cover-1'), BytesIO(b'audio-1')]),
+    )
+    monkeypatch.setattr(track_store_execution_module, 'to_jpg', Mock(return_value=b'jpg-1'))
+    monkeypatch.setattr(track_store_execution_module, 'to_opus', AsyncMock(return_value=b'opus-1'))
+
+    await on_track_intake_action(
+        _fake_callback(menu_message),
+        TrackIntakeActionCallbackData(
+            action=TrackIntakeAction.STORE,
+            buffer_version=buffer.version(42),
+        ),
+        state,
+        services,
+        settings,
+    )
+
+    year = date.today().year - 1
+    for callback_data in [
+        TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.UNIVERSE, value='west'),
+        TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.YEAR, value=str(year)),
+        TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.SEASON, value='1'),
+        TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.SUB_SEASON, value='A'),
+    ]:
+        await on_track_store_menu(
+            _fake_callback(menu_message),
+            callback_data,
+            state,
+            services,
+            settings,
+            bot,
+        )
+
+    track_store.store.assert_not_awaited()
+    menu_message.edit_text.assert_awaited_with('Not enough lines to extract artists and title', reply_markup=None)
+    assert services.chat_message_buffer.peek(42) == []
+
+
+@pytest.mark.asyncio
+async def test_track_store_partial_failure_reports_stored_titles_and_flushes_buffer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings()
+
+    async def failing_store(*args, **kwargs) -> None:
+        failing_store.calls.append((args, kwargs))
+        if len(failing_store.calls) == 1:
+            return None
+        raise RuntimeError('boom')
+
+    failing_store.calls = []
+    track_store = SimpleNamespace(store=failing_store)
+    buffer = ChatMessageBuffer()
+    for buffered_message in [
+        _fake_message(chat_id=42, message_id=1, photo=_fake_photo(file_id='photo-1'), caption='Artist 1\nTitle 1'),
+        _fake_message(chat_id=42, message_id=2, audio=_fake_audio(file_id='audio-1', file_name='one.mp3')),
+        _fake_message(chat_id=42, message_id=3, photo=_fake_photo(file_id='photo-2'), caption='Artist 2\nTitle 2'),
+        _fake_message(chat_id=42, message_id=4, audio=_fake_audio(file_id='audio-2', file_name='two.mp3')),
+    ]:
+        buffer.append(buffered_message, chat_id=42)
+    services = _services(clip_store=SimpleNamespace(), track_store=track_store, buffer=buffer)
+    menu_message = _fake_message(text='Select action:', chat_id=42, message_id=75)
+    state = _FakeState()
+    bot = SimpleNamespace(
+        get_file=AsyncMock(
+            side_effect=[
+                SimpleNamespace(file_path='photo-path-1'),
+                SimpleNamespace(file_path='audio-path-1'),
+                SimpleNamespace(file_path='photo-path-2'),
+                SimpleNamespace(file_path='audio-path-2'),
+            ]
+        ),
+        download_file=AsyncMock(
+            side_effect=[
+                BytesIO(b'cover-1'),
+                BytesIO(b'audio-1'),
+                BytesIO(b'cover-2'),
+                BytesIO(b'audio-2'),
+            ]
+        ),
+    )
+    monkeypatch.setattr(track_store_execution_module, 'to_jpg', Mock(side_effect=[b'jpg-1', b'jpg-2']))
+    monkeypatch.setattr(track_store_execution_module, 'to_opus', AsyncMock(side_effect=[b'opus-1', b'opus-2']))
+    log_exception = Mock()
+    monkeypatch.setattr(track_ingest_module.logger, 'exception', log_exception)
+
+    await on_track_intake_action(
+        _fake_callback(menu_message),
+        TrackIntakeActionCallbackData(
+            action=TrackIntakeAction.STORE,
+            buffer_version=buffer.version(42),
+        ),
+        state,
+        services,
+        settings,
+    )
+
+    year = date.today().year - 1
+    for callback_data in [
+        TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.UNIVERSE, value='west'),
+        TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.YEAR, value=str(year)),
+        TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.SEASON, value='1'),
+    ]:
+        await on_track_store_menu(
+            _fake_callback(menu_message),
+            callback_data,
+            state,
+            services,
+            settings,
+            bot,
+        )
+
+    await on_track_store_menu(
+        _fake_callback(menu_message),
+        TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.SUB_SEASON, value='A'),
+        state,
+        services,
+        settings,
+        bot,
+    )
+
+    assert len(failing_store.calls) == 2
+    menu_message.answer.assert_awaited_once_with(text='Storing failed\nStored titles:\nTitle 1')
+    assert services.chat_message_buffer.peek(42) == []
+    assert state.current_state is None
+    assert state.clear_count == 1
+    log_exception.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_track_store_selection_becomes_stale_when_buffer_changes() -> None:
+    settings = _settings()
+    buffer = ChatMessageBuffer()
+    for buffered_message in [
+        _fake_message(chat_id=42, message_id=1, photo=_fake_photo(file_id='photo-1'), caption='Artist\nTitle'),
+        _fake_message(chat_id=42, message_id=2, audio=_fake_audio(file_id='audio-1', file_name='one.mp3')),
+    ]:
+        buffer.append(buffered_message, chat_id=42)
+    services = _services(clip_store=SimpleNamespace(), buffer=buffer)
+    menu_message = _fake_message(text='Select action:', chat_id=42, message_id=80)
+    state = _FakeState()
+
+    await on_track_intake_action(
+        _fake_callback(menu_message),
+        TrackIntakeActionCallbackData(
+            action=TrackIntakeAction.STORE,
+            buffer_version=buffer.version(42),
+        ),
+        state,
+        services,
+        settings,
+    )
+    assert state.current_state == TrackStoreFlow.universe.state
+
+    buffer.append(_fake_message(chat_id=42, message_id=3, text='newer'), chat_id=42)
+
+    await on_track_store_menu(
+        _fake_callback(menu_message),
+        TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.UNIVERSE, value='west'),
+        state,
+        services,
+        settings,
+        SimpleNamespace(get_file=AsyncMock(), download_file=AsyncMock()),
+    )
+
+    menu_message.edit_text.assert_awaited_with('Selection is no longer available', reply_markup=None)
+    assert [buffered_message.message_id for buffered_message in services.chat_message_buffer.peek(42)] == [1, 2, 3]
+
+
+@pytest.mark.asyncio
+async def test_track_store_invalid_universe_callback_value_becomes_stale() -> None:
+    settings = _settings()
+    buffer = ChatMessageBuffer()
+    for buffered_message in [
+        _fake_message(chat_id=42, message_id=1, photo=_fake_photo(file_id='photo-1'), caption='Artist\nTitle'),
+        _fake_message(chat_id=42, message_id=2, audio=_fake_audio(file_id='audio-1', file_name='one.mp3')),
+    ]:
+        buffer.append(buffered_message, chat_id=42)
+    services = _services(clip_store=SimpleNamespace(), buffer=buffer)
+    menu_message = _fake_message(text='Select action:', chat_id=42, message_id=81)
+    state = _FakeState()
+
+    await on_track_intake_action(
+        _fake_callback(menu_message),
+        TrackIntakeActionCallbackData(
+            action=TrackIntakeAction.STORE,
+            buffer_version=buffer.version(42),
+        ),
+        state,
+        services,
+        settings,
+    )
+
+    await on_track_store_menu(
+        _fake_callback(menu_message),
+        TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.UNIVERSE, value='bad'),
+        state,
+        services,
+        settings,
+        SimpleNamespace(get_file=AsyncMock(), download_file=AsyncMock()),
+    )
+
+    menu_message.edit_text.assert_awaited_with('Selection is no longer available', reply_markup=None)
+
+
+@pytest.mark.asyncio
+async def test_track_store_year_menu_shows_most_recent_years_first(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _FixedDate(date):
+        @classmethod
+        def today(cls) -> date:
+            return cls(2026, 1, 1)
+
+    monkeypatch.setattr(track_ingest_module, 'date', _FixedDate)
+    settings = _settings(min_clip_year=2022)
+    buffer = ChatMessageBuffer()
+    for buffered_message in [
+        _fake_message(chat_id=42, message_id=1, photo=_fake_photo(file_id='photo-1'), caption='Artist\nTitle'),
+        _fake_message(chat_id=42, message_id=2, audio=_fake_audio(file_id='audio-1', file_name='one.mp3')),
+    ]:
+        buffer.append(buffered_message, chat_id=42)
+    services = _services(clip_store=SimpleNamespace(), buffer=buffer)
+    menu_message = _fake_message(text='Select action:', chat_id=42, message_id=81)
+    state = _FakeState()
+
+    await on_track_intake_action(
+        _fake_callback(menu_message),
+        TrackIntakeActionCallbackData(
+            action=TrackIntakeAction.STORE,
+            buffer_version=buffer.version(42),
+        ),
+        state,
+        services,
+        settings,
+    )
+    await on_track_store_menu(
+        _fake_callback(menu_message),
+        TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.UNIVERSE, value='west'),
+        state,
+        services,
+        settings,
+        SimpleNamespace(get_file=AsyncMock(), download_file=AsyncMock()),
+    )
+
+    reply_markup = menu_message.edit_text.await_args.kwargs['reply_markup']
+    assert _keyboard_rows(reply_markup) == [['2023', '2026'], ['2022', '2024', '2025'], ['Back']]
+
+
+@pytest.mark.asyncio
+async def test_track_store_invalid_year_callback_value_becomes_stale() -> None:
+    settings = _settings()
+    buffer = ChatMessageBuffer()
+    for buffered_message in [
+        _fake_message(chat_id=42, message_id=1, photo=_fake_photo(file_id='photo-1'), caption='Artist\nTitle'),
+        _fake_message(chat_id=42, message_id=2, audio=_fake_audio(file_id='audio-1', file_name='one.mp3')),
+    ]:
+        buffer.append(buffered_message, chat_id=42)
+    services = _services(clip_store=SimpleNamespace(), buffer=buffer)
+    menu_message = _fake_message(text='Select action:', chat_id=42, message_id=82)
+    state = _FakeState()
+
+    await on_track_intake_action(
+        _fake_callback(menu_message),
+        TrackIntakeActionCallbackData(
+            action=TrackIntakeAction.STORE,
+            buffer_version=buffer.version(42),
+        ),
+        state,
+        services,
+        settings,
+    )
+    await on_track_store_menu(
+        _fake_callback(menu_message),
+        TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.UNIVERSE, value='west'),
+        state,
+        services,
+        settings,
+        SimpleNamespace(get_file=AsyncMock(), download_file=AsyncMock()),
+    )
+
+    await on_track_store_menu(
+        _fake_callback(menu_message),
+        TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.YEAR, value='bad'),
+        state,
+        services,
+        settings,
+        SimpleNamespace(get_file=AsyncMock(), download_file=AsyncMock()),
+    )
+
+    menu_message.edit_text.assert_awaited_with('Selection is no longer available', reply_markup=None)
+
+
+@pytest.mark.asyncio
+async def test_track_store_invalid_season_callback_value_becomes_stale() -> None:
+    settings = _settings()
+    buffer = ChatMessageBuffer()
+    for buffered_message in [
+        _fake_message(chat_id=42, message_id=1, photo=_fake_photo(file_id='photo-1'), caption='Artist\nTitle'),
+        _fake_message(chat_id=42, message_id=2, audio=_fake_audio(file_id='audio-1', file_name='one.mp3')),
+    ]:
+        buffer.append(buffered_message, chat_id=42)
+    services = _services(clip_store=SimpleNamespace(), buffer=buffer)
+    menu_message = _fake_message(text='Select action:', chat_id=42, message_id=83)
+    state = _FakeState()
+    year = date.today().year - 1
+
+    await on_track_intake_action(
+        _fake_callback(menu_message),
+        TrackIntakeActionCallbackData(
+            action=TrackIntakeAction.STORE,
+            buffer_version=buffer.version(42),
+        ),
+        state,
+        services,
+        settings,
+    )
+    for callback_data in [
+        TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.UNIVERSE, value='west'),
+        TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.YEAR, value=str(year)),
+    ]:
+        await on_track_store_menu(
+            _fake_callback(menu_message),
+            callback_data,
+            state,
+            services,
+            settings,
+            SimpleNamespace(get_file=AsyncMock(), download_file=AsyncMock()),
+        )
+
+    await on_track_store_menu(
+        _fake_callback(menu_message),
+        TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.SEASON, value='bad'),
+        state,
+        services,
+        settings,
+        SimpleNamespace(get_file=AsyncMock(), download_file=AsyncMock()),
+    )
+
+    menu_message.edit_text.assert_awaited_with('Selection is no longer available', reply_markup=None)
+
+
+@pytest.mark.asyncio
+async def test_track_store_invalid_sub_season_callback_value_becomes_stale() -> None:
+    settings = _settings()
+    buffer = ChatMessageBuffer()
+    for buffered_message in [
+        _fake_message(chat_id=42, message_id=1, photo=_fake_photo(file_id='photo-1'), caption='Artist\nTitle'),
+        _fake_message(chat_id=42, message_id=2, audio=_fake_audio(file_id='audio-1', file_name='one.mp3')),
+    ]:
+        buffer.append(buffered_message, chat_id=42)
+    services = _services(clip_store=SimpleNamespace(), buffer=buffer)
+    menu_message = _fake_message(text='Select action:', chat_id=42, message_id=84)
+    state = _FakeState()
+    year = date.today().year - 1
+
+    await on_track_intake_action(
+        _fake_callback(menu_message),
+        TrackIntakeActionCallbackData(
+            action=TrackIntakeAction.STORE,
+            buffer_version=buffer.version(42),
+        ),
+        state,
+        services,
+        settings,
+    )
+    for callback_data in [
+        TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.UNIVERSE, value='west'),
+        TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.YEAR, value=str(year)),
+        TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.SEASON, value='1'),
+    ]:
+        await on_track_store_menu(
+            _fake_callback(menu_message),
+            callback_data,
+            state,
+            services,
+            settings,
+            SimpleNamespace(get_file=AsyncMock(), download_file=AsyncMock()),
+        )
+
+    await on_track_store_menu(
+        _fake_callback(menu_message),
+        TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.SUB_SEASON, value='bad'),
+        state,
+        services,
+        settings,
+        SimpleNamespace(get_file=AsyncMock(), download_file=AsyncMock()),
+    )
+
+    menu_message.edit_text.assert_awaited_with('Selection is no longer available', reply_markup=None)
 
 
 def test_intake_action_keyboard_uses_right_to_left_columns() -> None:
