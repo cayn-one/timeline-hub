@@ -13,6 +13,7 @@ import timeline_hub.handlers.clips.retrieve as retrieve_module
 import timeline_hub.handlers.clips.route_planning as route_planning_module
 import timeline_hub.handlers.clips.store_execution as store_execution_module
 import timeline_hub.handlers.tracks.ingest as track_ingest_module
+import timeline_hub.handlers.tracks.retrieve as track_retrieve_module
 import timeline_hub.handlers.tracks.store_execution as track_store_execution_module
 import timeline_hub.services.track_store as track_store_module
 from timeline_hub.handlers.clips.common import (
@@ -83,10 +84,17 @@ from timeline_hub.handlers.tracks.retrieve import (
     RetrieveEntryCallbackData as TracksRetrieveEntryCallbackData,
 )
 from timeline_hub.handlers.tracks.retrieve import (
+    TrackRetrieveAction,
+    TrackRetrieveCallbackData,
+    TrackRetrieveFlow,
+    TrackRetrieveStep,
+    on_tracks,
+)
+from timeline_hub.handlers.tracks.retrieve import (
     on_retrieve_entry as on_tracks_retrieve_entry,
 )
 from timeline_hub.handlers.tracks.retrieve import (
-    on_tracks,
+    on_retrieve_menu as on_tracks_retrieve_menu,
 )
 from timeline_hub.services.clip_store import (
     AudioNormalization,
@@ -250,6 +258,89 @@ class _ProduceClipStore:
             yield [FetchedClip(id=clip.id, file=_mp4_file(b'normalized:' + clip.file.data)) for clip in batch]
 
 
+class _RetrieveTrackStore:
+    def __init__(
+        self,
+        *,
+        groups: list[track_store_module.TrackGroup],
+        tracks_by_group: dict[
+            track_store_module.TrackGroup, dict[track_store_module.SubSeason, list[track_store_module.TrackInfo]]
+        ],
+        fetched_by_track_id: dict[str, track_store_module.FetchedVariants] | None = None,
+        events: list[tuple[str, object]] | None = None,
+    ) -> None:
+        self.groups = groups
+        self.tracks_by_group = tracks_by_group
+        self.fetched_by_track_id = fetched_by_track_id or {}
+        self.events = events if events is not None else []
+
+    async def list_groups(self) -> list[track_store_module.TrackGroup]:
+        self.events.append(('list_groups', None))
+        return self.groups
+
+    async def list_tracks(
+        self,
+        group: track_store_module.TrackGroup,
+    ) -> dict[track_store_module.SubSeason, list[track_store_module.TrackInfo]]:
+        self.events.append(('list_tracks', group))
+        return self.tracks_by_group[group]
+
+    async def fetch(
+        self,
+        group: track_store_module.TrackGroup,
+        track_id: str,
+    ) -> track_store_module.FetchedVariants:
+        self.events.append(('fetch', (group, track_id)))
+        return self.fetched_by_track_id[track_id]
+
+
+class _RecordingTrackBot:
+    def __init__(self, events: list[tuple[str, object]]) -> None:
+        self.events = events
+
+    async def send_photo(self, *, chat_id: int, photo, caption: str) -> None:
+        self.events.append(
+            (
+                'photo',
+                {
+                    'chat_id': chat_id,
+                    'filename': photo.filename,
+                    'data': photo.data,
+                    'caption': caption,
+                },
+            )
+        )
+
+    async def send_audio(self, *, chat_id: int, audio) -> None:
+        self.events.append(
+            (
+                'audio',
+                {
+                    'chat_id': chat_id,
+                    'filename': audio.filename,
+                    'data': audio.data,
+                },
+            )
+        )
+
+    async def send_media_group(self, *, chat_id: int, media) -> None:
+        self.events.append(
+            (
+                'media_group',
+                {
+                    'chat_id': chat_id,
+                    'files': [
+                        {
+                            'filename': item.media.filename,
+                            'data': item.media.data,
+                        }
+                        for item in media
+                    ],
+                },
+            )
+        )
+
+
 def _services(
     *,
     clip_store,
@@ -283,6 +374,40 @@ def _stored_filename(group: ClipGroup, sub_group: ClipSubGroup, clip_id: str) ->
 
 def _mp4_file(data: bytes) -> FileBytes:
     return FileBytes(data=data, extension=Extension.MP4)
+
+
+def _jpg_file(data: bytes) -> FileBytes:
+    return FileBytes(data=data, extension=Extension.JPG)
+
+
+def _opus_file(data: bytes) -> FileBytes:
+    return FileBytes(data=data, extension=Extension.OPUS)
+
+
+def _fetched_variant(*, data: bytes, speed: float = 1.0, reverb: float = 0.0) -> track_store_module.FetchedVariant:
+    return track_store_module.FetchedVariant(
+        speed=speed,
+        reverb=reverb,
+        audio=_opus_file(data),
+    )
+
+
+def _fetched_track(
+    *,
+    track_id: str,
+    title: str,
+    cover: bytes,
+    variants: list[track_store_module.FetchedVariant],
+    instrumental_variants: list[track_store_module.FetchedVariant] | None = None,
+) -> track_store_module.FetchedVariants:
+    return track_store_module.FetchedVariants(
+        track_id=track_id,
+        artists=('artist',),
+        title=title,
+        cover=_jpg_file(cover),
+        variants=tuple(variants),
+        instrumental_variants=None if instrumental_variants is None else tuple(instrumental_variants),
+    )
 
 
 def _fake_message(
@@ -519,7 +644,7 @@ async def test_on_start_sends_only_clips_entry() -> None:
         reply_markup=message.answer.await_args.kwargs['reply_markup'],
     )
     reply_markup = message.answer.await_args.kwargs['reply_markup']
-    assert _reply_keyboard_rows(reply_markup) == [['Clips']]
+    assert _reply_keyboard_rows(reply_markup) == [['Clips', 'Tracks']]
 
 
 def test_selection_labels_omits_none_sub_season_from_visible_path() -> None:
@@ -618,9 +743,50 @@ async def test_on_tracks_sends_track_entry_button() -> None:
         message_width=settings.message_width,
     )
     _assert_three_rows(reply_markup)
-    assert _keyboard_rows(reply_markup) == [[DUMMY_BUTTON_TEXT], [DUMMY_BUTTON_TEXT], ['Cancel']]
+    assert _keyboard_rows(reply_markup) == [['Get'], [DUMMY_BUTTON_TEXT], ['Cancel']]
     assert state.current_state is None
     assert state.clear_count == 1
+
+
+@pytest.mark.asyncio
+async def test_track_retrieve_entry_get_opens_universe_menu_with_existing_values_only() -> None:
+    message = _fake_message(text='Tracks', message_id=15)
+    callback = _fake_callback(message)
+    state = _FakeState()
+    group_west = track_store_module.TrackGroup(
+        universe=track_store_module.TrackUniverse.WEST,
+        year=2024,
+        season=track_store_module.Season.S1,
+    )
+    group_east = track_store_module.TrackGroup(
+        universe=track_store_module.TrackUniverse.EAST,
+        year=2025,
+        season=track_store_module.Season.S2,
+    )
+    track_store = _RetrieveTrackStore(
+        groups=[group_west, group_east],
+        tracks_by_group={},
+    )
+    services = _services(clip_store=SimpleNamespace(), track_store=track_store)
+    settings = _settings()
+
+    await on_tracks_retrieve_entry(
+        callback,
+        TracksRetrieveEntryCallbackData(action=TracksRetrieveEntryAction.GET),
+        services,
+        settings,
+        state,
+    )
+
+    callback.answer.assert_awaited_once()
+    _assert_format_kwargs(
+        message.edit_text.await_args.kwargs,
+        _selected_kwargs('Get', prompt='Select universe:', message_width=settings.message_width),
+    )
+    reply_markup = message.edit_text.await_args.kwargs['reply_markup']
+    _assert_three_rows(reply_markup)
+    assert _keyboard_rows(reply_markup) == [[DUMMY_BUTTON_TEXT, 'West'], [DUMMY_BUTTON_TEXT, 'East'], ['Back']]
+    assert state.current_state == TrackRetrieveFlow.universe.state
 
 
 @pytest.mark.asyncio
@@ -682,10 +848,13 @@ async def test_on_track_retrieve_entry_cancel_removes_buttons_and_shows_selected
     message = _fake_message(text='Select action:', message_id=14)
     callback = _fake_callback(message)
     state = _FakeState()
+    services = _services(clip_store=SimpleNamespace(), track_store=SimpleNamespace(list_groups=AsyncMock()))
 
     await on_tracks_retrieve_entry(
         callback,
         TracksRetrieveEntryCallbackData(action=TracksRetrieveEntryAction.CANCEL),
+        services,
+        _settings(),
         state,
     )
 
@@ -694,8 +863,526 @@ async def test_on_track_retrieve_entry_cancel_removes_buttons_and_shows_selected
         **Text('Selected: ', Bold('Cancel')).as_kwargs(),
         reply_markup=None,
     )
+    services.track_store.list_groups.assert_not_awaited()
     assert state.current_state is None
     assert state.clear_count == 1
+
+
+@pytest.mark.asyncio
+async def test_track_retrieve_flow_shows_only_existing_year_season_and_sub_season_values() -> None:
+    message = _fake_message(text='Select universe:', message_id=16)
+    callback = _fake_callback(message)
+    state = _FakeState()
+    group_west_s1 = track_store_module.TrackGroup(
+        universe=track_store_module.TrackUniverse.WEST,
+        year=2024,
+        season=track_store_module.Season.S1,
+    )
+    group_west_s3 = track_store_module.TrackGroup(
+        universe=track_store_module.TrackUniverse.WEST,
+        year=2024,
+        season=track_store_module.Season.S3,
+    )
+    group_east_s2 = track_store_module.TrackGroup(
+        universe=track_store_module.TrackUniverse.EAST,
+        year=2025,
+        season=track_store_module.Season.S2,
+    )
+    track_store = _RetrieveTrackStore(
+        groups=[group_west_s1, group_west_s3, group_east_s2],
+        tracks_by_group={
+            group_west_s1: {
+                track_store_module.SubSeason.NONE: [
+                    track_store_module.TrackInfo(
+                        id='018f05c1f1a37b348d291f53a1c9d101',
+                        artists=('artist',),
+                        title='none track',
+                        has_instrumental=False,
+                    )
+                ],
+                track_store_module.SubSeason.B: [
+                    track_store_module.TrackInfo(
+                        id='018f05c1f1a37b348d291f53a1c9d102',
+                        artists=('artist',),
+                        title='b track',
+                        has_instrumental=False,
+                    )
+                ],
+            }
+        },
+    )
+    services = _services(clip_store=SimpleNamespace(), track_store=track_store)
+    settings = _settings()
+    await state.set_state(TrackRetrieveFlow.universe)
+    await state.update_data(
+        mode=track_retrieve_module._TRACK_GET_MODE,
+        menu_message_id=16,
+        groups=[group_west_s1, group_west_s3, group_east_s2],
+    )
+
+    await on_tracks_retrieve_menu(
+        callback,
+        TrackRetrieveCallbackData(
+            action=TrackRetrieveAction.SELECT,
+            step=TrackRetrieveStep.UNIVERSE,
+            value=track_store_module.TrackUniverse.WEST.value,
+        ),
+        AsyncMock(),
+        services,
+        settings,
+        state,
+    )
+
+    _assert_format_kwargs(
+        message.edit_text.await_args.kwargs,
+        _selected_kwargs('Get', 'West', prompt='Select year:', message_width=settings.message_width),
+    )
+    assert _keyboard_rows(message.edit_text.await_args.kwargs['reply_markup']) == [
+        [DUMMY_BUTTON_TEXT, DUMMY_BUTTON_TEXT],
+        [DUMMY_BUTTON_TEXT, '2024', DUMMY_BUTTON_TEXT],
+        ['Back'],
+    ]
+    assert state.current_state == TrackRetrieveFlow.year.state
+
+    await on_tracks_retrieve_menu(
+        callback,
+        TrackRetrieveCallbackData(
+            action=TrackRetrieveAction.SELECT,
+            step=TrackRetrieveStep.YEAR,
+            value='2024',
+        ),
+        AsyncMock(),
+        services,
+        settings,
+        state,
+    )
+
+    _assert_format_kwargs(
+        message.edit_text.await_args.kwargs,
+        _selected_kwargs('Get', 'West', '2024', prompt='Select season:', message_width=settings.message_width),
+    )
+    assert _keyboard_rows(message.edit_text.await_args.kwargs['reply_markup']) == [
+        [DUMMY_BUTTON_TEXT, '1'],
+        [DUMMY_BUTTON_TEXT, '3', DUMMY_BUTTON_TEXT],
+        ['Back'],
+    ]
+    assert state.current_state == TrackRetrieveFlow.season.state
+
+    await on_tracks_retrieve_menu(
+        callback,
+        TrackRetrieveCallbackData(
+            action=TrackRetrieveAction.SELECT,
+            step=TrackRetrieveStep.SEASON,
+            value='1',
+        ),
+        AsyncMock(),
+        services,
+        settings,
+        state,
+    )
+
+    _assert_format_kwargs(
+        message.edit_text.await_args.kwargs,
+        _selected_kwargs('Get', 'West', '2024', '1', prompt='Select sub-season:', message_width=settings.message_width),
+    )
+    assert _keyboard_rows(message.edit_text.await_args.kwargs['reply_markup']) == [
+        [DUMMY_BUTTON_TEXT, 'None'],
+        [DUMMY_BUTTON_TEXT, 'B', DUMMY_BUTTON_TEXT],
+        ['Back'],
+    ]
+    assert state.current_state == TrackRetrieveFlow.sub_season.state
+
+
+@pytest.mark.asyncio
+async def test_track_retrieve_back_from_universe_returns_to_root_menu() -> None:
+    message = _fake_message(text='Select universe:', message_id=17)
+    callback = _fake_callback(message)
+    state = _FakeState()
+    group = track_store_module.TrackGroup(
+        universe=track_store_module.TrackUniverse.WEST,
+        year=2024,
+        season=track_store_module.Season.S1,
+    )
+    await state.set_state(TrackRetrieveFlow.universe)
+    await state.update_data(
+        mode=track_retrieve_module._TRACK_GET_MODE,
+        menu_message_id=17,
+        groups=[group],
+    )
+
+    await on_tracks_retrieve_menu(
+        callback,
+        TrackRetrieveCallbackData(
+            action=TrackRetrieveAction.BACK,
+            step=TrackRetrieveStep.UNIVERSE,
+            value='back',
+        ),
+        AsyncMock(),
+        _services(clip_store=SimpleNamespace(), track_store=SimpleNamespace()),
+        _settings(),
+        state,
+    )
+
+    _assert_one_line_button_message(
+        text=message.edit_text.await_args.kwargs['text'],
+        real_line='Select action:',
+        message_width=35,
+    )
+    assert _keyboard_rows(message.edit_text.await_args.kwargs['reply_markup']) == [
+        ['Get'],
+        [DUMMY_BUTTON_TEXT],
+        ['Cancel'],
+    ]
+    assert state.current_state is None
+
+
+@pytest.mark.asyncio
+async def test_track_retrieve_back_from_season_returns_to_year_menu() -> None:
+    message = _fake_message(text='Select season:', message_id=18)
+    callback = _fake_callback(message)
+    state = _FakeState()
+    groups = [
+        track_store_module.TrackGroup(
+            universe=track_store_module.TrackUniverse.WEST,
+            year=2024,
+            season=track_store_module.Season.S1,
+        ),
+        track_store_module.TrackGroup(
+            universe=track_store_module.TrackUniverse.WEST,
+            year=2025,
+            season=track_store_module.Season.S2,
+        ),
+    ]
+    await state.set_state(TrackRetrieveFlow.season)
+    await state.update_data(
+        mode=track_retrieve_module._TRACK_GET_MODE,
+        menu_message_id=18,
+        groups=groups,
+        universe=track_store_module.TrackUniverse.WEST,
+        year=2024,
+    )
+
+    await on_tracks_retrieve_menu(
+        callback,
+        TrackRetrieveCallbackData(
+            action=TrackRetrieveAction.BACK,
+            step=TrackRetrieveStep.SEASON,
+            value='back',
+        ),
+        AsyncMock(),
+        _services(clip_store=SimpleNamespace(), track_store=SimpleNamespace()),
+        _settings(),
+        state,
+    )
+
+    _assert_format_kwargs(
+        message.edit_text.await_args.kwargs,
+        _selected_kwargs('Get', 'West', prompt='Select year:', message_width=35),
+    )
+    assert _keyboard_rows(message.edit_text.await_args.kwargs['reply_markup']) == [
+        [DUMMY_BUTTON_TEXT, DUMMY_BUTTON_TEXT],
+        [DUMMY_BUTTON_TEXT, '2024', '2025'],
+        ['Back'],
+    ]
+    assert state.current_state == TrackRetrieveFlow.year.state
+
+
+@pytest.mark.asyncio
+async def test_track_retrieve_removed_track_id_during_fetch_becomes_stale_selection() -> None:
+    message = _fake_message(text='Select sub-season:', chat_id=9, message_id=22)
+    callback = _fake_callback(message)
+    state = _FakeState()
+    group = track_store_module.TrackGroup(
+        universe=track_store_module.TrackUniverse.WEST,
+        year=2024,
+        season=track_store_module.Season.S1,
+    )
+    track = track_store_module.TrackInfo(
+        id='018f05c1f1a37b348d291f53a1c9d141',
+        artists=('artist',),
+        title='Removed',
+        has_instrumental=False,
+    )
+
+    async def _missing_fetch(
+        fetch_group: track_store_module.TrackGroup,
+        track_id: str,
+    ) -> track_store_module.FetchedVariants:
+        raise ValueError(
+            f'Track id {track_id} does not exist in group '
+            f'{fetch_group.universe.value}-{fetch_group.year}-{int(fetch_group.season)}'
+        )
+
+    services = _services(
+        clip_store=SimpleNamespace(),
+        track_store=SimpleNamespace(fetch=AsyncMock(side_effect=_missing_fetch)),
+    )
+    await state.set_state(TrackRetrieveFlow.sub_season)
+    await state.update_data(
+        mode=track_retrieve_module._TRACK_GET_MODE,
+        menu_message_id=22,
+        groups=[group],
+        universe=group.universe,
+        year=group.year,
+        season=group.season,
+        tracks_by_sub_season={track_store_module.SubSeason.A: [track]},
+    )
+
+    await on_tracks_retrieve_menu(
+        callback,
+        TrackRetrieveCallbackData(
+            action=TrackRetrieveAction.SELECT,
+            step=TrackRetrieveStep.SUB_SEASON,
+            value=track_store_module.SubSeason.A.value,
+        ),
+        AsyncMock(),
+        services,
+        _settings(),
+        state,
+    )
+
+    assert message.edit_text.await_args_list[-1].args == ('Selection is no longer available',)
+    assert message.edit_text.await_args_list[-1].kwargs == {'reply_markup': None}
+
+
+@pytest.mark.asyncio
+async def test_track_retrieve_sub_season_selection_fetches_all_before_sending_and_sends_reverse_track_order() -> None:
+    message = _fake_message(text='Select sub-season:', chat_id=9, message_id=19)
+    callback = _fake_callback(message)
+    state = _FakeState()
+    group = track_store_module.TrackGroup(
+        universe=track_store_module.TrackUniverse.WEST,
+        year=2024,
+        season=track_store_module.Season.S1,
+    )
+    track_1 = track_store_module.TrackInfo(
+        id='018f05c1f1a37b348d291f53a1c9d111',
+        artists=('artist',),
+        title='First',
+        has_instrumental=False,
+    )
+    track_2 = track_store_module.TrackInfo(
+        id='018f05c1f1a37b348d291f53a1c9d112',
+        artists=('artist',),
+        title='Second',
+        has_instrumental=True,
+    )
+    events: list[tuple[str, object]] = []
+    track_store = _RetrieveTrackStore(
+        groups=[group],
+        tracks_by_group={group: {track_store_module.SubSeason.A: [track_1, track_2]}},
+        fetched_by_track_id={
+            track_1.id: _fetched_track(
+                track_id=track_1.id,
+                title='First',
+                cover=b'cover-1',
+                variants=[_fetched_variant(data=b'first-main')],
+            ),
+            track_2.id: _fetched_track(
+                track_id=track_2.id,
+                title='Second',
+                cover=b'cover-2',
+                variants=[
+                    _fetched_variant(data=b'second-main-1'),
+                    _fetched_variant(data=b'second-main-2'),
+                ],
+                instrumental_variants=[_fetched_variant(data=b'second-inst')],
+            ),
+        },
+        events=events,
+    )
+    services = _services(clip_store=SimpleNamespace(), track_store=track_store)
+    bot = _RecordingTrackBot(events)
+    await state.set_state(TrackRetrieveFlow.sub_season)
+    await state.update_data(
+        mode=track_retrieve_module._TRACK_GET_MODE,
+        menu_message_id=19,
+        groups=[group],
+        universe=group.universe,
+        year=group.year,
+        season=group.season,
+        tracks_by_sub_season={track_store_module.SubSeason.A: [track_1, track_2]},
+    )
+
+    await on_tracks_retrieve_menu(
+        callback,
+        TrackRetrieveCallbackData(
+            action=TrackRetrieveAction.SELECT,
+            step=TrackRetrieveStep.SUB_SEASON,
+            value=track_store_module.SubSeason.A.value,
+        ),
+        bot,
+        services,
+        _settings(),
+        state,
+    )
+
+    _assert_format_kwargs(
+        message.edit_text.await_args.kwargs,
+        _selected_kwargs('Get', 'West', '2024', '1', 'A'),
+    )
+    track_2_base = track_store_module.TrackStore.track_identity_to_string(group, track_2.id)
+    track_1_base = track_store_module.TrackStore.track_identity_to_string(group, track_1.id)
+    assert events[:2] == [
+        ('fetch', (group, track_1.id)),
+        ('fetch', (group, track_2.id)),
+    ]
+    assert events[2:] == [
+        (
+            'photo',
+            {
+                'chat_id': 9,
+                'filename': f'{track_2_base}-cover.jpg',
+                'data': b'cover-2',
+                'caption': 'Second',
+            },
+        ),
+        (
+            'media_group',
+            {
+                'chat_id': 9,
+                'files': [
+                    {
+                        'filename': f'{track_2_base}-variant-1.opus',
+                        'data': b'second-main-1',
+                    },
+                    {
+                        'filename': f'{track_2_base}-variant-2.opus',
+                        'data': b'second-main-2',
+                    },
+                ],
+            },
+        ),
+        (
+            'audio',
+            {
+                'chat_id': 9,
+                'filename': f'{track_2_base}-instrumental-variant-1.opus',
+                'data': b'second-inst',
+            },
+        ),
+        (
+            'photo',
+            {
+                'chat_id': 9,
+                'filename': f'{track_1_base}-cover.jpg',
+                'data': b'cover-1',
+                'caption': 'First',
+            },
+        ),
+        (
+            'audio',
+            {
+                'chat_id': 9,
+                'filename': f'{track_1_base}-variant-1.opus',
+                'data': b'first-main',
+            },
+        ),
+    ]
+    assert state.current_state is None
+
+
+@pytest.mark.asyncio
+async def test_track_retrieve_invalid_sub_season_callback_becomes_stale() -> None:
+    message = _fake_message(text='Select sub-season:', message_id=20)
+    callback = _fake_callback(message)
+    state = _FakeState()
+    group = track_store_module.TrackGroup(
+        universe=track_store_module.TrackUniverse.WEST,
+        year=2024,
+        season=track_store_module.Season.S1,
+    )
+    await state.set_state(TrackRetrieveFlow.sub_season)
+    await state.update_data(
+        mode=track_retrieve_module._TRACK_GET_MODE,
+        menu_message_id=20,
+        groups=[group],
+        universe=group.universe,
+        year=group.year,
+        season=group.season,
+        tracks_by_sub_season={
+            track_store_module.SubSeason.A: [
+                track_store_module.TrackInfo(
+                    id='018f05c1f1a37b348d291f53a1c9d121',
+                    artists=('artist',),
+                    title='only',
+                    has_instrumental=False,
+                )
+            ]
+        },
+    )
+
+    await on_tracks_retrieve_menu(
+        callback,
+        TrackRetrieveCallbackData(
+            action=TrackRetrieveAction.SELECT,
+            step=TrackRetrieveStep.SUB_SEASON,
+            value=track_store_module.SubSeason.B.value,
+        ),
+        AsyncMock(),
+        _services(clip_store=SimpleNamespace(), track_store=SimpleNamespace(fetch=AsyncMock())),
+        _settings(),
+        state,
+    )
+
+    message.edit_text.assert_awaited_once_with('Selection is no longer available', reply_markup=None)
+    assert state.current_state is None
+
+
+@pytest.mark.asyncio
+async def test_track_retrieve_raises_value_error_when_fetched_variant_list_exceeds_ten() -> None:
+    message = _fake_message(text='Select sub-season:', chat_id=9, message_id=21)
+    callback = _fake_callback(message)
+    state = _FakeState()
+    group = track_store_module.TrackGroup(
+        universe=track_store_module.TrackUniverse.WEST,
+        year=2024,
+        season=track_store_module.Season.S1,
+    )
+    track = track_store_module.TrackInfo(
+        id='018f05c1f1a37b348d291f53a1c9d131',
+        artists=('artist',),
+        title='Overflow',
+        has_instrumental=False,
+    )
+    variants = [_fetched_variant(data=f'v{index}'.encode()) for index in range(11)]
+    track_store = _RetrieveTrackStore(
+        groups=[group],
+        tracks_by_group={group: {track_store_module.SubSeason.A: [track]}},
+        fetched_by_track_id={
+            track.id: _fetched_track(
+                track_id=track.id,
+                title='Overflow',
+                cover=b'cover',
+                variants=variants,
+            )
+        },
+    )
+    services = _services(clip_store=SimpleNamespace(), track_store=track_store)
+    await state.set_state(TrackRetrieveFlow.sub_season)
+    await state.update_data(
+        mode=track_retrieve_module._TRACK_GET_MODE,
+        menu_message_id=21,
+        groups=[group],
+        universe=group.universe,
+        year=group.year,
+        season=group.season,
+        tracks_by_sub_season={track_store_module.SubSeason.A: [track]},
+    )
+
+    with pytest.raises(ValueError, match='at most 10 items'):
+        await on_tracks_retrieve_menu(
+            callback,
+            TrackRetrieveCallbackData(
+                action=TrackRetrieveAction.SELECT,
+                step=TrackRetrieveStep.SUB_SEASON,
+                value=track_store_module.SubSeason.A.value,
+            ),
+            AsyncMock(),
+            services,
+            _settings(),
+            state,
+        )
 
 
 @pytest.mark.asyncio

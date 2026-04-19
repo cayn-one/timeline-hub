@@ -30,7 +30,7 @@ async def on_dummy_button(callback: CallbackQuery) -> None:
 async def on_start_send_menu(message: Message) -> None:
     keyboard = ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text='Clips')],
+            [KeyboardButton(text='Clips'), KeyboardButton(text='Tracks')],
         ],
         resize_keyboard=True,
         input_field_placeholder='Choose an option...',
