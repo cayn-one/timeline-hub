@@ -1,4 +1,5 @@
 from datetime import date, timedelta
+from importlib.resources import files
 from io import BytesIO
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, call
@@ -311,7 +312,7 @@ class _RecordingTrackBot:
             )
         )
 
-    async def send_audio(self, *, chat_id: int, audio) -> None:
+    async def send_audio(self, *, chat_id: int, audio, thumbnail=None, performer=None, title=None) -> None:
         self.events.append(
             (
                 'audio',
@@ -319,6 +320,10 @@ class _RecordingTrackBot:
                     'chat_id': chat_id,
                     'filename': audio.filename,
                     'data': audio.data,
+                    'thumbnail_filename': None if thumbnail is None else thumbnail.filename,
+                    'thumbnail_data': None if thumbnail is None else thumbnail.data,
+                    'performer': performer,
+                    'title': title,
                 },
             )
         )
@@ -333,6 +338,10 @@ class _RecordingTrackBot:
                         {
                             'filename': item.media.filename,
                             'data': item.media.data,
+                            'thumbnail_filename': None if item.thumbnail is None else item.thumbnail.filename,
+                            'thumbnail_data': None if item.thumbnail is None else item.thumbnail.data,
+                            'performer': item.performer,
+                            'title': item.title,
                         }
                         for item in media
                     ],
@@ -384,8 +393,19 @@ def _opus_file(data: bytes) -> FileBytes:
     return FileBytes(data=data, extension=Extension.OPUS)
 
 
-def _fetched_variant(*, data: bytes, speed: float = 1.0, reverb: float = 0.0) -> track_store_module.FetchedVariant:
+def _root_audio_thumbnail_bytes() -> bytes:
+    return files('timeline_hub').joinpath('assets/track-thumbnail.jpg').read_bytes()
+
+
+def _fetched_variant(
+    *,
+    data: bytes,
+    level: int = 1,
+    speed: float = 1.0,
+    reverb: float = 0.0,
+) -> track_store_module.FetchedVariant:
     return track_store_module.FetchedVariant(
+        level=level,
         speed=speed,
         reverb=reverb,
         audio=_opus_file(data),
@@ -1176,17 +1196,17 @@ async def test_track_retrieve_sub_season_selection_fetches_all_before_sending_an
                 track_id=track_1.id,
                 title='First',
                 cover=b'cover-1',
-                variants=[_fetched_variant(data=b'first-main')],
+                variants=[_fetched_variant(data=b'first-main', level=1, speed=0.95, reverb=0.06)],
             ),
             track_2.id: _fetched_track(
                 track_id=track_2.id,
                 title='Second',
                 cover=b'cover-2',
                 variants=[
-                    _fetched_variant(data=b'second-main-1'),
-                    _fetched_variant(data=b'second-main-2'),
+                    _fetched_variant(data=b'second-main-1', level=2, speed=1.12, reverb=0.01),
+                    _fetched_variant(data=b'second-main-2', level=1, speed=0.95, reverb=0.12),
                 ],
-                instrumental_variants=[_fetched_variant(data=b'second-inst')],
+                instrumental_variants=[_fetched_variant(data=b'second-inst', level=3, speed=1.08, reverb=0.01)],
             ),
         },
         events=events,
@@ -1221,18 +1241,17 @@ async def test_track_retrieve_sub_season_selection_fetches_all_before_sending_an
         message.edit_text.await_args.kwargs,
         _selected_kwargs('Get', 'West', '2024', '1', 'A'),
     )
-    track_2_base = track_store_module.TrackStore.track_identity_to_string(group, track_2.id)
-    track_1_base = track_store_module.TrackStore.track_identity_to_string(group, track_1.id)
     assert events[:2] == [
         ('fetch', (group, track_1.id)),
         ('fetch', (group, track_2.id)),
     ]
+    thumbnail_bytes = _root_audio_thumbnail_bytes()
     assert events[2:] == [
         (
             'photo',
             {
                 'chat_id': 9,
-                'filename': f'{track_2_base}-cover.jpg',
+                'filename': f'{track_store_module.TrackStore.track_identity_to_string(group, track_2.id)}-cover.jpg',
                 'data': b'cover-2',
                 'caption': 'Second',
             },
@@ -1243,12 +1262,20 @@ async def test_track_retrieve_sub_season_selection_fetches_all_before_sending_an
                 'chat_id': 9,
                 'files': [
                     {
-                        'filename': f'{track_2_base}-variant-1.opus',
+                        'filename': f'1{Extension.OPUS.suffix}',
                         'data': b'second-main-1',
+                        'thumbnail_filename': 'track-thumbnail.jpg',
+                        'thumbnail_data': thumbnail_bytes,
+                        'performer': '\u2009',
+                        'title': '⏩⏩',
                     },
                     {
-                        'filename': f'{track_2_base}-variant-2.opus',
+                        'filename': f'2{Extension.OPUS.suffix}',
                         'data': b'second-main-2',
+                        'thumbnail_filename': 'track-thumbnail.jpg',
+                        'thumbnail_data': thumbnail_bytes,
+                        'performer': '\u2009',
+                        'title': '⏪',
                     },
                 ],
             },
@@ -1257,15 +1284,19 @@ async def test_track_retrieve_sub_season_selection_fetches_all_before_sending_an
             'audio',
             {
                 'chat_id': 9,
-                'filename': f'{track_2_base}-instrumental-variant-1.opus',
+                'filename': f'1{Extension.OPUS.suffix}',
                 'data': b'second-inst',
+                'thumbnail_filename': 'track-thumbnail.jpg',
+                'thumbnail_data': thumbnail_bytes,
+                'performer': '\u2009',
+                'title': '⏩⏩⏩',
             },
         ),
         (
             'photo',
             {
                 'chat_id': 9,
-                'filename': f'{track_1_base}-cover.jpg',
+                'filename': f'{track_store_module.TrackStore.track_identity_to_string(group, track_1.id)}-cover.jpg',
                 'data': b'cover-1',
                 'caption': 'First',
             },
@@ -1274,12 +1305,30 @@ async def test_track_retrieve_sub_season_selection_fetches_all_before_sending_an
             'audio',
             {
                 'chat_id': 9,
-                'filename': f'{track_1_base}-variant-1.opus',
+                'filename': f'1{Extension.OPUS.suffix}',
                 'data': b'first-main',
+                'thumbnail_filename': 'track-thumbnail.jpg',
+                'thumbnail_data': thumbnail_bytes,
+                'performer': '\u2009',
+                'title': '⏪',
             },
         ),
     ]
     assert state.current_state is None
+
+
+def test_track_retrieve_variant_title_rejects_unmodified_speed() -> None:
+    variant = _fetched_variant(data=b'audio', level=1, speed=1.0, reverb=0.06)
+
+    with pytest.raises(ValueError, match='speed must not be 1.0'):
+        track_retrieve_module._variant_title(variant)
+
+
+def test_track_retrieve_variant_title_rejects_non_positive_level() -> None:
+    variant = _fetched_variant(data=b'audio', level=0, speed=0.95, reverb=0.06)
+
+    with pytest.raises(ValueError, match='level must be >= 1'):
+        track_retrieve_module._variant_title(variant)
 
 
 @pytest.mark.asyncio

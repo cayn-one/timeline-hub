@@ -1,6 +1,7 @@
 from collections.abc import Mapping, Sequence
 from datetime import date
 from enum import StrEnum, auto
+from importlib.resources import files
 
 from aiogram import Bot, F, Router
 from aiogram.enums import ChatType
@@ -45,6 +46,8 @@ from timeline_hub.types import Extension
 router = Router()
 _TRACK_GET_MODE = 'track_get'
 _TRACK_BACK_VALUE = 'back'
+_AUDIO_THUMBNAIL_NAME = 'track-thumbnail.jpg'
+_AUDIO_THUMBNAIL_BYTES = files('timeline_hub').joinpath(f'assets/{_AUDIO_THUMBNAIL_NAME}').read_bytes()
 
 
 class RetrieveEntryAction(StrEnum):
@@ -590,19 +593,13 @@ async def _send_fetched_track(
     await _send_variant_audio(
         bot=bot,
         chat_id=chat_id,
-        group=group,
-        track_id=fetched_track.track_id,
         variants=fetched_track.variants,
-        instrumental=False,
     )
     if fetched_track.instrumental_variants is not None:
         await _send_variant_audio(
             bot=bot,
             chat_id=chat_id,
-            group=group,
-            track_id=fetched_track.track_id,
             variants=fetched_track.instrumental_variants,
-            instrumental=True,
         )
 
 
@@ -610,10 +607,7 @@ async def _send_variant_audio(
     *,
     bot: Bot,
     chat_id: int,
-    group: TrackGroup,
-    track_id: str,
     variants: Sequence[FetchedVariant],
-    instrumental: bool,
 ) -> None:
     _validate_variant_count(variants)
 
@@ -622,13 +616,11 @@ async def _send_variant_audio(
             chat_id=chat_id,
             audio=BufferedInputFile(
                 variants[0].audio.data,
-                filename=_variant_filename(
-                    group=group,
-                    track_id=track_id,
-                    variant_index=1,
-                    instrumental=instrumental,
-                ),
+                filename=_variant_filename(variants[0], index=1),
             ),
+            thumbnail=_audio_thumbnail(),
+            performer='\u2009',
+            title=_variant_title(variants[0]),
         )
         return
 
@@ -638,13 +630,11 @@ async def _send_variant_audio(
             InputMediaAudio(
                 media=BufferedInputFile(
                     variant.audio.data,
-                    filename=_variant_filename(
-                        group=group,
-                        track_id=track_id,
-                        variant_index=index,
-                        instrumental=instrumental,
-                    ),
-                )
+                    filename=_variant_filename(variant, index=index),
+                ),
+                thumbnail=_audio_thumbnail(),
+                performer='\u2009',
+                title=_variant_title(variant),
             )
             for index, variant in enumerate(variants, start=1)
         ],
@@ -883,18 +873,25 @@ def _cover_filename(*, group: TrackGroup, track_id: str) -> str:
     return f'{TrackStore.track_identity_to_string(group, track_id)}-cover{Extension.JPG.suffix}'
 
 
-def _variant_filename(
-    *,
-    group: TrackGroup,
-    track_id: str,
-    variant_index: int,
-    instrumental: bool,
-) -> str:
-    instrumental_suffix = '-instrumental' if instrumental else ''
-    return (
-        f'{TrackStore.track_identity_to_string(group, track_id)}'
-        f'{instrumental_suffix}-variant-{variant_index}{Extension.OPUS.suffix}'
-    )
+def _variant_title(variant: FetchedVariant) -> str:
+    if variant.speed < 1.0:
+        arrow = '⏪'
+    elif variant.speed > 1.0:
+        arrow = '⏩'
+    else:
+        raise ValueError('Fetched track variant speed must not be 1.0')
+
+    if variant.level < 1:
+        raise ValueError('Fetched track variant level must be >= 1')
+    return arrow * variant.level
+
+
+def _variant_filename(variant: FetchedVariant, *, index: int) -> str:
+    return f'{index}{variant.audio.extension.suffix}'
+
+
+def _audio_thumbnail() -> BufferedInputFile:
+    return BufferedInputFile(_AUDIO_THUMBNAIL_BYTES, filename=_AUDIO_THUMBNAIL_NAME)
 
 
 def _validate_variant_count(variants: Sequence[FetchedVariant]) -> None:

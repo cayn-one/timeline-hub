@@ -44,3 +44,6 @@ ban-relative-imports = "all"
 
 [tool.ruff.format]
 quote-style = "single"
+
+[tool.setuptools.package-data]
+timeline_hub = ["assets/*.jpg"]
