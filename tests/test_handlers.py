@@ -454,6 +454,7 @@ def _fake_message(
     )
     message.answer = AsyncMock()
     message.edit_text = AsyncMock()
+    message.delete = AsyncMock()
     return message
 
 
@@ -494,14 +495,13 @@ def _assert_route_progress_edit(edit_call, *routes: tuple[str, ...]) -> None:
     assert '→' in edit_call.kwargs['text']
 
 
-def _assert_one_line_button_message(*, text: str, real_line: str, message_width: int) -> None:
+def _assert_one_line_button_message(*, text: str, message_width: int) -> None:
     padding_line = create_padding_line(message_width)
-    assert text.split('\n') == [padding_line, padding_line, real_line]
+    assert text.split('\n') == [padding_line, '·']
 
 
 def _assert_two_line_button_message(*, text: str, top_line: str, bottom_line: str, message_width: int) -> None:
-    padding_line = create_padding_line(message_width)
-    assert text.split('\n') == [top_line, padding_line, bottom_line]
+    assert text.split('\n') == [top_line, bottom_line]
 
 
 def _assert_three_rows(reply_markup) -> None:
@@ -520,7 +520,7 @@ def _selected_kwargs(*values: str, prompt: str | None = None, message_width: int
     parts: list[object] = ['Selected: ']
     for index, value in enumerate(values):
         if index > 0:
-            parts.append(' → ')
+            parts.append(' / ')
         parts.append(Bold(value))
 
     selected = Text(*parts)
@@ -529,11 +529,9 @@ def _selected_kwargs(*values: str, prompt: str | None = None, message_width: int
     if message_width is None:
         raise ValueError('`message_width` is required when `prompt` is provided')
     return Text(
-        selected,
-        '\n',
         create_padding_line(message_width),
         '\n',
-        prompt,
+        selected,
     ).as_kwargs()
 
 
@@ -738,7 +736,6 @@ async def test_on_clips_sends_retrieve_entry_button() -> None:
     reply_markup = message.answer.await_args.kwargs['reply_markup']
     _assert_one_line_button_message(
         text=message.answer.await_args.kwargs['text'],
-        real_line='Select action:',
         message_width=settings.message_width,
     )
     _assert_three_rows(reply_markup)
@@ -759,7 +756,6 @@ async def test_on_tracks_sends_track_entry_button() -> None:
     reply_markup = message.answer.await_args.kwargs['reply_markup']
     _assert_one_line_button_message(
         text=message.answer.await_args.kwargs['text'],
-        real_line='Select action:',
         message_width=settings.message_width,
     )
     _assert_three_rows(reply_markup)
@@ -936,10 +932,8 @@ async def test_on_retrieve_entry_cancel_removes_buttons_and_shows_selected_text(
     )
 
     callback.answer.assert_awaited_once()
-    message.edit_text.assert_awaited_once_with(
-        **Text('Selected: ', Bold('Cancel')).as_kwargs(),
-        reply_markup=None,
-    )
+    message.edit_text.assert_awaited_once_with('Canceled', reply_markup=None)
+    message.delete.assert_not_awaited()
     services.clip_store.list_groups.assert_not_awaited()
     assert state.current_state is None
     assert state.clear_count == 1
@@ -961,10 +955,8 @@ async def test_on_track_retrieve_entry_cancel_removes_buttons_and_shows_selected
     )
 
     callback.answer.assert_awaited_once()
-    message.edit_text.assert_awaited_once_with(
-        **Text('Selected: ', Bold('Cancel')).as_kwargs(),
-        reply_markup=None,
-    )
+    message.edit_text.assert_awaited_once_with('Canceled', reply_markup=None)
+    message.delete.assert_not_awaited()
     services.track_store.list_groups.assert_not_awaited()
     assert state.current_state is None
     assert state.clear_count == 1
@@ -1103,7 +1095,6 @@ async def test_track_retrieve_back_from_universe_returns_to_root_menu() -> None:
 
     _assert_one_line_button_message(
         text=message.edit_text.await_args.kwargs['text'],
-        real_line='Select action:',
         message_width=35,
     )
     assert _keyboard_rows(message.edit_text.await_args.kwargs['reply_markup']) == [
@@ -1206,7 +1197,6 @@ async def test_track_retrieve_back_from_season_skips_single_year_to_universe_men
 
     _assert_one_line_button_message(
         text=message.edit_text.await_args.kwargs['text'],
-        real_line='Select action:',
         message_width=35,
     )
     assert _keyboard_rows(message.edit_text.await_args.kwargs['reply_markup']) == [
@@ -1561,10 +1551,8 @@ async def test_store_cancel_removes_buttons_and_shows_only_selected_cancel() -> 
     )
 
     callback.answer.assert_awaited_once()
-    message.edit_text.assert_awaited_once_with(
-        **Text('Selected: ', Bold('Cancel')).as_kwargs(),
-        reply_markup=None,
-    )
+    message.edit_text.assert_awaited_once_with('Canceled', reply_markup=None)
+    message.delete.assert_not_awaited()
     message.answer.assert_not_awaited()
     assert state.current_state is None
     assert state.clear_count == 1
@@ -1587,12 +1575,9 @@ async def test_clip_action_selection_includes_store_button() -> None:
     await scheduler.job()
 
     expected = Text(
-        'Clips: ',
-        Bold('1'),
-        '\n',
         create_padding_line(settings.message_width),
         '\n',
-        'Select action:',
+        Text('Clips: ', Bold('1')),
     ).as_kwargs()
     _assert_format_kwargs(
         message.answer.await_args.kwargs,
@@ -1635,12 +1620,9 @@ async def test_valid_photo_audio_pairs_dispatch_to_track_menu() -> None:
     await scheduler.job()
 
     expected = Text(
-        'Tracks: ',
-        Bold('2'),
-        '\n',
         create_padding_line(settings.message_width),
         '\n',
-        'Select action:',
+        Text('Tracks: ', Bold('2')),
     ).as_kwargs()
     _assert_format_kwargs(message.answer.await_args.kwargs, expected)
     reply_markup = message.answer.await_args.kwargs['reply_markup']
@@ -1682,12 +1664,9 @@ async def test_valid_out_of_order_appended_track_batch_dispatches_in_message_ord
     await scheduler.job()
 
     expected = Text(
-        'Tracks: ',
-        Bold('2'),
-        '\n',
         create_padding_line(settings.message_width),
         '\n',
-        'Select action:',
+        Text('Tracks: ', Bold('2')),
     ).as_kwargs()
     _assert_format_kwargs(message.answer.await_args.kwargs, expected)
     reply_markup = message.answer.await_args.kwargs['reply_markup']
@@ -1833,12 +1812,9 @@ async def test_text_only_buffered_batch_shows_fallback_menu_without_flushing() -
     await scheduler.job()
 
     expected = Text(
-        'Messages: ',
-        Bold('1'),
-        '\n',
         create_padding_line(settings.message_width),
         '\n',
-        'Select action:',
+        Text('Messages: ', Bold('1')),
     ).as_kwargs()
     _assert_format_kwargs(message.answer.await_args.kwargs, expected)
     reply_markup = message.answer.await_args.kwargs['reply_markup']
@@ -1924,12 +1900,9 @@ async def test_try_dispatch_track_intake_shows_menu_with_multiple_pairs() -> Non
         message.answer.await_args.kwargs,
         {
             **Text(
-                'Tracks: ',
-                Bold('2'),
-                '\n',
                 create_padding_line(_settings().message_width),
                 '\n',
-                'Select action:',
+                Text('Tracks: ', Bold('2')),
             ).as_kwargs(),
             'reply_markup': message.answer.await_args.kwargs['reply_markup'],
         },
@@ -1968,10 +1941,8 @@ async def test_track_intake_cancel_flushes_buffer() -> None:
     )
 
     callback.answer.assert_awaited_once()
-    message.edit_text.assert_awaited_once_with(
-        **Text('Selected: ', Bold('Cancel')).as_kwargs(),
-        reply_markup=None,
-    )
+    message.edit_text.assert_awaited_once_with('Canceled', reply_markup=None)
+    message.delete.assert_not_awaited()
     assert services.chat_message_buffer.peek_raw(42) == []
     assert state.current_state is None
     assert state.clear_count == 1
@@ -2029,10 +2000,8 @@ async def test_fallback_cancel_flushes_buffer_when_current() -> None:
     )
 
     callback.answer.assert_awaited_once()
-    message.edit_text.assert_awaited_once_with(
-        **Text('Selected: ', Bold('Cancel')).as_kwargs(),
-        reply_markup=None,
-    )
+    message.edit_text.assert_awaited_once_with('Canceled', reply_markup=None)
+    message.delete.assert_not_awaited()
     assert services.chat_message_buffer.peek_raw(42) == []
     assert state.current_state is None
     assert state.clear_count == 1
@@ -3062,12 +3031,9 @@ async def test_reorder_back_from_empty_state_returns_to_intake_action_menu() -> 
     _assert_format_kwargs(
         message.edit_text.await_args.kwargs,
         Text(
-            'Clips: ',
-            Bold('5'),
-            '\n',
             create_padding_line(35),
             '\n',
-            'Select action:',
+            Text('Clips: ', Bold('5')),
         ).as_kwargs(),
     )
     assert state.current_state is None
@@ -4698,12 +4664,9 @@ async def test_reconcile_back_from_sub_season_returns_to_clip_action_menu() -> N
     _assert_format_kwargs(
         message.edit_text.await_args.kwargs,
         Text(
-            'Clips: ',
-            Bold('3'),
-            '\n',
             create_padding_line(35),
             '\n',
-            'Select action:',
+            Text('Clips: ', Bold('3')),
         ).as_kwargs(),
     )
     assert state.current_state is None
@@ -4778,7 +4741,6 @@ async def test_clip_retrieve_back_from_season_skips_single_year_to_universe_menu
 
     _assert_one_line_button_message(
         text=message.edit_text.await_args.kwargs['text'],
-        real_line='Select action:',
         message_width=35,
     )
     reply_markup = message.edit_text.await_args.kwargs['reply_markup']
@@ -5105,7 +5067,6 @@ async def test_pull_scope_all_with_one_scope_sends_single_scope_normally() -> No
     ]
     assert bot.events == [
         ('video', (9, _stored_filename(clip_group, clip_sub_group, _CLIP_ID_1))),
-        ('message', (9, 'Done')),
     ]
     assert state.current_state is None
 
@@ -5159,7 +5120,7 @@ async def test_get_scope_all_requests_normalized_fetch_before_sending() -> None:
         clip_group, clip_sub_group, _CLIP_ID_1
     )
     assert bot.send_video.await_args.kwargs['video'].data == b'normalized:one'
-    bot.send_message.assert_awaited_with(chat_id=9, text='Done')
+    bot.send_message.assert_not_awaited()
     assert state.current_state is None
 
 
@@ -5549,7 +5510,7 @@ async def test_produce_scope_selection_stores_then_fetches_only_new_subset_via_s
         ),
     ]
     assert [item.media.data for item in sent_media] == [b'normalized:two', b'normalized:three']
-    bot.send_message.assert_awaited_once_with(chat_id=77, text='Done')
+    bot.send_message.assert_not_awaited()
     assert state.current_state is None
     assert state.clear_count == 1
 
@@ -6417,7 +6378,6 @@ async def test_send_retrieve_scopes_sends_separator_only_between_scope_blocks_an
                 ),
             ),
         ),
-        ('message', (9, 'Done')),
     ]
 
 
@@ -6510,7 +6470,7 @@ async def test_send_retrieve_scopes_sends_raw_batches_when_normalization_is_disa
         )
     ]
     assert bot.send_video.await_args.kwargs['video'].data == b'one'
-    bot.send_message.assert_awaited_once_with(chat_id=9, text='Done')
+    bot.send_message.assert_not_awaited()
 
 
 @pytest.mark.asyncio

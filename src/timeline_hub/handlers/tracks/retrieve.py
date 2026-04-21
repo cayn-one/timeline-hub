@@ -126,10 +126,7 @@ async def on_retrieve_entry(
 
     if callback_data.action is RetrieveEntryAction.CANCEL:
         await state.clear()
-        await message.edit_text(
-            **selected_text(selected='Cancel'),
-            reply_markup=None,
-        )
+        await message.edit_text('Canceled', reply_markup=None)
         return
 
     groups = await services.track_store.list_groups()
@@ -807,7 +804,7 @@ async def _send_variant_audio(
                 filename=_variant_filename(variants[0], index=1),
             ),
             thumbnail=_audio_thumbnail(),
-            performer='\u2009',
+            performer='\u00a0',
             title=_variant_title(variants[0]),
         )
         return
@@ -821,7 +818,7 @@ async def _send_variant_audio(
                     filename=_variant_filename(variant, index=index),
                 ),
                 thumbnail=_audio_thumbnail(),
-                performer='\u2009',
+                performer='\u00a0',
                 title=_variant_title(variant),
             )
             for index, variant in enumerate(variants, start=1)

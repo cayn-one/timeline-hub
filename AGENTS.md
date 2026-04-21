@@ -5,7 +5,7 @@
 These rules apply only to real action-selection menus with inline keyboards. Plain text messages must remain unmodified and must not be padded or height-normalized.
 
 Every real action-selection menu must render:
-- exactly 3 text lines
+- exactly 2 text lines
 - exactly 3 rows of buttons
 
 Short informational prompts with a single terminal action are not action-selection menus.
@@ -102,13 +102,12 @@ Only real text lines count as content. Padding lines exist only for layout stabi
 Allowed layouts:
 
 Single-content messages:
-- real content on line 3
-- lines 1 and 2 are padding
+- real content on line 2
+- line 1 is padding
 
-Context + prompt messages:
-- context on line 1
-- line 2 is padding
-- prompt on line 3
+Context messages:
+- line 1 is padding
+- context on line 2
 
 Padding must use one consistent width-based mechanism.
 Do not use:
@@ -121,7 +120,6 @@ Do not use:
 Selection state must be visually structured.
 
 Rules:
-- `Selected:` is plain text
 - each selected value is emphasized individually
 - separators are plain
 - do not emphasize the whole concatenated string

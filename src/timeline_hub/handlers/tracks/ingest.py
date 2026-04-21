@@ -91,10 +91,7 @@ async def on_track_intake_action(
 
     if callback_data.action is TrackIntakeAction.CANCEL:
         await state.clear()
-        await message.edit_text(
-            **selected_text(selected='Cancel'),
-            reply_markup=None,
-        )
+        await message.edit_text('Canceled', reply_markup=None)
         services.chat_message_buffer.flush(message.chat.id)
         return
 
@@ -248,12 +245,9 @@ def _track_intake_menu_kwargs(
 ) -> dict[str, Any]:
     return {
         **Text(
-            'Tracks: ',
-            Bold(str(track_count)),
-            '\n',
             create_padding_line(message_width),
             '\n',
-            'Select action:',
+            Text('Tracks: ', Bold(str(track_count))),
         ).as_kwargs(),
         'reply_markup': stacked_keyboard(
             buttons=[

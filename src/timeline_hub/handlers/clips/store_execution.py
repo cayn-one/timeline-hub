@@ -72,7 +72,6 @@ async def execute_store_or_produce(
                 audio_normalization=audio_normalization_from_settings(settings=settings),
             ),
         )
-        await bot.send_message(chat_id=message.chat.id, text='Done')
 
     return result
 

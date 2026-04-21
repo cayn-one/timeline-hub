@@ -103,12 +103,9 @@ async def _show_fallback_menu(
 ) -> None:
     await message.answer(
         **Text(
-            'Messages: ',
-            Bold(str(message_count)),
-            '\n',
             create_padding_line(settings.message_width),
             '\n',
-            'Select action:',
+            Text('Messages: ', Bold(str(message_count))),
         ).as_kwargs(),
         reply_markup=single_button_keyboard(
             button=InlineKeyboardButton(

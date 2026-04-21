@@ -34,10 +34,11 @@ def selection_text(
         return selected_content.as_kwargs()
     if message_width is None:
         raise ValueError('`message_width` is required when `prompt` is provided with selected values')
-    return _button_message_text(
-        real_lines=[selected_content, prompt],
-        message_width=message_width,
-    )
+    return Text(
+        create_padding_line(message_width),
+        '\n',
+        selected_content,
+    ).as_kwargs()
 
 
 def selected_text(
@@ -54,7 +55,9 @@ def selected_text(
 
 def width_reserved_text(*, text: str, message_width: int) -> dict[str, Any]:
     padding_line = create_padding_line(message_width)
-    return {'text': f'{padding_line}\n{padding_line}\n{text}'}
+    # Telegram renders action-menu width more consistently when the second
+    # line is a single visible dot instead of whitespace-only content.
+    return {'text': f'{padding_line}\n·'}
 
 
 def fixed_option_keyboard(
@@ -219,7 +222,7 @@ def _selected_content(selected: Sequence[str]) -> Text:
     parts: list[Any] = ['Selected: ']
     for index, value in enumerate(selected):
         if index > 0:
-            parts.append(' → ')
+            parts.append(' / ')
         parts.append(Bold(value))
     return Text(*parts)
 

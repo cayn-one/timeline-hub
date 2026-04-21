@@ -46,7 +46,6 @@ from timeline_hub.handlers.clips.flow import (
 from timeline_hub.handlers.menu import (
     callback_message,
     handle_stale_selection,
-    selected_text,
     selection_text,
     stacked_keyboard,
     width_reserved_text,
@@ -144,10 +143,7 @@ async def on_retrieve_entry(
 
     if callback_data.action is RetrieveEntryAction.CANCEL:
         await state.clear()
-        await message.edit_text(
-            **selected_text(selected='Cancel'),
-            reply_markup=None,
-        )
+        await message.edit_text('Canceled', reply_markup=None)
         return
 
     flow = _flow_for_entry_action(callback_data.action)
@@ -938,8 +934,6 @@ async def _send_retrieve_scopes(
                 audio_normalization=audio_normalization,
             ),
         )
-
-    await bot.send_message(chat_id=chat_id, text='Done')
 
 
 async def _retrieve_sub_groups(
