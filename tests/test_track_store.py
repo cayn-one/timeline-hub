@@ -3,6 +3,7 @@ import re
 import uuid
 
 import pytest
+from pytest import approx
 
 import timeline_hub.services.track_store as track_store_module
 from timeline_hub.infra.s3 import S3BatchDeleteError, S3Client, S3ObjectNotFoundError
@@ -164,10 +165,14 @@ def _stored_preset(
     )
 
 
+def _materialized_preset_version(version: int) -> int:
+    return version + (track_store_module._VARIANT_INDEX_SCHEMA_VERSION - 1)
+
+
 def _applied_preset(
     *,
     preset_id: int = 1,
-    version: int = 3,
+    version: int | None = None,
     preset: Preset | None = None,
     variant_count: int | None = None,
 ) -> AppliedPreset:
@@ -177,7 +182,7 @@ def _applied_preset(
     )
     return AppliedPreset(
         id=preset_id,
-        version=version,
+        version=_materialized_preset_version(3) if version is None else version,
         variant_count=resolved_variant_count,
     )
 
@@ -361,6 +366,24 @@ def test_preset_rejects_empty_name() -> None:
 def test_preset_rejects_negative_reverb_start() -> None:
     with pytest.raises(ValueError, match='Preset.reverb_start must be >= 0'):
         _preset(name='default', reverb_start=-0.01)
+
+
+def test_resolve_variant_specs_assigns_reverb_from_fastest_to_slowest() -> None:
+    preset = _preset(
+        name='directional',
+        slowed=PresetMode(step=0.05, levels=3),
+        sped_up=PresetMode(step=0.1, levels=2),
+        reverb_start=0.02,
+        reverb_step=0.03,
+    )
+
+    specs = _store(_FakeS3Client())._resolve_variant_specs(preset)
+
+    assert [spec.speed for spec in specs] == [0.85, 0.9, 0.95, 1.1, 1.2]
+    assert [spec.reverb for spec in specs] == approx([0.14, 0.11, 0.08, 0.05, 0.02])
+    assert [spec.reverb for spec in sorted(specs, key=lambda spec: spec.speed, reverse=True)] == approx(
+        [0.02, 0.05, 0.08, 0.11, 0.14]
+    )
 
 
 def test_preset_rejects_missing_all_variant_modes() -> None:
@@ -619,7 +642,7 @@ def test_manifest_uses_data_root_with_preferred_field_order() -> None:
                 'title': 'title',
                 'sub_season': 'A',
                 'order': 1,
-                'preset': {'id': 1, 'version': 3, 'variant_count': 5},
+                'preset': {'id': 1, 'version': _materialized_preset_version(3), 'variant_count': 5},
                 'has_variants': False,
                 'has_instrumental': False,
                 'has_instrumental_variants': False,
@@ -1828,7 +1851,7 @@ async def test_store_initializes_preset_from_current_default_preset(monkeypatch:
 
     assert manifest_payload['data'][0]['preset'] == {
         'id': default_preset.id,
-        'version': default_preset.version,
+        'version': _materialized_preset_version(default_preset.version),
         'variant_count': expected_variant_count,
     }
     assert manifest_payload['data'][0]['has_variants'] is False
@@ -4263,7 +4286,11 @@ async def test_fetch_with_explicit_preset_returns_current_original_and_instrumen
     cover_key = _cover_key(universe=group.universe, year=group.year, season=group.season, track_id=_UUID_1)
     presets = _sample_stored_presets()
     resolved = presets[0]
-    applied_preset = _applied_preset(preset_id=resolved.id, version=resolved.version, preset=resolved.preset)
+    applied_preset = _applied_preset(
+        preset_id=resolved.id,
+        version=_materialized_preset_version(resolved.version),
+        preset=resolved.preset,
+    )
     store = _store(_FakeS3Client())
     objects = {
         _presets_key(): _presets_bytes(presets=presets),
@@ -4318,6 +4345,7 @@ async def test_fetch_with_explicit_preset_returns_current_original_and_instrumen
     assert isinstance(result.variants[0], FetchedVariant)
     assert [variant.level for variant in result.variants] == [3, 2, 1, 1, 2]
     assert [variant.speed for variant in result.variants] == sorted(variant.speed for variant in result.variants)
+    assert [variant.reverb for variant in result.variants] == [0.05, 0.04, 0.03, 0.02, 0.01]
     assert [variant.audio.data for variant in result.variants] == [
         b'orig|1',
         b'orig|2',
@@ -4355,7 +4383,11 @@ async def test_fetch_reads_cover_from_selected_track_key_even_with_shared_album_
     cover_key_2 = _cover_key(universe=group.universe, year=group.year, season=group.season, track_id=_UUID_2)
     track_key_2 = _track_key(universe=group.universe, year=group.year, season=group.season, track_id=_UUID_2)
     resolved = _sample_stored_presets()[0]
-    applied_preset = _applied_preset(preset_id=resolved.id, version=resolved.version, preset=resolved.preset)
+    applied_preset = _applied_preset(
+        preset_id=resolved.id,
+        version=_materialized_preset_version(resolved.version),
+        preset=resolved.preset,
+    )
     store = _store(_FakeS3Client())
     s3_client = _FakeS3Client(
         objects={
@@ -4505,7 +4537,11 @@ async def test_fetch_with_none_resolves_current_default_preset_and_returns_no_in
                 title='title',
                 sub_season=SubSeason.A,
                 order=1,
-                preset=_applied_preset(preset_id=2, version=1, preset=_sample_stored_presets()[1].preset),
+                preset=_applied_preset(
+                    preset_id=2,
+                    version=_materialized_preset_version(1),
+                    preset=_sample_stored_presets()[1].preset,
+                ),
                 has_instrumental=False,
                 has_instrumental_variants=False,
                 has_variants=True,
@@ -4608,16 +4644,20 @@ async def test_fetch_regenerates_original_variants_when_preset_id_mismatches(mon
     assert s3_client.delete_keys_calls == [previous_keys]
     assert generation_calls
     assert [variant.audio.data for variant in result.variants] == [
-        b'authoritative-track|0.82|0.03',
-        b'authoritative-track|0.88|0.02',
-        b'authoritative-track|0.94|0.01',
-        b'authoritative-track|1.06|0.01',
-        b'authoritative-track|1.12|0.02',
+        b'authoritative-track|0.82|0.05',
+        b'authoritative-track|0.88|0.04',
+        b'authoritative-track|0.94|0.03',
+        b'authoritative-track|1.06|0.02',
+        b'authoritative-track|1.12|0.01',
     ]
     assert all(variant.audio.extension is Extension.MP3 for variant in result.variants)
     rewritten_manifest = json.loads(s3_client.objects[manifest_key].decode('utf-8'))
     assert rewritten_manifest['data'][0]['preset'] == _applied_preset_dict(
-        _applied_preset(preset_id=1, version=3, preset=_sample_stored_presets()[0].preset)
+        _applied_preset(
+            preset_id=1,
+            version=_materialized_preset_version(3),
+            preset=_sample_stored_presets()[0].preset,
+        )
     )
     assert rewritten_manifest['data'][0]['has_instrumental_variants'] is False
 
@@ -4680,7 +4720,7 @@ async def test_fetch_treats_variant_count_mismatch_as_stale(monkeypatch: pytest.
     manifest_key = _manifest_key(universe=group.universe, year=group.year, season=group.season)
     track_key = _track_key(universe=group.universe, year=group.year, season=group.season, track_id=_UUID_1)
     cover_key = _cover_key(universe=group.universe, year=group.year, season=group.season, track_id=_UUID_1)
-    stale_applied_preset = AppliedPreset(id=1, version=3, variant_count=4)
+    stale_applied_preset = AppliedPreset(id=1, version=_materialized_preset_version(3), variant_count=4)
     s3_client = _FakeS3Client(
         objects={
             _presets_key(): _presets_bytes(),
@@ -4732,7 +4772,11 @@ async def test_fetch_regenerates_instrumental_variants_when_manifest_flag_is_fal
     instrumental_key = _instrumental_key(
         universe=group.universe, year=group.year, season=group.season, track_id=_UUID_1
     )
-    current_applied_preset = _applied_preset(preset_id=1, version=3, preset=_sample_stored_presets()[0].preset)
+    current_applied_preset = _applied_preset(
+        preset_id=1,
+        version=_materialized_preset_version(3),
+        preset=_sample_stored_presets()[0].preset,
+    )
     store = _store(_FakeS3Client())
     s3_client = _FakeS3Client(
         objects={
@@ -4823,7 +4867,11 @@ async def test_fetch_regeneration_rewrites_manifest_with_applied_preset(monkeypa
     cached_applied_preset = next(
         iter(store._manifest_cache[_track_group_prefix(universe=group.universe, year=group.year, season=group.season)])
     ).preset
-    assert cached_applied_preset == _applied_preset(preset_id=1, version=3, preset=_sample_stored_presets()[0].preset)
+    assert cached_applied_preset == _applied_preset(
+        preset_id=1,
+        version=_materialized_preset_version(3),
+        preset=_sample_stored_presets()[0].preset,
+    )
 
 
 @pytest.mark.asyncio
@@ -4867,7 +4915,7 @@ async def test_fetch_wraps_partial_original_variant_upload_as_sync_error(
     assert getattr(excinfo.value, '__notes__', []) == [
         f"Original variant upload error: RuntimeError('boom putting {original_variant_keys[1]}')"
     ]
-    assert s3_client.objects[original_variant_keys[0]] == b'authoritative-track|0.82|0.03'
+    assert s3_client.objects[original_variant_keys[0]] == b'authoritative-track|0.82|0.05'
     assert original_variant_keys[1] not in s3_client.objects
     assert s3_client.objects[manifest_key] == _manifest_bytes([_entry(id=_UUID_1, has_variants=False)])
 
@@ -4930,7 +4978,7 @@ async def test_fetch_wraps_partial_instrumental_variant_upload_as_sync_error(
     assert getattr(excinfo.value, '__notes__', []) == [
         f"Instrumental variant upload error: RuntimeError('boom putting {instrumental_variant_keys[1]}')"
     ]
-    assert s3_client.objects[instrumental_variant_keys[0]] == b'authoritative-instrumental|0.82|0.03'
+    assert s3_client.objects[instrumental_variant_keys[0]] == b'authoritative-instrumental|0.82|0.05'
     assert instrumental_variant_keys[1] not in s3_client.objects
 
 
@@ -5055,8 +5103,8 @@ async def test_fetch_wraps_manifest_write_failure_after_regeneration_as_sync_err
             )
         ]
     )
-    assert s3_client.objects[original_variant_keys[0]] == b'authoritative-track|0.82|0.03'
-    assert s3_client.objects[instrumental_variant_keys[0]] == b'authoritative-instrumental|0.82|0.03'
+    assert s3_client.objects[original_variant_keys[0]] == b'authoritative-track|0.82|0.05'
+    assert s3_client.objects[instrumental_variant_keys[0]] == b'authoritative-instrumental|0.82|0.05'
 
 
 @pytest.mark.asyncio
@@ -5203,7 +5251,7 @@ async def test_fetch_wraps_stale_instrumental_variant_deletion_as_sync_error(
     assert getattr(excinfo.value, '__notes__', []) == [
         f"Instrumental variant delete error: RuntimeError('boom deleting {instrumental_variant_keys[1]}')"
     ]
-    assert s3_client.objects[original_variant_keys[0]] == b'authoritative-track|0.82|0.03'
+    assert s3_client.objects[original_variant_keys[0]] == b'authoritative-track|0.82|0.05'
     assert instrumental_variant_keys[0] not in s3_client.objects
     assert instrumental_variant_keys[1] in s3_client.objects
 
@@ -5319,7 +5367,7 @@ async def test_fetch_wraps_instrumental_source_read_failure_after_prior_mutation
     assert getattr(excinfo.value, '__notes__', []) == [
         f"Instrumental source read error: S3ObjectNotFoundError('Object not found: {instrumental_key}')"
     ]
-    assert s3_client.objects[regenerated_original_variant_keys[0]] == b'authoritative-track|0.82|0.03'
+    assert s3_client.objects[regenerated_original_variant_keys[0]] == b'authoritative-track|0.82|0.05'
     assert instrumental_variant_keys[0] not in s3_client.objects
     assert instrumental_variant_keys[1] not in s3_client.objects
 

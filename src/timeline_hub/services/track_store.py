@@ -298,6 +298,9 @@ class AppliedPreset:
             raise ValueError('AppliedPreset.variant_count must be >= 1')
 
 
+_VARIANT_INDEX_SCHEMA_VERSION = 2
+
+
 @dataclass(frozen=True, slots=True)
 class Presets:
     """Internal validated preset registry aggregate for `PresetStore`.
@@ -1337,7 +1340,7 @@ class TrackStore:
                             entry,
                             preset=AppliedPreset(
                                 id=resolved_stored_preset.id,
-                                version=resolved_stored_preset.version,
+                                version=self._applied_preset_version(resolved_stored_preset),
                                 variant_count=variant_count,
                             ),
                             has_variants=True if original_regenerated else entry.has_variants,
@@ -1479,7 +1482,7 @@ class TrackStore:
                 order=order,
                 preset=AppliedPreset(
                     id=resolved_preset.id,
-                    version=resolved_preset.version,
+                    version=self._applied_preset_version(resolved_preset),
                     variant_count=variant_count,
                 ),
                 has_variants=False,
@@ -2506,9 +2509,13 @@ class TrackStore:
     ) -> bool:
         return (
             applied_preset.id == resolved_preset.id
-            and applied_preset.version == resolved_preset.version
+            and applied_preset.version == self._applied_preset_version(resolved_preset)
             and applied_preset.variant_count == variant_count
         )
+
+    def _applied_preset_version(self, preset: PresetRecord) -> int:
+        """Return the manifest version for the current variant-index schema."""
+        return preset.version + (_VARIANT_INDEX_SCHEMA_VERSION - 1)
 
     def _resolve_variant_specs(self, preset: Preset) -> tuple[_ResolvedVariantSpec, ...]:
         # This final ascending-speed order is a storage invariant: variant
@@ -2522,7 +2529,7 @@ class TrackStore:
                     _ResolvedVariantSpec(
                         level=level,
                         speed=1.0 - level * preset.slowed.step,
-                        reverb=preset.reverb_start + (level - 1) * preset.reverb_step,
+                        reverb=0.0,
                     )
                 )
         if preset.sped_up is not None:
@@ -2531,11 +2538,18 @@ class TrackStore:
                     _ResolvedVariantSpec(
                         level=level,
                         speed=1.0 + level * preset.sped_up.step,
-                        reverb=preset.reverb_start + (level - 1) * preset.reverb_step,
+                        reverb=0.0,
                     )
                 )
-
-        return tuple(sorted(variant_specs, key=lambda spec: spec.speed))
+        fastest_to_slowest = sorted(variant_specs, key=lambda spec: spec.speed, reverse=True)
+        resolved_specs = [
+            dataclass_replace(
+                spec,
+                reverb=preset.reverb_start + index * preset.reverb_step,
+            )
+            for index, spec in enumerate(fastest_to_slowest)
+        ]
+        return tuple(sorted(resolved_specs, key=lambda spec: spec.speed))
 
     async def _load_variants(
         self,
