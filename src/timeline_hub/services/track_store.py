@@ -1,3 +1,4 @@
+import asyncio
 import json
 import math
 import uuid
@@ -2559,25 +2560,25 @@ class TrackStore:
         variant_specs: tuple[_ResolvedVariantSpec, ...],
         instrumental: bool,
     ) -> tuple[FetchedVariant, ...]:
-        variants: list[FetchedVariant] = []
-        for index, spec in enumerate(variant_specs, start=1):
-            variant_key = self._variant_storage_key(
+        variant_keys = [
+            self._variant_storage_key(
                 track_group_prefix=track_group_prefix,
                 track_id=track_id,
                 index=index,
                 instrumental=instrumental,
             )
-            variant_bytes = await self._s3_client.get_bytes(variant_key)
-            variants.append(
-                FetchedVariant(
-                    level=spec.level,
-                    speed=spec.speed,
-                    reverb=spec.reverb,
-                    audio=FileBytes(data=variant_bytes, extension=Extension.MP3),
-                )
+            for index, _ in enumerate(variant_specs, start=1)
+        ]
+        variant_bytes_list = await asyncio.gather(*(self._s3_client.get_bytes(key) for key in variant_keys))
+        return tuple(
+            FetchedVariant(
+                level=spec.level,
+                speed=spec.speed,
+                reverb=spec.reverb,
+                audio=FileBytes(data=variant_bytes, extension=Extension.MP3),
             )
-
-        return tuple(variants)
+            for spec, variant_bytes in zip(variant_specs, variant_bytes_list, strict=True)
+        )
 
     async def _generate_and_store_variants(
         self,

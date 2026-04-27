@@ -1,3 +1,4 @@
+import asyncio
 import json
 import re
 import uuid
@@ -4373,6 +4374,153 @@ async def test_fetch_with_explicit_preset_returns_current_original_and_instrumen
     )
     assert s3_client.delete_keys_calls == []
     assert all(call[0] != manifest_key for call in s3_client.put_calls)
+
+
+@pytest.mark.asyncio
+async def test_fetch_current_original_variants_preserve_order_when_s3_reads_complete_out_of_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    group = _track_group()
+    manifest_key = _manifest_key(universe=group.universe, year=group.year, season=group.season)
+    cover_key = _cover_key(universe=group.universe, year=group.year, season=group.season, track_id=_UUID_1)
+    presets = _sample_stored_presets()
+    resolved = presets[0]
+    applied_preset = _applied_preset(
+        preset_id=resolved.id,
+        version=_materialized_preset_version(resolved.version),
+        preset=resolved.preset,
+    )
+    seed_store = _store(_FakeS3Client())
+    original_variant_objects = _variant_storage_objects(
+        seed_store,
+        group=group,
+        track_id=_UUID_1,
+        preset=resolved.preset,
+        payload_prefix='orig',
+    )
+    s3_client = _FakeS3Client(
+        objects={
+            _presets_key(): _presets_bytes(presets=presets),
+            manifest_key: _manifest_bytes(
+                [
+                    _entry(
+                        id=_UUID_1,
+                        artists=('artist', 'featured'),
+                        title='title',
+                        sub_season=SubSeason.A,
+                        order=1,
+                        preset=applied_preset,
+                        has_variants=True,
+                        has_instrumental=False,
+                        has_instrumental_variants=False,
+                    ),
+                ]
+            ),
+            cover_key: b'cover-bytes',
+            **original_variant_objects,
+        }
+    )
+    original_get_bytes = s3_client.get_bytes
+    reversed_variant_keys = list(original_variant_objects.keys())[::-1]
+    delays = {key: index * 0.01 for index, key in enumerate(reversed_variant_keys, start=1)}
+
+    async def _delayed_get_bytes(key: str) -> bytes:
+        delay = delays.get(key)
+        if delay is not None:
+            await asyncio.sleep(delay)
+        return await original_get_bytes(key)
+
+    monkeypatch.setattr(s3_client, 'get_bytes', _delayed_get_bytes)
+    store = _store(s3_client)
+
+    result = await store.fetch(group, _UUID_1, preset_id=1)
+
+    assert [variant.audio.data for variant in result.variants] == [
+        b'orig|1',
+        b'orig|2',
+        b'orig|3',
+        b'orig|4',
+        b'orig|5',
+    ]
+    assert result.instrumental_variants is None
+
+
+@pytest.mark.asyncio
+async def test_fetch_current_instrumental_variants_preserve_order_when_s3_reads_complete_out_of_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    group = _track_group()
+    manifest_key = _manifest_key(universe=group.universe, year=group.year, season=group.season)
+    cover_key = _cover_key(universe=group.universe, year=group.year, season=group.season, track_id=_UUID_1)
+    presets = _sample_stored_presets()
+    resolved = presets[0]
+    applied_preset = _applied_preset(
+        preset_id=resolved.id,
+        version=_materialized_preset_version(resolved.version),
+        preset=resolved.preset,
+    )
+    seed_store = _store(_FakeS3Client())
+    original_variant_objects = _variant_storage_objects(
+        seed_store,
+        group=group,
+        track_id=_UUID_1,
+        preset=resolved.preset,
+        payload_prefix='orig',
+    )
+    instrumental_variant_objects = _variant_storage_objects(
+        seed_store,
+        group=group,
+        track_id=_UUID_1,
+        preset=resolved.preset,
+        payload_prefix='inst',
+        instrumental=True,
+    )
+    s3_client = _FakeS3Client(
+        objects={
+            _presets_key(): _presets_bytes(presets=presets),
+            manifest_key: _manifest_bytes(
+                [
+                    _entry(
+                        id=_UUID_1,
+                        artists=('artist', 'featured'),
+                        title='title',
+                        sub_season=SubSeason.A,
+                        order=1,
+                        preset=applied_preset,
+                        has_variants=True,
+                        has_instrumental=True,
+                        has_instrumental_variants=True,
+                    ),
+                ]
+            ),
+            cover_key: b'cover-bytes',
+            **original_variant_objects,
+            **instrumental_variant_objects,
+        }
+    )
+    original_get_bytes = s3_client.get_bytes
+    reversed_variant_keys = list(instrumental_variant_objects.keys())[::-1]
+    delays = {key: index * 0.01 for index, key in enumerate(reversed_variant_keys, start=1)}
+
+    async def _delayed_get_bytes(key: str) -> bytes:
+        delay = delays.get(key)
+        if delay is not None:
+            await asyncio.sleep(delay)
+        return await original_get_bytes(key)
+
+    monkeypatch.setattr(s3_client, 'get_bytes', _delayed_get_bytes)
+    store = _store(s3_client)
+
+    result = await store.fetch(group, _UUID_1, preset_id=1)
+
+    assert result.instrumental_variants is not None
+    assert [variant.audio.data for variant in result.instrumental_variants] == [
+        b'inst|1',
+        b'inst|2',
+        b'inst|3',
+        b'inst|4',
+        b'inst|5',
+    ]
 
 
 @pytest.mark.asyncio
