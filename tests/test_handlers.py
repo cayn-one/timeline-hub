@@ -1,5 +1,4 @@
 from datetime import date, timedelta
-from importlib.resources import files
 from io import BytesIO
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, call
@@ -391,10 +390,6 @@ def _jpg_file(data: bytes) -> FileBytes:
 
 def _opus_file(data: bytes) -> FileBytes:
     return FileBytes(data=data, extension=Extension.OPUS)
-
-
-def _root_audio_thumbnail_bytes() -> bytes:
-    return files('timeline_hub').joinpath('assets/track-thumbnail.jpg').read_bytes()
 
 
 def _fetched_variant(
@@ -1266,7 +1261,9 @@ async def test_track_retrieve_removed_track_id_during_fetch_becomes_stale_select
 
 
 @pytest.mark.asyncio
-async def test_track_retrieve_sub_season_selection_fetches_all_before_sending_and_sends_reverse_track_order() -> None:
+async def test_track_retrieve_sub_season_selection_fetches_all_before_sending_and_sends_reverse_track_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     message = _fake_message(text='Select sub-season:', chat_id=9, message_id=19)
     callback = _fake_callback(message)
     state = _FakeState()
@@ -1313,6 +1310,10 @@ async def test_track_retrieve_sub_season_selection_fetches_all_before_sending_an
     )
     services = _services(clip_store=SimpleNamespace(), track_store=track_store)
     bot = _RecordingTrackBot(events)
+    pad_image_to_width_factor = Mock(
+        side_effect=lambda image_bytes, *, width_factor=2.0, background='white', quality=95: image_bytes
+    )
+    monkeypatch.setattr(track_retrieve_module, 'pad_image_to_width_factor', pad_image_to_width_factor)
     await state.set_state(TrackRetrieveFlow.sub_season)
     await state.update_data(
         mode=track_retrieve_module._TRACK_GET_MODE,
@@ -1345,7 +1346,10 @@ async def test_track_retrieve_sub_season_selection_fetches_all_before_sending_an
         ('fetch', (group, track_1.id)),
         ('fetch', (group, track_2.id)),
     ]
-    thumbnail_bytes = _root_audio_thumbnail_bytes()
+    assert pad_image_to_width_factor.call_args_list == [
+        call(b'cover-2', width_factor=2.0, background='blur'),
+        call(b'cover-1', width_factor=2.0, background='blur'),
+    ]
     assert events[2:] == [
         (
             'photo',
@@ -1362,20 +1366,20 @@ async def test_track_retrieve_sub_season_selection_fetches_all_before_sending_an
                 'chat_id': 9,
                 'files': [
                     {
-                        'filename': f'1{Extension.OPUS.suffix}',
+                        'filename': '++',
                         'data': b'second-main-1',
-                        'thumbnail_filename': 'track-thumbnail.jpg',
-                        'thumbnail_data': thumbnail_bytes,
-                        'performer': '\u00a0',
-                        'title': '⏩⏩⏩⏩',
+                        'thumbnail_filename': None,
+                        'thumbnail_data': None,
+                        'performer': None,
+                        'title': None,
                     },
                     {
-                        'filename': f'2{Extension.OPUS.suffix}',
+                        'filename': '--',
                         'data': b'second-main-2',
-                        'thumbnail_filename': 'track-thumbnail.jpg',
-                        'thumbnail_data': thumbnail_bytes,
-                        'performer': '\u00a0',
-                        'title': '⏪⏪',
+                        'thumbnail_filename': None,
+                        'thumbnail_data': None,
+                        'performer': None,
+                        'title': None,
                     },
                 ],
             },
@@ -1384,12 +1388,12 @@ async def test_track_retrieve_sub_season_selection_fetches_all_before_sending_an
             'audio',
             {
                 'chat_id': 9,
-                'filename': f'1{Extension.OPUS.suffix}',
+                'filename': '++',
                 'data': b'second-inst',
-                'thumbnail_filename': 'track-thumbnail.jpg',
-                'thumbnail_data': thumbnail_bytes,
-                'performer': '\u00a0',
-                'title': '⏩⏩⏩⏩⏩⏩',
+                'thumbnail_filename': None,
+                'thumbnail_data': None,
+                'performer': None,
+                'title': None,
             },
         ),
         (
@@ -1405,30 +1409,31 @@ async def test_track_retrieve_sub_season_selection_fetches_all_before_sending_an
             'audio',
             {
                 'chat_id': 9,
-                'filename': f'1{Extension.OPUS.suffix}',
+                'filename': '--',
                 'data': b'first-main',
-                'thumbnail_filename': 'track-thumbnail.jpg',
-                'thumbnail_data': thumbnail_bytes,
-                'performer': '\u00a0',
-                'title': '⏪⏪',
+                'thumbnail_filename': None,
+                'thumbnail_data': None,
+                'performer': None,
+                'title': None,
             },
         ),
     ]
     assert state.current_state is None
 
 
-def test_track_retrieve_variant_title_rejects_unmodified_speed() -> None:
+def test_track_retrieve_variant_filename_rejects_unmodified_speed() -> None:
     variant = _fetched_variant(data=b'audio', level=1, speed=1.0, reverb=0.06)
 
     with pytest.raises(ValueError, match='speed must not be 1.0'):
-        track_retrieve_module._variant_title(variant)
+        track_retrieve_module._variant_filename(variant)
 
 
-def test_track_retrieve_variant_title_rejects_non_positive_level() -> None:
-    variant = _fetched_variant(data=b'audio', level=0, speed=0.95, reverb=0.06)
+def test_track_retrieve_variant_filename_uses_directional_tokens() -> None:
+    fast_variant = _fetched_variant(data=b'audio', level=1, speed=1.12, reverb=0.06)
+    slow_variant = _fetched_variant(data=b'audio', level=1, speed=0.95, reverb=0.06)
 
-    with pytest.raises(ValueError, match='level must be >= 1'):
-        track_retrieve_module._variant_title(variant)
+    assert track_retrieve_module._variant_filename(fast_variant) == '++'
+    assert track_retrieve_module._variant_filename(slow_variant) == '--'
 
 
 @pytest.mark.asyncio

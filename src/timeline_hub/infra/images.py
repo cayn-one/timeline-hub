@@ -1,6 +1,8 @@
+import math
 from io import BytesIO
+from typing import Literal
 
-from PIL import Image, ImageOps
+from PIL import Image, ImageFilter, ImageOps
 
 
 def to_jpg(image_bytes: bytes, *, quality: int = 95) -> bytes:
@@ -70,6 +72,58 @@ def normalize_cover_to_jpg(
         return _save_jpg(output_image, quality=quality)
 
 
+def pad_image_to_width_factor(
+    image_bytes: bytes,
+    *,
+    width_factor: float = 2.0,
+    background: Literal['white', 'black', 'blur'] = 'white',
+    quality: int = 95,
+) -> bytes:
+    """Pad image bytes to a wider JPEG canvas while preserving source content.
+
+    Common accepted source formats include JPEG, PNG, WebP, GIF, BMP, and
+    TIFF, depending on Pillow support in the runtime environment. Output is
+    always JPEG bytes.
+
+    Args:
+        image_bytes: Source image bytes in a Pillow-readable format.
+        width_factor: Multiplier used to derive output width from source width.
+        background: Background fill strategy for extra horizontal space.
+        quality: JPEG quality in the closed range 1..100.
+
+    Raises:
+        ValueError: If parameters are invalid.
+    """
+    _validate_image_bytes(image_bytes)
+    _validate_quality(quality)
+    _validate_width_factor(width_factor)
+    _validate_background(background)
+
+    with Image.open(BytesIO(image_bytes)) as image:
+        image.load()
+        image = ImageOps.exif_transpose(image)
+        source_image = _normalize_to_rgb(image)
+
+        width, height = source_image.size
+        target_width = max(width, round(width * width_factor))
+        if background == 'white':
+            output_image = Image.new('RGB', (target_width, height), 'white')
+        elif background == 'black':
+            output_image = Image.new('RGB', (target_width, height), 'black')
+        else:
+            background_scale = max(target_width / width, 1.0)
+            background_width = max(1, round(width * background_scale))
+            background_height = max(1, round(height * background_scale))
+            output_image = source_image.resize((background_width, background_height), Image.Resampling.LANCZOS)
+            crop_left = max(0, (background_width - target_width) // 2)
+            crop_top = max(0, (background_height - height) // 2)
+            output_image = output_image.crop((crop_left, crop_top, crop_left + target_width, crop_top + height))
+            output_image = output_image.filter(ImageFilter.GaussianBlur(radius=32))
+        offset_x = (target_width - width) // 2
+        output_image.paste(source_image, (offset_x, 0))
+        return _save_jpg(output_image, quality=quality)
+
+
 def _validate_image_bytes(image_bytes: bytes) -> None:
     if not image_bytes:
         raise ValueError('image_bytes must not be empty')
@@ -87,6 +141,22 @@ def _validate_max_height(max_height: int) -> None:
         raise ValueError('max_height must be an integer')
     if max_height < 1:
         raise ValueError('max_height must be >= 1')
+
+
+def _validate_width_factor(width_factor: float) -> None:
+    if isinstance(width_factor, bool) or not isinstance(width_factor, int | float):
+        raise ValueError('width_factor must be an int or float')
+    if not math.isfinite(width_factor):
+        raise ValueError('width_factor must be finite')
+    if width_factor < 1.0:
+        raise ValueError('width_factor must be >= 1.0')
+
+
+def _validate_background(background: Literal['white', 'black', 'blur']) -> None:
+    if not isinstance(background, str):
+        raise ValueError("background must be one of 'white', 'black', or 'blur'")
+    if background not in {'white', 'black', 'blur'}:
+        raise ValueError("background must be one of 'white', 'black', or 'blur'")
 
 
 def _needs_exif_transpose(image: Image.Image) -> bool:

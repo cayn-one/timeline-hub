@@ -28,6 +28,7 @@ from timeline_hub.handlers.menu import (
     width_reserved_text,
 )
 from timeline_hub.handlers.retrieve_common import StepOutcome
+from timeline_hub.infra.images import pad_image_to_width_factor
 from timeline_hub.services.container import Services
 from timeline_hub.services.track_store import (
     FetchedVariant,
@@ -763,11 +764,16 @@ async def _send_fetched_track(
     _validate_variant_count(fetched_track.variants)
     if fetched_track.instrumental_variants is not None:
         _validate_variant_count(fetched_track.instrumental_variants)
+    ui_cover_bytes = pad_image_to_width_factor(
+        fetched_track.cover.data,
+        width_factor=2.0,
+        background='blur',
+    )
 
     await bot.send_photo(
         chat_id=chat_id,
         photo=BufferedInputFile(
-            fetched_track.cover.data,
+            ui_cover_bytes,
             filename=_cover_filename(group=group, track_id=fetched_track.track_id),
         ),
         caption=fetched_track.title,
