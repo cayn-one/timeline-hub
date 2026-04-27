@@ -1,7 +1,6 @@
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from datetime import date
 from enum import StrEnum, auto
-from importlib.resources import files
 
 from aiogram import Bot, F, Router
 from aiogram.enums import ChatType
@@ -48,8 +47,6 @@ router = Router()
 type BackStep = Callable[[], Awaitable[StepOutcome]]
 _TRACK_GET_MODE = 'track_get'
 _TRACK_BACK_VALUE = 'back'
-_AUDIO_THUMBNAIL_NAME = 'track-thumbnail.jpg'
-_AUDIO_THUMBNAIL_BYTES = files('timeline_hub').joinpath(f'assets/{_AUDIO_THUMBNAIL_NAME}').read_bytes()
 
 
 async def _resolve_back_chain(*steps: BackStep, fallback: Callable[[], Awaitable[None]]) -> None:
@@ -801,11 +798,8 @@ async def _send_variant_audio(
             chat_id=chat_id,
             audio=BufferedInputFile(
                 variants[0].audio.data,
-                filename=_variant_filename(variants[0], index=1),
+                filename=_variant_filename(variants[0]),
             ),
-            thumbnail=_audio_thumbnail(),
-            performer='\u00a0',
-            title=_variant_title(variants[0]),
         )
         return
 
@@ -815,13 +809,10 @@ async def _send_variant_audio(
             InputMediaAudio(
                 media=BufferedInputFile(
                     variant.audio.data,
-                    filename=_variant_filename(variant, index=index),
+                    filename=_variant_filename(variant),
                 ),
-                thumbnail=_audio_thumbnail(),
-                performer='\u00a0',
-                title=_variant_title(variant),
             )
-            for index, variant in enumerate(variants, start=1)
+            for variant in variants
         ],
     )
 
@@ -1058,25 +1049,13 @@ def _cover_filename(*, group: TrackGroup, track_id: str) -> str:
     return f'{TrackStore.track_identity_to_string(group, track_id)}-cover{Extension.JPG.suffix}'
 
 
-def _variant_title(variant: FetchedVariant) -> str:
+def _variant_filename(variant: FetchedVariant) -> str:
     if variant.speed < 1.0:
-        arrow = '⏪'
+        return '--'
     elif variant.speed > 1.0:
-        arrow = '⏩'
+        return '++'
     else:
         raise ValueError('Fetched track variant speed must not be 1.0')
-
-    if variant.level < 1:
-        raise ValueError('Fetched track variant level must be >= 1')
-    return arrow * variant.level * 2
-
-
-def _variant_filename(variant: FetchedVariant, *, index: int) -> str:
-    return f'{index}{variant.audio.extension.suffix}'
-
-
-def _audio_thumbnail() -> BufferedInputFile:
-    return BufferedInputFile(_AUDIO_THUMBNAIL_BYTES, filename=_AUDIO_THUMBNAIL_NAME)
 
 
 def _validate_variant_count(variants: Sequence[FetchedVariant]) -> None:
