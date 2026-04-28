@@ -381,7 +381,7 @@ def _settings(**overrides: object) -> SimpleNamespace:
 
 
 def _stored_filename(group: ClipGroup, sub_group: ClipSubGroup, clip_id: str) -> str:
-    return f'{ClipStore.clip_identity_to_string(group, sub_group, clip_id)}{Extension.MP4.suffix}'
+    return f'{ClipStore.clip_identity_to_string(group, clip_id)}{Extension.MP4.suffix}'
 
 
 def _mp4_file(data: bytes) -> FileBytes:

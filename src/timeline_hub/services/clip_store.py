@@ -1342,7 +1342,6 @@ class ClipStore:
     @staticmethod
     def clip_identity_to_string(
         group: ClipGroup,
-        sub_group: ClipSubGroup,
         clip_id: ClipId,
     ) -> str:
         """Encode logical clip identity as a strict flat string.
@@ -1352,13 +1351,12 @@ class ClipStore:
         """
         clip_id = _parse_uuid7(clip_id, field='id')
         clip_group = _CLIP_GROUP_SEPARATOR.join((group.universe.value, str(group.year), str(int(group.season))))
-        clip_sub_group = _CLIP_GROUP_SEPARATOR.join((sub_group.sub_season.value, sub_group.scope.value))
-        return '--'.join((clip_group, clip_sub_group, clip_id))
+        return '--'.join((clip_group, clip_id))
 
     @staticmethod
     def string_to_clip_identity(
         value: str,
-    ) -> tuple[ClipGroup, ClipSubGroup, ClipId]:
+    ) -> tuple[ClipGroup, ClipId]:
         """Decode a strict logical clip identity string.
 
         The input must match the exact logical identity format produced by
@@ -1373,22 +1371,17 @@ class ClipStore:
             raise InvalidClipIdentityError('clip identity `value` must not contain extensions')
 
         parts = value.split('--')
-        if len(parts) != 3:
-            raise InvalidClipIdentityError("clip identity `value` must contain exactly two '--' separators")
+        if len(parts) != 2:
+            raise InvalidClipIdentityError("clip identity `value` must contain exactly one '--' separator")
 
-        group_text, sub_group_text, clip_id_text = parts
-        if not group_text or not sub_group_text or not clip_id_text:
-            raise InvalidClipIdentityError("clip identity `value` must contain exactly two '--' separators")
+        group_text, clip_id_text = parts
+        if not group_text or not clip_id_text:
+            raise InvalidClipIdentityError("clip identity `value` must contain exactly one '--' separator")
 
         try:
             universe_text, year_text, season_text = group_text.split(_CLIP_GROUP_SEPARATOR)
         except ValueError as error:
             raise InvalidClipIdentityError('clip identity `value` has malformed group segment') from error
-
-        try:
-            sub_season_text, scope_text = sub_group_text.split(_CLIP_GROUP_SEPARATOR)
-        except ValueError as error:
-            raise InvalidClipIdentityError('clip identity `value` has malformed sub-group segment') from error
 
         try:
             universe = Universe(universe_text)
@@ -1408,18 +1401,6 @@ class ClipStore:
             raise InvalidClipIdentityError('clip identity `value` has invalid season') from error
 
         try:
-            sub_season = SubSeason(sub_season_text)
-        except ValueError as error:
-            raise InvalidClipIdentityError(
-                f'clip identity `value` has unsupported sub_season: {sub_season_text}'
-            ) from error
-
-        try:
-            scope = Scope(scope_text)
-        except ValueError as error:
-            raise InvalidClipIdentityError(f'clip identity `value` has unsupported scope: {scope_text}') from error
-
-        try:
             clip_id = _parse_uuid7(clip_id_text, field='id')
         except ValueError as error:
             message = str(error).replace('manifest `id`', 'clip identity `value`')
@@ -1427,7 +1408,6 @@ class ClipStore:
 
         return (
             ClipGroup(universe=universe, year=year, season=season),
-            ClipSubGroup(sub_season=sub_season, scope=scope),
             clip_id,
         )
 

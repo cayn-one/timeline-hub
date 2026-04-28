@@ -89,19 +89,14 @@ def test_season_from_month_uses_exact_mapping() -> None:
 
 def test_clip_identity_to_string_returns_expected_identity_string() -> None:
     group = ClipGroup(universe=Universe.WEST, year=2026, season=Season.S1)
-    sub_group = ClipSubGroup(sub_season=SubSeason.A, scope=Scope.COLLECTION)
-
-    assert ClipStore.clip_identity_to_string(group, sub_group, _UUID_1) == f'west-2026-1--A-collection--{_UUID_1}'
+    assert ClipStore.clip_identity_to_string(group, _UUID_1) == f'west-2026-1--{_UUID_1}'
 
 
 def test_clip_identity_to_string_canonicalizes_valid_uuid7_input() -> None:
     group = ClipGroup(universe=Universe.WEST, year=2026, season=Season.S1)
-    sub_group = ClipSubGroup(sub_season=SubSeason.A, scope=Scope.COLLECTION)
     non_canonical_uuid = str(uuid.UUID(_UUID_1)).upper()
 
-    assert ClipStore.clip_identity_to_string(group, sub_group, non_canonical_uuid) == (
-        f'west-2026-1--A-collection--{_UUID_1}'
-    )
+    assert ClipStore.clip_identity_to_string(group, non_canonical_uuid) == f'west-2026-1--{_UUID_1}'
 
 
 @pytest.mark.parametrize(
@@ -113,39 +108,33 @@ def test_clip_identity_to_string_canonicalizes_valid_uuid7_input() -> None:
 )
 def test_clip_identity_to_string_rejects_invalid_clip_ids(clip_id: str) -> None:
     group = ClipGroup(universe=Universe.WEST, year=2026, season=Season.S1)
-    sub_group = ClipSubGroup(sub_season=SubSeason.A, scope=Scope.COLLECTION)
 
     with pytest.raises(ValueError, match='must be a valid UUID|must be a UUIDv7'):
-        ClipStore.clip_identity_to_string(group, sub_group, clip_id)
+        ClipStore.clip_identity_to_string(group, clip_id)
 
 
 def test_clip_identity_string_round_trips() -> None:
     group = ClipGroup(universe=Universe.EAST, year=2027, season=Season.S4)
-    sub_group = ClipSubGroup(sub_season=SubSeason.D, scope=Scope.EXTRA)
-    identity = ClipStore.clip_identity_to_string(group, sub_group, _UUID_1)
+    identity = ClipStore.clip_identity_to_string(group, _UUID_1)
 
-    assert ClipStore.string_to_clip_identity(identity) == (group, sub_group, _UUID_1)
+    assert ClipStore.string_to_clip_identity(identity) == (group, _UUID_1)
 
 
 @pytest.mark.parametrize(
     ('identity', 'message'),
     [
-        ('west-2026-1-A-collection-018f05c1f1a37b348d291f53a1c9d0e1', "exactly two '--' separators"),
-        ('west-2026-1--A-collection', "exactly two '--' separators"),
-        (f'west-2026-1--A-collection--{_UUID_1}--extra', "exactly two '--' separators"),
-        (f'west-2026--A-collection--{_UUID_1}', 'malformed group segment'),
-        (f'west-2026-1-extra--A-collection--{_UUID_1}', 'malformed group segment'),
-        (f'west-2026-1--A--{_UUID_1}', 'malformed sub-group segment'),
-        (f'west-2026-1--A-collection-extra--{_UUID_1}', 'malformed sub-group segment'),
-        (f'north-2026-1--A-collection--{_UUID_1}', 'unsupported universe'),
-        (f'west-year-1--A-collection--{_UUID_1}', 'invalid year'),
-        (f'west-2026-9--A-collection--{_UUID_1}', 'invalid season'),
-        (f'west-2026-1--Z-collection--{_UUID_1}', 'unsupported sub_season'),
-        (f'west-2026-1--A-archive--{_UUID_1}', 'unsupported scope'),
-        ('west-2026-1--A-collection--not-a-uuid', 'must be a valid UUID'),
-        (f'west-2026-1--A-collection--{uuid.UUID(int=0x1234).hex}', 'must be a UUIDv7'),
-        (f'west-2026-1--A-collection--{_UUID_1}/clip', 'must not contain path separators'),
-        (f'west-2026-1--A-collection--{_UUID_1}.mp4', 'must not contain extensions'),
+        ('west-2026-1-018f05c1f1a37b348d291f53a1c9d0e1', "exactly one '--' separator"),
+        ('west-2026-1', "exactly one '--' separator"),
+        (f'west-2026-1--{_UUID_1}--extra', "exactly one '--' separator"),
+        (f'west-2026--{_UUID_1}', 'malformed group segment'),
+        (f'west-2026-1-extra--{_UUID_1}', 'malformed group segment'),
+        (f'north-2026-1--{_UUID_1}', 'unsupported universe'),
+        (f'west-year-1--{_UUID_1}', 'invalid year'),
+        (f'west-2026-9--{_UUID_1}', 'invalid season'),
+        ('west-2026-1--not-a-uuid', 'must be a valid UUID'),
+        (f'west-2026-1--{uuid.UUID(int=0x1234).hex}', 'must be a UUIDv7'),
+        (f'west-2026-1--{_UUID_1}/clip', 'must not contain path separators'),
+        (f'west-2026-1--{_UUID_1}.mp4', 'must not contain extensions'),
     ],
 )
 def test_string_to_clip_identity_rejects_malformed_values(identity: str, message: str) -> None:

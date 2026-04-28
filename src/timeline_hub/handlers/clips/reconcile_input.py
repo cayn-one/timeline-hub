@@ -43,7 +43,7 @@ def _parse_reconcile_filename_batches(
         clip_id_batch: list[ClipId] = []
         for filename in batch:
             identity_str = filename.rsplit('.', 1)[0] if '.' in filename else filename
-            parsed_group, _parsed_sub_group, clip_id = ClipStore.string_to_clip_identity(identity_str)
+            parsed_group, clip_id = ClipStore.string_to_clip_identity(identity_str)
             if clip_group is None:
                 clip_group = parsed_group
             elif parsed_group != clip_group:

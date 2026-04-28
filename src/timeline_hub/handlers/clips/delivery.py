@@ -64,5 +64,5 @@ def audio_normalization_from_settings(*, settings: Settings) -> AudioNormalizati
 
 
 def _fetched_clip_filename(group: ClipGroup, sub_group: ClipSubGroup, clip_id: str) -> str:
-    identity = ClipStore.clip_identity_to_string(group, sub_group, clip_id)
+    identity = ClipStore.clip_identity_to_string(group, clip_id)
     return f'{identity}{Extension.MP4.suffix}'
