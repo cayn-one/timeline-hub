@@ -298,7 +298,7 @@ class _RecordingTrackBot:
     def __init__(self, events: list[tuple[str, object]]) -> None:
         self.events = events
 
-    async def send_photo(self, *, chat_id: int, photo, caption: str) -> None:
+    async def send_photo(self, *, chat_id: int, photo, caption: str, caption_entities=None, parse_mode=None) -> None:
         self.events.append(
             (
                 'photo',
@@ -307,6 +307,10 @@ class _RecordingTrackBot:
                     'filename': photo.filename,
                     'data': photo.data,
                     'caption': caption,
+                    'caption_entities': None
+                    if caption_entities is None
+                    else [entity.model_dump(exclude_none=True) for entity in caption_entities],
+                    'parse_mode': parse_mode,
                 },
             )
         )
@@ -1357,7 +1361,18 @@ async def test_track_retrieve_sub_season_selection_fetches_all_before_sending_an
                 'chat_id': 9,
                 'filename': f'{track_store_module.TrackStore.track_identity_to_string(group, track_2.id)}-cover.jpg',
                 'data': b'cover-2',
-                'caption': 'Second',
+                'caption': '·Second',
+                'caption_entities': [
+                    {
+                        'type': 'text_link',
+                        'offset': 0,
+                        'length': 1,
+                        'url': (
+                            f'https://{track_store_module.TrackStore.track_identity_to_string(group, track_2.id)}.com'
+                        ),
+                    }
+                ],
+                'parse_mode': None,
             },
         ),
         (
@@ -1402,7 +1417,18 @@ async def test_track_retrieve_sub_season_selection_fetches_all_before_sending_an
                 'chat_id': 9,
                 'filename': f'{track_store_module.TrackStore.track_identity_to_string(group, track_1.id)}-cover.jpg',
                 'data': b'cover-1',
-                'caption': 'First',
+                'caption': '·First',
+                'caption_entities': [
+                    {
+                        'type': 'text_link',
+                        'offset': 0,
+                        'length': 1,
+                        'url': (
+                            f'https://{track_store_module.TrackStore.track_identity_to_string(group, track_1.id)}.com'
+                        ),
+                    }
+                ],
+                'parse_mode': None,
             },
         ),
         (

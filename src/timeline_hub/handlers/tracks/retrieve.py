@@ -14,6 +14,7 @@ from aiogram.types import (
     InputMediaAudio,
     Message,
 )
+from aiogram.utils.formatting import Text, TextLink
 
 from timeline_hub.handlers.menu import (
     back_button,
@@ -769,6 +770,15 @@ async def _send_fetched_track(
         width_factor=2.0,
         background='blur',
     )
+    track_identity = TrackStore.track_identity_to_string(group, fetched_track.track_id)
+    url = f'https://{track_identity}.com'
+    caption_kwargs = Text(
+        TextLink(
+            '·',
+            url=url,
+        ),
+        fetched_track.title,
+    ).as_caption_kwargs()
 
     await bot.send_photo(
         chat_id=chat_id,
@@ -776,7 +786,7 @@ async def _send_fetched_track(
             ui_cover_bytes,
             filename=_cover_filename(group=group, track_id=fetched_track.track_id),
         ),
-        caption=fetched_track.title,
+        **caption_kwargs,
     )
     await _send_variant_audio(
         bot=bot,
