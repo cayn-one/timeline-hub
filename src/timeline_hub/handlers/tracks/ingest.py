@@ -14,6 +14,7 @@ from loguru import logger
 from timeline_hub.handlers.menu import (
     back_button,
     callback_message,
+    create_padding_line,
     dummy_button,
     fixed_option_keyboard,
     handle_stale_selection,
@@ -21,7 +22,6 @@ from timeline_hub.handlers.menu import (
     selection_text,
     stacked_keyboard,
     validate_flow_state,
-    width_reserved_text,
 )
 from timeline_hub.handlers.tracks.store_execution import (
     TrackInputError,
@@ -235,6 +235,7 @@ async def try_dispatch_track_intake(
         **_track_intake_menu_kwargs(
             message_width=settings.message_width,
             buffer_version=services.chat_message_buffer.version(message.chat.id),
+            message_count=len(buffered_messages),
         )
     )
     return True
@@ -244,9 +245,14 @@ def _track_intake_menu_kwargs(
     *,
     message_width: int,
     buffer_version: int,
+    message_count: int,
 ) -> dict[str, Any]:
     return {
-        **width_reserved_text(text='', message_width=message_width),
+        **Text(
+            create_padding_line(message_width),
+            '\n',
+            Text('Messages: ', Bold(str(message_count))),
+        ).as_kwargs(),
         'reply_markup': stacked_keyboard(
             buttons=[
                 InlineKeyboardButton(
@@ -281,6 +287,7 @@ async def _show_track_intake_action_menu(
         **_track_intake_menu_kwargs(
             message_width=settings.message_width,
             buffer_version=services.chat_message_buffer.version(message.chat.id),
+            message_count=len(services.chat_message_buffer.peek_flat(message.chat.id)),
         )
     )
 

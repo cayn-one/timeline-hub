@@ -1611,7 +1611,7 @@ async def test_video_and_text_dispatch_to_clip_action_menu() -> None:
     expected = Text(
         create_padding_line(settings.message_width),
         '\n',
-        Text('Clips: ', Bold('1')),
+        Text('Messages: ', Bold('2')),
     ).as_kwargs()
     _assert_format_kwargs(
         message.answer.await_args.kwargs,
@@ -1654,7 +1654,11 @@ async def test_valid_photo_audio_pairs_dispatch_to_track_menu() -> None:
 
     await scheduler.job()
 
-    expected = {'text': f'{create_padding_line(settings.message_width)}\n·'}
+    expected = Text(
+        create_padding_line(settings.message_width),
+        '\n',
+        Text('Messages: ', Bold('4')),
+    ).as_kwargs()
     _assert_format_kwargs(message.answer.await_args.kwargs, expected)
     reply_markup = message.answer.await_args.kwargs['reply_markup']
     _assert_three_rows(reply_markup)
@@ -1694,7 +1698,11 @@ async def test_valid_out_of_order_appended_track_batch_dispatches_in_message_ord
 
     await scheduler.job()
 
-    expected = {'text': f'{create_padding_line(settings.message_width)}\n·'}
+    expected = Text(
+        create_padding_line(settings.message_width),
+        '\n',
+        Text('Messages: ', Bold('4')),
+    ).as_kwargs()
     _assert_format_kwargs(message.answer.await_args.kwargs, expected)
     reply_markup = message.answer.await_args.kwargs['reply_markup']
     _assert_three_rows(reply_markup)
@@ -1759,7 +1767,11 @@ async def test_photo_without_caption_dispatches_to_track_menu() -> None:
 
     await scheduler.job()
 
-    expected = {'text': f'{create_padding_line(settings.message_width)}\n·'}
+    expected = Text(
+        create_padding_line(settings.message_width),
+        '\n',
+        Text('Messages: ', Bold('2')),
+    ).as_kwargs()
     _assert_format_kwargs(message.answer.await_args.kwargs, expected)
     reply_markup = message.answer.await_args.kwargs['reply_markup']
     _assert_three_rows(reply_markup)
@@ -1781,7 +1793,11 @@ async def test_single_line_caption_dispatches_to_track_menu() -> None:
 
     await scheduler.job()
 
-    expected = {'text': f'{create_padding_line(settings.message_width)}\n·'}
+    expected = Text(
+        create_padding_line(settings.message_width),
+        '\n',
+        Text('Messages: ', Bold('2')),
+    ).as_kwargs()
     _assert_format_kwargs(message.answer.await_args.kwargs, expected)
     reply_markup = message.answer.await_args.kwargs['reply_markup']
     _assert_three_rows(reply_markup)
@@ -1805,7 +1821,11 @@ async def test_odd_number_of_track_candidate_messages_dispatches_to_track_menu()
 
     await scheduler.job()
 
-    expected = {'text': f'{create_padding_line(settings.message_width)}\n·'}
+    expected = Text(
+        create_padding_line(settings.message_width),
+        '\n',
+        Text('Messages: ', Bold('3')),
+    ).as_kwargs()
     _assert_format_kwargs(message.answer.await_args.kwargs, expected)
     reply_markup = message.answer.await_args.kwargs['reply_markup']
     _assert_three_rows(reply_markup)
@@ -1903,7 +1923,11 @@ async def test_photo_text_audio_dispatches_to_track_menu() -> None:
 
     await scheduler.job()
 
-    expected = {'text': f'{create_padding_line(settings.message_width)}\n·'}
+    expected = Text(
+        create_padding_line(settings.message_width),
+        '\n',
+        Text('Messages: ', Bold('3')),
+    ).as_kwargs()
     _assert_format_kwargs(message.answer.await_args.kwargs, expected)
     reply_markup = message.answer.await_args.kwargs['reply_markup']
     _assert_three_rows(reply_markup)
@@ -2004,7 +2028,11 @@ async def test_try_dispatch_track_intake_shows_menu_with_multiple_pairs() -> Non
     _assert_format_kwargs(
         message.answer.await_args.kwargs,
         {
-            'text': f'{create_padding_line(_settings().message_width)}\n·',
+            **Text(
+                create_padding_line(_settings().message_width),
+                '\n',
+                Text('Messages: ', Bold('4')),
+            ).as_kwargs(),
             'reply_markup': message.answer.await_args.kwargs['reply_markup'],
         },
     )
@@ -3374,7 +3402,7 @@ async def test_reorder_back_from_empty_state_returns_to_intake_action_menu() -> 
         Text(
             create_padding_line(35),
             '\n',
-            Text('Clips: ', Bold('5')),
+            Text('Messages: ', Bold('5')),
         ).as_kwargs(),
     )
     assert state.current_state is None
@@ -3410,7 +3438,7 @@ async def test_reorder_back_with_empty_buffer_flushes_and_shows_no_clips_receive
         state,
     )
 
-    message.edit_text.assert_awaited_once_with('No clips received', reply_markup=None)
+    message.edit_text.assert_awaited_once_with('Invalid input', reply_markup=None)
     assert services.chat_message_buffer.peek_raw(77) == []
     assert state.current_state is None
     assert state.data == {}
@@ -4995,24 +5023,11 @@ async def test_reconcile_back_from_sub_season_returns_to_clip_action_menu() -> N
         state,
     )
 
-    reply_markup = message.edit_text.await_args.kwargs['reply_markup']
-    _assert_three_rows(reply_markup)
-    assert _keyboard_rows(reply_markup) == [
-        ['Route', 'Store', 'Reorder'],
-        ['Reconcile', 'Produce', 'Compact'],
-        ['Cancel'],
-    ]
-    _assert_format_kwargs(
-        message.edit_text.await_args.kwargs,
-        Text(
-            create_padding_line(35),
-            '\n',
-            Text('Clips: ', Bold('3')),
-        ).as_kwargs(),
-    )
+    message.edit_text.assert_awaited_once_with('Invalid input', reply_markup=None)
     assert state.current_state is None
-    assert state.clear_count == 0
-    assert state.data['clip_id_batches'] == [[_CLIP_ID_1], [_CLIP_ID_2, _CLIP_ID_3]]
+    assert state.clear_count == 1
+    assert state.data == {}
+    assert services.chat_message_buffer.peek_raw(77) == []
     message.answer.assert_not_awaited()
 
 

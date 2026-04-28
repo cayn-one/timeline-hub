@@ -1173,6 +1173,7 @@ def _intake_action_menu_kwargs(
     message_width: int,
     clip_count_override: int | None = None,
 ) -> dict[str, Any] | None:
+    message_count = len(services.chat_message_buffer.peek_flat(chat_id))
     clip_count = clip_count_override
     if clip_count is None:
         clip_count = len(
@@ -1184,7 +1185,7 @@ def _intake_action_menu_kwargs(
         **Text(
             create_padding_line(message_width),
             '\n',
-            Text('Clips: ', Bold(str(clip_count))),
+            Text('Messages: ', Bold(str(message_count))),
         ).as_kwargs(),
         'reply_markup': _column_right_to_left_two_row_keyboard(
             buttons=[
@@ -1300,6 +1301,15 @@ async def _show_intake_action_menu(
     clip_count_override: int | None = None,
     preserve_state: bool = False,
 ) -> None:
+    if len(services.chat_message_buffer.peek_flat(message.chat.id)) == 0:
+        await _invalidate_intake_buffer(
+            message=message,
+            state=state,
+            services=services,
+            text='Invalid input',
+        )
+        return
+
     if preserve_state:
         await state.set_state(None)
     else:
