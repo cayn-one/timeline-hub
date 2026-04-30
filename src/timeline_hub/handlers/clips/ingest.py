@@ -174,7 +174,10 @@ async def on_intake_action(
     match callback_data.action:
         case IntakeAction.CANCEL:
             await state.clear()
-            await message.edit_text('Canceled', reply_markup=None)
+            await message.edit_text(
+                **selected_text(selected=['Cancel']),
+                reply_markup=None,
+            )
             services.chat_message_buffer.flush(message.chat.id)
 
         case IntakeAction.REORDER:
@@ -1186,6 +1189,7 @@ def _intake_action_menu_kwargs(
             create_padding_line(message_width),
             '\n',
             Text('Messages: ', Bold(str(message_count))),
+            '. Select action:',
         ).as_kwargs(),
         'reply_markup': _column_right_to_left_two_row_keyboard(
             buttons=[

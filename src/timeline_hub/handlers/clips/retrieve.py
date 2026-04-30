@@ -7,6 +7,7 @@ from aiogram.enums import ChatType
 from aiogram.filters.callback_data import CallbackData
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, InlineKeyboardButton, Message
+from aiogram.utils.formatting import Text
 
 from timeline_hub.handlers.clips.common import (
     ALL_SCOPES_CALLBACK_VALUE,
@@ -45,10 +46,11 @@ from timeline_hub.handlers.clips.flow import (
 )
 from timeline_hub.handlers.menu import (
     callback_message,
+    create_padding_line,
     handle_stale_selection,
+    selected_text,
     selection_text,
     stacked_keyboard,
-    width_reserved_text,
 )
 from timeline_hub.handlers.retrieve_common import StepOutcome
 from timeline_hub.services.clip_store import (
@@ -115,10 +117,11 @@ _PULL_FLOW = FlowMenuDefinition(
 async def on_clips(message: Message, state: FSMContext, settings: Settings) -> None:
     await state.clear()
     await message.answer(
-        **width_reserved_text(
-            text='Select action:',
-            message_width=settings.message_width,
-        ),
+        **Text(
+            create_padding_line(settings.message_width),
+            '\n',
+            'Select action:',
+        ).as_kwargs(),
         reply_markup=_retrieve_entry_reply_markup(),
     )
 
@@ -143,7 +146,10 @@ async def on_retrieve_entry(
 
     if callback_data.action is RetrieveEntryAction.CANCEL:
         await state.clear()
-        await message.edit_text('Canceled', reply_markup=None)
+        await message.edit_text(
+            **selected_text(selected=['Cancel']),
+            reply_markup=None,
+        )
         return
 
     flow = _flow_for_entry_action(callback_data.action)
@@ -969,10 +975,11 @@ def _retrieve_entry_reply_markup():
 async def _show_retrieve_entry_menu(*, message: Message, state: FSMContext, settings: Settings) -> None:
     await state.clear()
     await message.edit_text(
-        **width_reserved_text(
-            text='Select action:',
-            message_width=settings.message_width,
-        ),
+        **Text(
+            create_padding_line(settings.message_width),
+            '\n',
+            'Select action:',
+        ).as_kwargs(),
         reply_markup=_retrieve_entry_reply_markup(),
     )
 

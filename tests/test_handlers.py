@@ -538,7 +538,7 @@ def _assert_route_progress_edit(edit_call, *routes: tuple[str, ...]) -> None:
 
 def _assert_one_line_button_message(*, text: str, message_width: int) -> None:
     padding_line = create_padding_line(message_width)
-    assert text.split('\n') == [padding_line, '·']
+    assert text.split('\n') == [padding_line, 'Select action:']
 
 
 def _assert_two_line_button_message(*, text: str, top_line: str, bottom_line: str, message_width: int) -> None:
@@ -973,7 +973,9 @@ async def test_on_retrieve_entry_cancel_removes_buttons_and_shows_selected_text(
     )
 
     callback.answer.assert_awaited_once()
-    message.edit_text.assert_awaited_once_with('Canceled', reply_markup=None)
+    _assert_format_kwargs(
+        message.edit_text.await_args.kwargs, {**selected_text(selected=['Cancel']), 'reply_markup': None}
+    )
     message.delete.assert_not_awaited()
     services.clip_store.list_groups.assert_not_awaited()
     assert state.current_state is None
@@ -996,7 +998,9 @@ async def test_on_track_retrieve_entry_cancel_removes_buttons_and_shows_selected
     )
 
     callback.answer.assert_awaited_once()
-    message.edit_text.assert_awaited_once_with('Canceled', reply_markup=None)
+    _assert_format_kwargs(
+        message.edit_text.await_args.kwargs, {**selected_text(selected=['Cancel']), 'reply_markup': None}
+    )
     message.delete.assert_not_awaited()
     services.track_store.list_groups.assert_not_awaited()
     assert state.current_state is None
@@ -1624,7 +1628,9 @@ async def test_store_cancel_removes_buttons_and_shows_only_selected_cancel() -> 
     )
 
     callback.answer.assert_awaited_once()
-    message.edit_text.assert_awaited_once_with('Canceled', reply_markup=None)
+    _assert_format_kwargs(
+        message.edit_text.await_args.kwargs, {**selected_text(selected=['Cancel']), 'reply_markup': None}
+    )
     message.delete.assert_not_awaited()
     message.answer.assert_not_awaited()
     assert state.current_state is None
@@ -1654,6 +1660,7 @@ async def test_video_and_text_dispatch_to_clip_action_menu() -> None:
         create_padding_line(settings.message_width),
         '\n',
         Text('Messages: ', Bold('2')),
+        '. Select action:',
     ).as_kwargs()
     _assert_format_kwargs(
         message.answer.await_args.kwargs,
@@ -1700,6 +1707,7 @@ async def test_valid_photo_audio_pairs_dispatch_to_track_menu() -> None:
         create_padding_line(settings.message_width),
         '\n',
         Text('Messages: ', Bold('4')),
+        '. Select action:',
     ).as_kwargs()
     _assert_format_kwargs(message.answer.await_args.kwargs, expected)
     reply_markup = message.answer.await_args.kwargs['reply_markup']
@@ -1744,6 +1752,7 @@ async def test_valid_out_of_order_appended_track_batch_dispatches_in_message_ord
         create_padding_line(settings.message_width),
         '\n',
         Text('Messages: ', Bold('4')),
+        '. Select action:',
     ).as_kwargs()
     _assert_format_kwargs(message.answer.await_args.kwargs, expected)
     reply_markup = message.answer.await_args.kwargs['reply_markup']
@@ -1794,6 +1803,7 @@ async def test_audio_before_photo_dispatches_to_track_menu() -> None:
         create_padding_line(_settings().message_width),
         '\n',
         Text('Messages: ', Bold('2')),
+        '. Select action:',
     ).as_kwargs()
     _assert_format_kwargs(message.answer.await_args.kwargs, expected)
     reply_markup = message.answer.await_args.kwargs['reply_markup']
@@ -1821,6 +1831,7 @@ async def test_photo_without_caption_dispatches_to_track_menu() -> None:
         create_padding_line(settings.message_width),
         '\n',
         Text('Messages: ', Bold('2')),
+        '. Select action:',
     ).as_kwargs()
     _assert_format_kwargs(message.answer.await_args.kwargs, expected)
     reply_markup = message.answer.await_args.kwargs['reply_markup']
@@ -1847,6 +1858,7 @@ async def test_single_line_caption_dispatches_to_track_menu() -> None:
         create_padding_line(settings.message_width),
         '\n',
         Text('Messages: ', Bold('2')),
+        '. Select action:',
     ).as_kwargs()
     _assert_format_kwargs(message.answer.await_args.kwargs, expected)
     reply_markup = message.answer.await_args.kwargs['reply_markup']
@@ -1875,6 +1887,7 @@ async def test_odd_number_of_track_candidate_messages_dispatches_to_track_menu()
         create_padding_line(settings.message_width),
         '\n',
         Text('Messages: ', Bold('3')),
+        '. Select action:',
     ).as_kwargs()
     _assert_format_kwargs(message.answer.await_args.kwargs, expected)
     reply_markup = message.answer.await_args.kwargs['reply_markup']
@@ -1925,6 +1938,7 @@ async def test_photo_only_batch_dispatches_to_track_menu() -> None:
         create_padding_line(_settings().message_width),
         '\n',
         Text('Messages: ', Bold('2')),
+        '. Select action:',
     ).as_kwargs()
     _assert_format_kwargs(message.answer.await_args.kwargs, expected)
     reply_markup = message.answer.await_args.kwargs['reply_markup']
@@ -2015,6 +2029,7 @@ async def test_photo_text_audio_dispatches_to_track_menu() -> None:
         create_padding_line(settings.message_width),
         '\n',
         Text('Messages: ', Bold('3')),
+        '. Select action:',
     ).as_kwargs()
     _assert_format_kwargs(message.answer.await_args.kwargs, expected)
     reply_markup = message.answer.await_args.kwargs['reply_markup']
@@ -2041,6 +2056,7 @@ async def test_photo_and_text_batch_dispatches_to_track_menu() -> None:
         create_padding_line(settings.message_width),
         '\n',
         Text('Messages: ', Bold('2')),
+        '. Select action:',
     ).as_kwargs()
     _assert_format_kwargs(message.answer.await_args.kwargs, expected)
     reply_markup = message.answer.await_args.kwargs['reply_markup']
@@ -2113,6 +2129,7 @@ async def test_try_dispatch_track_intake_shows_menu_without_audio() -> None:
                 create_padding_line(_settings().message_width),
                 '\n',
                 Text('Messages: ', Bold('1')),
+                '. Select action:',
             ).as_kwargs(),
             'reply_markup': message.answer.await_args.kwargs['reply_markup'],
         },
@@ -2143,7 +2160,10 @@ async def test_fallback_cancel_flushes_buffer() -> None:
     )
 
     callback.answer.assert_awaited_once()
-    menu_message.edit_text.assert_awaited_once_with('Canceled', reply_markup=None)
+    _assert_format_kwargs(
+        menu_message.edit_text.await_args.kwargs,
+        {**selected_text(selected=['Cancel']), 'reply_markup': None},
+    )
     assert services.chat_message_buffer.peek_raw(42) == []
 
 
@@ -2212,6 +2232,7 @@ async def test_try_dispatch_track_intake_shows_menu_with_multiple_pairs() -> Non
                 create_padding_line(_settings().message_width),
                 '\n',
                 Text('Messages: ', Bold('4')),
+                '. Select action:',
             ).as_kwargs(),
             'reply_markup': message.answer.await_args.kwargs['reply_markup'],
         },
@@ -2250,7 +2271,8 @@ async def test_track_intake_replace_opens_replace_submenu_without_flushing() -> 
             **Text(
                 create_padding_line(_settings().message_width),
                 '\n',
-                Text('Messages: ', Bold('1')),
+                'Selected: ',
+                Bold('Replace'),
             ).as_kwargs(),
             'reply_markup': message.edit_text.await_args.kwargs['reply_markup'],
         },
@@ -2292,6 +2314,7 @@ async def test_track_intake_back_returns_to_root_menu_without_flushing() -> None
                 create_padding_line(_settings().message_width),
                 '\n',
                 Text('Messages: ', Bold('1')),
+                '. Select action:',
             ).as_kwargs(),
             'reply_markup': message.edit_text.await_args.kwargs['reply_markup'],
         },
@@ -2362,7 +2385,7 @@ async def test_track_replace_action_updates_track_audio_and_flushes_buffer(monke
     assert 'instrumental' not in track_store.update.await_args.kwargs
     _assert_format_kwargs(
         message.edit_text.await_args_list[0].kwargs,
-        _selected_kwargs('Track', 'West', '2026', '1', 'A'),
+        _selected_kwargs('Replace', 'Track', 'West', '2026', '1', 'A'),
     )
     assert message.edit_text.await_args_list[0].kwargs['reply_markup'] is None
     message.answer.assert_awaited_once_with('Done')
@@ -2426,7 +2449,7 @@ async def test_track_replace_action_updates_instrumental_and_flushes_buffer(monk
     assert 'track' not in track_store.update.await_args.kwargs
     _assert_format_kwargs(
         message.edit_text.await_args_list[0].kwargs,
-        _selected_kwargs('Instrumental', 'West', '2026', '1', 'A'),
+        _selected_kwargs('Replace', 'Instrumental', 'West', '2026', '1', 'A'),
     )
     assert message.edit_text.await_args_list[0].kwargs['reply_markup'] is None
     message.answer.assert_awaited_once_with('Done')
@@ -2541,7 +2564,7 @@ async def test_track_replace_action_hides_none_sub_season_in_selected_state(
 
     _assert_format_kwargs(
         message.edit_text.await_args_list[0].kwargs,
-        _selected_kwargs('Track', 'West', '2026', '1'),
+        _selected_kwargs('Replace', 'Track', 'West', '2026', '1'),
     )
     assert ' / None' not in message.edit_text.await_args_list[0].kwargs['text']
     assert ' / none' not in message.edit_text.await_args_list[0].kwargs['text']
@@ -3066,7 +3089,9 @@ async def test_track_intake_cancel_flushes_buffer() -> None:
     )
 
     callback.answer.assert_awaited_once()
-    message.edit_text.assert_awaited_once_with('Canceled', reply_markup=None)
+    _assert_format_kwargs(
+        message.edit_text.await_args.kwargs, {**selected_text(selected=['Cancel']), 'reply_markup': None}
+    )
     message.delete.assert_not_awaited()
     assert services.chat_message_buffer.peek_raw(42) == []
     assert state.current_state is None
@@ -3187,7 +3212,9 @@ async def test_fallback_cancel_flushes_buffer_when_current() -> None:
     )
 
     callback.answer.assert_awaited_once()
-    message.edit_text.assert_awaited_once_with('Canceled', reply_markup=None)
+    _assert_format_kwargs(
+        message.edit_text.await_args.kwargs, {**selected_text(selected=['Cancel']), 'reply_markup': None}
+    )
     message.delete.assert_not_awaited()
     assert services.chat_message_buffer.peek_raw(42) == []
     assert state.current_state is None
@@ -4461,6 +4488,7 @@ async def test_reorder_back_from_empty_state_returns_to_intake_action_menu() -> 
             create_padding_line(35),
             '\n',
             Text('Messages: ', Bold('5')),
+            '. Select action:',
         ).as_kwargs(),
     )
     assert state.current_state is None

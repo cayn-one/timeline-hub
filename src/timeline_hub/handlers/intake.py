@@ -10,6 +10,7 @@ from timeline_hub.handlers.menu import (
     callback_message,
     create_padding_line,
     handle_stale_selection,
+    selected_text,
     single_button_keyboard,
 )
 from timeline_hub.handlers.tracks.ingest import try_dispatch_track_intake
@@ -107,4 +108,7 @@ async def on_intake_fallback_cancel(
         await handle_stale_selection(message=message, state=state)
         return
     services.chat_message_buffer.flush(message.chat.id)
-    await message.edit_text('Canceled', reply_markup=None)
+    await message.edit_text(
+        **selected_text(selected=['Cancel']),
+        reply_markup=None,
+    )

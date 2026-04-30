@@ -113,7 +113,10 @@ async def on_track_intake_action(
 
     if callback_data.action is TrackIntakeAction.CANCEL:
         await state.clear()
-        await message.edit_text('Canceled', reply_markup=None)
+        await message.edit_text(
+            **selected_text(selected=['Cancel']),
+            reply_markup=None,
+        )
         services.chat_message_buffer.flush(message.chat.id)
         return
 
@@ -300,6 +303,7 @@ def _track_intake_menu_kwargs(
             create_padding_line(message_width),
             '\n',
             Text('Messages: ', Bold(str(message_count))),
+            '. Select action:',
         ).as_kwargs(),
         'reply_markup': selection_keyboard(
             buttons=[
@@ -339,7 +343,8 @@ def _track_replace_menu_kwargs(
         **Text(
             create_padding_line(message_width),
             '\n',
-            Text('Messages: ', Bold(str(message_count))),
+            'Selected: ',
+            Bold('Replace'),
         ).as_kwargs(),
         'reply_markup': selection_keyboard(
             buttons=[
@@ -716,6 +721,7 @@ async def _execute_track_update(
         owns_buffer = True
         action_label = 'Track' if action is TrackIntakeAction.TRACK else 'Instrumental'
         selected = [
+            'Replace',
             action_label,
             _format_universe(group.universe),
             str(group.year),

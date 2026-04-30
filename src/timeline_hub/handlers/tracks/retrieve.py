@@ -19,6 +19,7 @@ from aiogram.utils.formatting import Text, TextLink
 from timeline_hub.handlers.menu import (
     back_button,
     callback_message,
+    create_padding_line,
     dummy_button,
     fixed_option_keyboard,
     handle_stale_selection,
@@ -26,7 +27,6 @@ from timeline_hub.handlers.menu import (
     selection_text,
     stacked_keyboard,
     validate_flow_state,
-    width_reserved_text,
 )
 from timeline_hub.handlers.retrieve_common import StepOutcome
 from timeline_hub.infra.images import pad_image_to_width_factor
@@ -97,10 +97,11 @@ class TrackRetrieveFlow(StatesGroup):
 async def on_tracks(message: Message, state: FSMContext, settings: Settings) -> None:
     await state.clear()
     await message.answer(
-        **width_reserved_text(
-            text='Select action:',
-            message_width=settings.message_width,
-        ),
+        **Text(
+            create_padding_line(settings.message_width),
+            '\n',
+            'Select action:',
+        ).as_kwargs(),
         reply_markup=_track_entry_reply_markup(),
     )
 
@@ -125,7 +126,10 @@ async def on_retrieve_entry(
 
     if callback_data.action is RetrieveEntryAction.CANCEL:
         await state.clear()
-        await message.edit_text('Canceled', reply_markup=None)
+        await message.edit_text(
+            **selected_text(selected=['Cancel']),
+            reply_markup=None,
+        )
         return
 
     groups = await services.track_store.list_groups()
@@ -841,10 +845,11 @@ async def _show_retrieve_entry_menu(
 ) -> None:
     await state.clear()
     await message.edit_text(
-        **width_reserved_text(
-            text='Select action:',
-            message_width=settings.message_width,
-        ),
+        **Text(
+            create_padding_line(settings.message_width),
+            '\n',
+            'Select action:',
+        ).as_kwargs(),
         reply_markup=_track_entry_reply_markup(),
     )
 
