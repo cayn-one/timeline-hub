@@ -493,6 +493,7 @@ def _tracks_by_sub_season_with_id(
         track_store_module.SubSeason.A: [
             track_store_module.TrackInfo(
                 id=track_id,
+                album_id=track_id,
                 artists=('Artist',),
                 title='Title',
                 has_instrumental=False,
@@ -509,6 +510,7 @@ def _tracks_by_sub_season_with_id_and_sub_season(
         sub_season: [
             track_store_module.TrackInfo(
                 id=track_id,
+                album_id=track_id,
                 artists=('Artist',),
                 title='Title',
                 has_instrumental=False,
@@ -1034,6 +1036,7 @@ async def test_track_retrieve_flow_shows_only_existing_year_season_and_sub_seaso
                 track_store_module.SubSeason.NONE: [
                     track_store_module.TrackInfo(
                         id='018f05c1f1a37b348d291f53a1c9d101',
+                        album_id='018f05c1f1a37b348d291f53a1c9d101',
                         artists=('artist',),
                         title='none track',
                         has_instrumental=False,
@@ -1042,6 +1045,7 @@ async def test_track_retrieve_flow_shows_only_existing_year_season_and_sub_seaso
                 track_store_module.SubSeason.B: [
                     track_store_module.TrackInfo(
                         id='018f05c1f1a37b348d291f53a1c9d102',
+                        album_id='018f05c1f1a37b348d291f53a1c9d102',
                         artists=('artist',),
                         title='b track',
                         has_instrumental=False,
@@ -1264,6 +1268,7 @@ async def test_track_retrieve_removed_track_id_during_fetch_becomes_stale_select
     )
     track = track_store_module.TrackInfo(
         id='018f05c1f1a37b348d291f53a1c9d141',
+        album_id='018f05c1f1a37b348d291f53a1c9d141',
         artists=('artist',),
         title='Removed',
         has_instrumental=False,
@@ -1324,12 +1329,14 @@ async def test_track_retrieve_sub_season_selection_fetches_all_before_sending_an
     )
     track_1 = track_store_module.TrackInfo(
         id='018f05c1f1a37b348d291f53a1c9d111',
+        album_id='018f05c1f1a37b348d291f53a1c9d111',
         artists=('artist',),
         title='First',
         has_instrumental=False,
     )
     track_2 = track_store_module.TrackInfo(
         id='018f05c1f1a37b348d291f53a1c9d112',
+        album_id='018f05c1f1a37b348d291f53a1c9d112',
         artists=('artist',),
         title='Second',
         has_instrumental=True,
@@ -1530,6 +1537,7 @@ async def test_track_retrieve_invalid_sub_season_callback_becomes_stale() -> Non
             track_store_module.SubSeason.A: [
                 track_store_module.TrackInfo(
                     id='018f05c1f1a37b348d291f53a1c9d121',
+                    album_id='018f05c1f1a37b348d291f53a1c9d121',
                     artists=('artist',),
                     title='only',
                     has_instrumental=False,
@@ -1567,6 +1575,7 @@ async def test_track_retrieve_raises_value_error_when_fetched_variant_list_excee
     )
     track = track_store_module.TrackInfo(
         id='018f05c1f1a37b348d291f53a1c9d131',
+        album_id='018f05c1f1a37b348d291f53a1c9d131',
         artists=('artist',),
         title='Overflow',
         has_instrumental=False,
@@ -2556,10 +2565,15 @@ async def test_track_remove_action_multi_cover_validates_before_remove_calls() -
             return_value={
                 track_store_module.SubSeason.A: [
                     track_store_module.TrackInfo(
-                        id=first_track_id, artists=('artist',), title='title', has_instrumental=True
+                        id=first_track_id,
+                        album_id=first_track_id,
+                        artists=('artist',),
+                        title='title',
+                        has_instrumental=True,
                     ),
                     track_store_module.TrackInfo(
                         id=second_track_id,
+                        album_id=second_track_id,
                         artists=('artist 2',),
                         title='title 2',
                         has_instrumental=True,
@@ -2625,10 +2639,15 @@ async def test_track_remove_instrumental_action_multi_cover_removes_all() -> Non
             return_value={
                 track_store_module.SubSeason.A: [
                     track_store_module.TrackInfo(
-                        id=first_track_id, artists=('artist',), title='title', has_instrumental=True
+                        id=first_track_id,
+                        album_id=first_track_id,
+                        artists=('artist',),
+                        title='title',
+                        has_instrumental=True,
                     ),
                     track_store_module.TrackInfo(
                         id=second_track_id,
+                        album_id=second_track_id,
                         artists=('artist 2',),
                         title='title 2',
                         has_instrumental=True,
@@ -4238,7 +4257,7 @@ async def test_track_store_happy_path_stores_all_prepared_tracks_in_order(monkey
         _selected_kwargs('Store', 'West', str(year), '1', 'A'),
     )
     assert menu_message.edit_text.await_args_list[-1].kwargs['reply_markup'] is None
-    menu_message.answer.assert_awaited_once_with(**Text('Stored: ', Bold('2')).as_kwargs())
+    menu_message.answer.assert_awaited_once_with(text='Done')
     assert services.chat_message_buffer.peek_raw(42) == []
     assert state.current_state is None
 

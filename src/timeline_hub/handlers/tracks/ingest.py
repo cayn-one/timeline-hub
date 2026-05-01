@@ -757,7 +757,7 @@ async def _execute_track_store(
 
     await state.clear()
     services.chat_message_buffer.flush(chat_id)
-    await message.answer(**Text('Stored: ', Bold(str(len(prepared_tracks)))).as_kwargs())
+    await message.answer(text='Done')
 
 
 async def _execute_track_update(
