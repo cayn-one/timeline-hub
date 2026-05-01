@@ -57,7 +57,7 @@ async def on_buffered_relevant_message(
             )
             if handled:
                 return
-        elif has_photo:
+        elif has_photo or (has_audio and not has_video):
             handled = await try_dispatch_track_intake(
                 message=message,
                 services=services,

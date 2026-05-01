@@ -100,6 +100,51 @@ def track_count_from_store_messages(messages: Sequence[Message]) -> int:
     return len(extract_store_messages(messages)) // 2
 
 
+def extract_audio_only_store_messages(messages: Sequence[Message]) -> tuple[Message | None, Message]:
+    """Return validated audio-only store inputs as optional text + audio."""
+    if len(messages) == 0 or len(messages) > 2:
+        raise TrackInputError('Invalid input')
+    if any(
+        message.photo is not None or message.video is not None or getattr(message, 'animation', None) is not None
+        for message in messages
+    ):
+        raise TrackInputError('Invalid input')
+    text_messages = [message for message in messages if message.text is not None]
+    audio_messages = [message for message in messages if message.audio is not None]
+    if len(audio_messages) != 1 or len(text_messages) > 1:
+        raise TrackInputError('Invalid input')
+    audio_message = audio_messages[0]
+    text_message = text_messages[0] if text_messages else None
+    if len(messages) == 1:
+        if text_message is not None:
+            raise TrackInputError('Invalid input')
+        if audio_message.caption is None:
+            raise TrackInputError('Invalid input')
+        return None, audio_message
+    if len(messages) != 2 or text_message is None:
+        raise TrackInputError('Invalid input')
+    if audio_message.caption is not None:
+        raise TrackInputError('Invalid input')
+    return text_message, audio_message
+
+
+def parse_audio_only_track_metadata(
+    *, text_message: Message | None, audio_message: Message
+) -> tuple[tuple[str, ...], str]:
+    """Parse artists/title for audio-only store from a plain text message."""
+    try:
+        source = text_message.text if text_message is not None else audio_message.caption
+        return _caption_to_artists_and_title(source)
+    except TrackInputError as error:
+        raise TrackInputError('Invalid input') from error
+
+
+def validate_audio_only_store_input(messages: Sequence[Message]) -> tuple[tuple[str, ...], str]:
+    """Validate audio-only store shape and metadata without downloading files."""
+    text_message, audio_message = extract_audio_only_store_messages(messages)
+    return parse_audio_only_track_metadata(text_message=text_message, audio_message=audio_message)
+
+
 def validate_track_batch(messages: Sequence[Message]) -> list[tuple[tuple[str, ...], str]]:
     if len(messages) < 2 or len(messages) % 2 != 0:
         raise TrackInputError("Can't dispatch input")
@@ -169,6 +214,25 @@ async def prepare_tracks_from_buffer(*, bot: Bot, messages: Sequence[Message]) -
         )
 
     return prepared_tracks
+
+
+async def prepare_audio_only_track_from_buffer(
+    *,
+    bot: Bot,
+    messages: Sequence[Message],
+    album_id: str,
+) -> Track:
+    """Prepare one store-ready track for audio-only + text metadata flows."""
+    text_message, audio_message = extract_audio_only_store_messages(messages)
+    artists, title = parse_audio_only_track_metadata(text_message=text_message, audio_message=audio_message)
+    audio = await prepare_audio_from_message(bot=bot, audio_message=audio_message)
+    return Track(
+        artists=artists,
+        title=title,
+        audio=audio,
+        cover=None,
+        album_id=album_id,
+    )
 
 
 def _caption_to_artists_and_title(caption: str | None) -> tuple[tuple[str, ...], str]:
