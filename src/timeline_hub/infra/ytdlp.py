@@ -425,6 +425,33 @@ async def _download_audio_as_opus_clipped(
     normalized_url = _normalize_url(url)
     _validate_max_duration(max_duration)
     max_duration_seconds = str(max_duration.total_seconds())
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout.total_seconds()
+    source_codec = await _get_selected_audio_codec(
+        normalized_url,
+        timeout=timeout,
+    )
+    remaining_timeout_seconds = deadline - loop.time()
+    if remaining_timeout_seconds <= 0:
+        raise asyncio.TimeoutError
+    codec_is_opus = _codec_is_opus(source_codec)
+    codec_args: tuple[str, ...]
+    if codec_is_opus:
+        codec_args = (
+            '-c:a',
+            'copy',
+        )
+    else:
+        codec_args = (
+            '-c:a',
+            'libopus',
+            '-b:a',
+            '160k',
+            '-vbr',
+            'on',
+            '-compression_level',
+            '10',
+        )
 
     ytdlp_proc = await asyncio.create_subprocess_exec(
         'yt-dlp',
@@ -454,8 +481,7 @@ async def _download_audio_as_opus_clipped(
         '-t',
         max_duration_seconds,
         '-vn',
-        '-c:a',
-        'copy',
+        *codec_args,
         '-f',
         'opus',
         'pipe:1',
@@ -468,8 +494,6 @@ async def _download_audio_as_opus_clipped(
     assert ffmpeg_proc.stdin is not None
     assert ffmpeg_proc.stdout is not None
     assert ffmpeg_proc.stderr is not None
-    # We prefer stream-copy for clipped mode and keep `-c:a copy`.
-    # If source audio is not Opus-compatible for stream copy, ffmpeg fails explicitly.
     pipe_task = asyncio.create_task(_pipe_stream(ytdlp_proc.stdout, ffmpeg_proc.stdin))
     ffmpeg_stdout_task = asyncio.create_task(ffmpeg_proc.stdout.read())
     ffmpeg_stderr_task = asyncio.create_task(ffmpeg_proc.stderr.read())
@@ -485,7 +509,7 @@ async def _download_audio_as_opus_clipped(
         ytdlp_wait_task,
     )
     try:
-        async with asyncio.timeout(timeout.total_seconds()):
+        async with asyncio.timeout(remaining_timeout_seconds):
             await ffmpeg_wait_task
             ffmpeg_returncode = ffmpeg_wait_task.result()
             ffmpeg_stdout = await ffmpeg_stdout_task
@@ -560,3 +584,53 @@ async def _pipe_stream(
             await destination.wait_closed()
         except BrokenPipeError, ConnectionResetError:
             pass
+
+
+async def _get_selected_audio_codec(
+    url: str,
+    *,
+    timeout: timedelta = timedelta(seconds=30),
+) -> str | None:
+    proc = await asyncio.create_subprocess_exec(
+        'yt-dlp',
+        '--no-warnings',
+        '--print',
+        '%(acodec)s',
+        '-f',
+        'bestaudio',
+        '--skip-download',
+        '--no-playlist',
+        url,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+
+    try:
+        stdout, stderr = await asyncio.wait_for(
+            proc.communicate(),
+            timeout=timeout.total_seconds(),
+        )
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        raise
+
+    if proc.returncode != 0:
+        stderr_text = stderr.decode(errors='replace')
+        raise RuntimeError(f'yt-dlp failed: {stderr_text}')
+
+    codec = stdout.decode(errors='replace').strip()
+    if not codec:
+        return None
+    return codec
+
+
+def _codec_is_opus(codec: str | None) -> bool:
+    if codec is None:
+        return False
+    normalized = codec.strip().lower()
+    if not normalized:
+        return False
+    if normalized in {'none', 'na', 'unknown'}:
+        return False
+    return normalized == 'opus' or normalized.startswith('opus')
