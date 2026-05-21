@@ -1804,7 +1804,13 @@ async def test_store_creates_new_group_and_manifest_entry(monkeypatch: pytest.Mo
     track_key = _track_key(universe=TrackUniverse.WEST, year=2026, season=Season.S1, track_id=_UUID_1)
     cover_key = _cover_key(universe=TrackUniverse.WEST, year=2026, season=Season.S1, track_id=_UUID_1)
     cache_key = _track_group_prefix(universe=TrackUniverse.WEST, year=2026, season=Season.S1)
-    assert result is None
+    assert result == TrackInfo(
+        id=_UUID_1,
+        album_id=_UUID_1,
+        artists=('artist one', 'artist two'),
+        title='Track Title',
+        has_instrumental=False,
+    )
     assert s3_client.objects[track_key] == b'track'
     assert s3_client.objects[cover_key] == b'cover'
     expected_manifest = _manifest_payload(

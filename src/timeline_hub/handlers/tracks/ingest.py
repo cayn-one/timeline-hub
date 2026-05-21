@@ -23,6 +23,7 @@ from timeline_hub.handlers.menu import (
     selection_text,
     validate_flow_state,
 )
+from timeline_hub.handlers.tracks.retrieve import send_fetched_tracks_by_ids
 from timeline_hub.handlers.tracks.store_execution import (
     CoverLinkTrackInput,
     LinkOnlyTrackInput,
@@ -70,6 +71,8 @@ _TRACK_STORE_MODE = 'track_store'
 _TRACK_BACK_VALUE = 'back'
 _TRACK_COVER_SOURCE_AUTO = 'auto'
 _TRACK_COVER_SOURCE_ALBUM = 'album'
+_TRACK_STORE_FINAL_SKIP = 'skip'
+_TRACK_STORE_FINAL_FETCH = 'fetch'
 
 
 class TrackIntakeAction(StrEnum):
@@ -94,6 +97,11 @@ class TrackStoreAction(StrEnum):
     BACK = auto()
 
 
+class TrackStoreCompletionMode(StrEnum):
+    SKIP = auto()
+    FETCH = auto()
+
+
 class TrackStoreStep(StrEnum):
     UNIVERSE = auto()
     YEAR = auto()
@@ -101,6 +109,7 @@ class TrackStoreStep(StrEnum):
     SUB_SEASON = auto()
     COVER_SOURCE = auto()
     ALBUM = auto()
+    FINAL = auto()
 
 
 class TrackStoreCallbackData(CallbackData, prefix='track_store'):
@@ -116,6 +125,7 @@ class TrackStoreFlow(StatesGroup):
     sub_season = State()
     cover_source = State()
     album = State()
+    final = State()
 
 
 @router.callback_query(
@@ -346,16 +356,15 @@ async def on_track_store_menu(
                 await handle_stale_selection(message=message, state=state)
                 return
             if callback_data.value == _TRACK_COVER_SOURCE_AUTO:
-                await _execute_track_store_with_auto_cover(
+                await _show_store_final_menu(
                     message=message,
                     state=state,
-                    services=services,
                     settings=settings,
-                    bot=bot,
                     universe=universe,
                     year=year,
                     season=season,
                     sub_season=sub_season,
+                    from_step=TrackStoreStep.COVER_SOURCE,
                 )
                 return
             if callback_data.value == _TRACK_COVER_SOURCE_ALBUM:
@@ -382,7 +391,32 @@ async def on_track_store_menu(
             if sub_season is None:
                 await handle_stale_selection(message=message, state=state)
                 return
-            await _execute_track_store_with_album_reuse(
+            await _show_store_final_menu(
+                message=message,
+                state=state,
+                settings=settings,
+                universe=universe,
+                year=year,
+                season=season,
+                sub_season=sub_season,
+                from_step=TrackStoreStep.ALBUM,
+                album_id=callback_data.value,
+            )
+        case TrackStoreStep.FINAL:
+            selection = _selected_universe_year_season(data)
+            if selection is None:
+                await handle_stale_selection(message=message, state=state)
+                return
+            universe, year, season = selection
+            sub_season = _selected_sub_season(data)
+            if sub_season is None:
+                await handle_stale_selection(message=message, state=state)
+                return
+            completion_mode = _parse_track_store_completion_mode(callback_data.value)
+            if completion_mode is None:
+                await handle_stale_selection(message=message, state=state)
+                return
+            await _execute_track_store_final_selection(
                 message=message,
                 state=state,
                 services=services,
@@ -392,7 +426,8 @@ async def on_track_store_menu(
                 year=year,
                 season=season,
                 sub_season=sub_season,
-                album_id=callback_data.value,
+                completion_mode=completion_mode,
+                data=data,
             )
 
 
@@ -852,6 +887,152 @@ async def _show_store_cover_source_menu(
     )
 
 
+async def _show_store_final_menu(
+    *,
+    message: Message,
+    state: FSMContext,
+    settings: Settings,
+    universe: TrackUniverse,
+    year: int,
+    season: Season,
+    sub_season: SubSeason,
+    from_step: TrackStoreStep,
+    album_id: str | None = None,
+) -> None:
+    selected = _selected_store_path(
+        universe=universe,
+        year=year,
+        season=season,
+        sub_season=sub_season,
+    )
+    if from_step is TrackStoreStep.COVER_SOURCE:
+        selected.append('Auto')
+    if from_step is TrackStoreStep.ALBUM:
+        selected.append('Album')
+    await _set_track_store_context(
+        state=state,
+        fsm_state=TrackStoreFlow.final,
+        menu_message_id=message.message_id,
+        buffer_version=_buffer_version_from_state(await state.get_data()),
+        universe=universe,
+        year=year,
+        season=season,
+        sub_season=sub_season,
+    )
+    await state.update_data(
+        final_from_step=from_step.value,
+        final_album_id=album_id,
+    )
+    await message.edit_text(
+        **selection_text(
+            selected=selected,
+            prompt='Select finish mode:',
+            message_width=settings.message_width,
+        ),
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text='Skip',
+                        callback_data=TrackStoreCallbackData(
+                            action=TrackStoreAction.SELECT,
+                            step=TrackStoreStep.FINAL,
+                            value=_TRACK_STORE_FINAL_SKIP,
+                        ).pack(),
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        text='Fetch',
+                        callback_data=TrackStoreCallbackData(
+                            action=TrackStoreAction.SELECT,
+                            step=TrackStoreStep.FINAL,
+                            value=_TRACK_STORE_FINAL_FETCH,
+                        ).pack(),
+                    ),
+                ],
+                [
+                    back_button(
+                        callback_data=TrackStoreCallbackData(
+                            action=TrackStoreAction.BACK,
+                            step=TrackStoreStep.FINAL,
+                            value=_TRACK_BACK_VALUE,
+                        ).pack(),
+                    )
+                ],
+            ]
+        ),
+    )
+
+
+async def _execute_track_store_final_selection(
+    *,
+    message: Message,
+    state: FSMContext,
+    services: Services,
+    settings: Settings,
+    bot: Bot,
+    universe: TrackUniverse,
+    year: int,
+    season: Season,
+    sub_season: SubSeason,
+    completion_mode: TrackStoreCompletionMode,
+    data: dict[str, object],
+) -> None:
+    final_from_step = _final_from_step(data)
+    if final_from_step is None:
+        await handle_stale_selection(message=message, state=state)
+        return
+    if final_from_step is TrackStoreStep.SUB_SEASON:
+        await _on_store_sub_season_selected_with_mode(
+            message=message,
+            state=state,
+            services=services,
+            settings=settings,
+            bot=bot,
+            sub_season=sub_season,
+            universe=universe,
+            year=year,
+            season=season,
+            completion_mode=completion_mode,
+        )
+        return
+    if final_from_step is TrackStoreStep.COVER_SOURCE:
+        await _execute_track_store_with_auto_cover(
+            message=message,
+            state=state,
+            services=services,
+            settings=settings,
+            bot=bot,
+            universe=universe,
+            year=year,
+            season=season,
+            sub_season=sub_season,
+            completion_mode=completion_mode,
+        )
+        return
+    if final_from_step is TrackStoreStep.ALBUM:
+        album_id = _final_album_id(data)
+        if album_id is None:
+            await handle_stale_selection(message=message, state=state)
+            return
+        await _execute_track_store_with_album_reuse(
+            message=message,
+            state=state,
+            services=services,
+            settings=settings,
+            bot=bot,
+            universe=universe,
+            year=year,
+            season=season,
+            sub_season=sub_season,
+            album_id=album_id,
+            completion_mode=completion_mode,
+        )
+        return
+    await handle_stale_selection(message=message, state=state)
+
+
 async def _handle_track_store_back(
     *,
     message: Message,
@@ -950,6 +1131,68 @@ async def _handle_track_store_back(
                     year=year,
                     season=season,
                 )
+        case TrackStoreStep.FINAL:
+            final_from_step = _final_from_step(data)
+            if final_from_step is None:
+                await handle_stale_selection(message=message, state=state)
+                return
+            if final_from_step is TrackStoreStep.SUB_SEASON:
+                selection = _selected_universe_year_season(data)
+                if selection is None:
+                    await handle_stale_selection(message=message, state=state)
+                    return
+                universe, year, season = selection
+                await _show_store_sub_season_menu(
+                    message=message,
+                    state=state,
+                    settings=settings,
+                    buffer_version=_buffer_version_from_state(data),
+                    universe=universe,
+                    year=year,
+                    season=season,
+                )
+                return
+            if final_from_step is TrackStoreStep.COVER_SOURCE:
+                selection = _selected_universe_year_season(data)
+                sub_season = _selected_sub_season(data)
+                if selection is None or sub_season is None:
+                    await handle_stale_selection(message=message, state=state)
+                    return
+                universe, year, season = selection
+                await _show_store_cover_source_menu(
+                    message=message,
+                    state=state,
+                    settings=settings,
+                    universe=universe,
+                    year=year,
+                    season=season,
+                    sub_season=sub_season,
+                    buffer_version=_buffer_version_from_state(data),
+                )
+                return
+            if final_from_step is TrackStoreStep.ALBUM:
+                selection = _selected_universe_year_season(data)
+                sub_season = _selected_sub_season(data)
+                if selection is None or sub_season is None:
+                    await handle_stale_selection(message=message, state=state)
+                    return
+                universe, year, season = selection
+                try:
+                    await _show_store_album_menu(
+                        message=message,
+                        state=state,
+                        services=services,
+                        settings=settings,
+                        universe=universe,
+                        year=year,
+                        season=season,
+                        sub_season=sub_season,
+                        buffer_version=_buffer_version_from_state(data),
+                    )
+                except TrackInputError:
+                    await handle_stale_selection(message=message, state=state)
+                return
+            await handle_stale_selection(message=message, state=state)
 
 
 async def _execute_track_store(
@@ -957,11 +1200,13 @@ async def _execute_track_store(
     message: Message,
     state: FSMContext,
     services: Services,
+    settings: Settings,
     bot: Bot,
     sub_season: SubSeason,
     universe: TrackUniverse,
     year: int,
     season: Season,
+    completion_mode: TrackStoreCompletionMode = TrackStoreCompletionMode.SKIP,
 ) -> None:
     chat_id = message.chat.id
     expected_version = _buffer_version_from_state(await state.get_data())
@@ -1001,10 +1246,12 @@ async def _execute_track_store(
     # Multi-track store is best-effort convenience only.
     # Atomicity is per track, so partial success is allowed and reported.
     stored_titles: list[str] = []
+    stored_track_infos: list[TrackInfo] = []
     try:
         for track in prepared_tracks:
-            await services.track_store.store(group, sub_season, track=track)
+            stored_info = await services.track_store.store(group, sub_season, track=track)
             stored_titles.append(track.title)
+            stored_track_infos.append(stored_info)
     except Exception:
         logger.exception('Track store failed')
         await state.clear()
@@ -1017,7 +1264,15 @@ async def _execute_track_store(
 
     await state.clear()
     services.chat_message_buffer.flush(chat_id)
-    await message.answer(text='Done')
+    await _complete_track_store(
+        message=message,
+        services=services,
+        settings=settings,
+        bot=bot,
+        completion_mode=completion_mode,
+        group=group,
+        stored_track_infos=stored_track_infos,
+    )
 
 
 async def _on_store_sub_season_selected(
@@ -1032,6 +1287,33 @@ async def _on_store_sub_season_selected(
     year: int,
     season: Season,
 ) -> None:
+    await _on_store_sub_season_selected_with_mode(
+        message=message,
+        state=state,
+        services=services,
+        settings=settings,
+        bot=bot,
+        sub_season=sub_season,
+        universe=universe,
+        year=year,
+        season=season,
+        completion_mode=None,
+    )
+
+
+async def _on_store_sub_season_selected_with_mode(
+    *,
+    message: Message,
+    state: FSMContext,
+    services: Services,
+    settings: Settings,
+    bot: Bot,
+    sub_season: SubSeason,
+    universe: TrackUniverse,
+    year: int,
+    season: Season,
+    completion_mode: TrackStoreCompletionMode | None,
+) -> None:
     chat_id = message.chat.id
     buffered_messages = services.chat_message_buffer.peek_flat(chat_id)
     expected_version = _buffer_version_from_state(await state.get_data())
@@ -1044,6 +1326,18 @@ async def _on_store_sub_season_selected(
     except TrackInputError:
         parsed_cover_link_input = None
     if parsed_cover_link_input is not None:
+        if completion_mode is None:
+            await _show_store_final_menu(
+                message=message,
+                state=state,
+                settings=settings,
+                universe=universe,
+                year=year,
+                season=season,
+                sub_season=sub_season,
+                from_step=TrackStoreStep.SUB_SEASON,
+            )
+            return
         await _execute_track_store_with_user_cover_link(
             message=message,
             state=state,
@@ -1055,19 +1349,34 @@ async def _on_store_sub_season_selected(
             season=season,
             sub_season=sub_season,
             parsed_cover_link_input=parsed_cover_link_input,
+            completion_mode=completion_mode,
         )
         return
 
     if any(buffered_message.photo is not None for buffered_message in buffered_messages):
+        if completion_mode is None:
+            await _show_store_final_menu(
+                message=message,
+                state=state,
+                settings=settings,
+                universe=universe,
+                year=year,
+                season=season,
+                sub_season=sub_season,
+                from_step=TrackStoreStep.SUB_SEASON,
+            )
+            return
         await _execute_track_store(
             message=message,
             state=state,
             services=services,
+            settings=settings,
             bot=bot,
             sub_season=sub_season,
             universe=universe,
             year=year,
             season=season,
+            completion_mode=completion_mode,
         )
         return
 
@@ -1098,6 +1407,18 @@ async def _on_store_sub_season_selected(
                     buffer_version=expected_version,
                 )
                 return
+            if completion_mode is None:
+                await _show_store_final_menu(
+                    message=message,
+                    state=state,
+                    settings=settings,
+                    universe=universe,
+                    year=year,
+                    season=season,
+                    sub_season=sub_season,
+                    from_step=TrackStoreStep.SUB_SEASON,
+                )
+                return
             await _execute_track_store_with_auto_cover(
                 message=message,
                 state=state,
@@ -1108,6 +1429,7 @@ async def _on_store_sub_season_selected(
                 year=year,
                 season=season,
                 sub_season=sub_season,
+                completion_mode=completion_mode,
             )
             return
 
@@ -1145,6 +1467,7 @@ async def _execute_track_store_with_auto_cover(
     year: int,
     season: Season,
     sub_season: SubSeason,
+    completion_mode: TrackStoreCompletionMode = TrackStoreCompletionMode.SKIP,
 ) -> None:
     chat_id = message.chat.id
     expected_version = _buffer_version_from_state(await state.get_data())
@@ -1205,7 +1528,7 @@ async def _execute_track_store_with_auto_cover(
             cover=downloaded_result.cover,
         )
         group = TrackGroup(universe=universe, year=year, season=season)
-        await services.track_store.store(group, sub_season, track=track)
+        stored_track_info = await services.track_store.store(group, sub_season, track=track)
     except TrackInputError, TrackGroupNotFoundError:
         await _invalidate_track_intake_buffer(
             message=message,
@@ -1223,7 +1546,15 @@ async def _execute_track_store_with_auto_cover(
 
     await state.clear()
     services.chat_message_buffer.flush(chat_id)
-    await message.answer(text='Done')
+    await _complete_track_store(
+        message=message,
+        services=services,
+        settings=settings,
+        bot=bot,
+        completion_mode=completion_mode,
+        group=group,
+        stored_track_infos=[stored_track_info],
+    )
 
 
 async def _execute_track_store_with_user_cover_link(
@@ -1238,6 +1569,7 @@ async def _execute_track_store_with_user_cover_link(
     season: Season,
     sub_season: SubSeason,
     parsed_cover_link_input: CoverLinkTrackInput,
+    completion_mode: TrackStoreCompletionMode = TrackStoreCompletionMode.SKIP,
 ) -> None:
     chat_id = message.chat.id
     expected_version = _buffer_version_from_state(await state.get_data())
@@ -1309,7 +1641,7 @@ async def _execute_track_store_with_user_cover_link(
             return
 
         group = TrackGroup(universe=universe, year=year, season=season)
-        await services.track_store.store(
+        stored_track_info = await services.track_store.store(
             group,
             sub_season,
             track=Track(
@@ -1337,7 +1669,15 @@ async def _execute_track_store_with_user_cover_link(
 
     await state.clear()
     services.chat_message_buffer.flush(chat_id)
-    await message.answer(text='Done')
+    await _complete_track_store(
+        message=message,
+        services=services,
+        settings=settings,
+        bot=bot,
+        completion_mode=completion_mode,
+        group=group,
+        stored_track_infos=[stored_track_info],
+    )
 
 
 def _album_label_from_options(*, album_options: list[tuple[str, str]], album_id: str) -> str:
@@ -1378,6 +1718,7 @@ async def _execute_track_store_with_album_reuse(
     season: Season,
     sub_season: SubSeason,
     album_id: str,
+    completion_mode: TrackStoreCompletionMode = TrackStoreCompletionMode.SKIP,
 ) -> None:
     chat_id = message.chat.id
     expected_version = _buffer_version_from_state(await state.get_data())
@@ -1447,7 +1788,7 @@ async def _execute_track_store_with_album_reuse(
                 album_id=album_id,
             )
         group = TrackGroup(universe=universe, year=year, season=season)
-        await services.track_store.store(group, sub_season, track=track)
+        stored_track_info = await services.track_store.store(group, sub_season, track=track)
     except TrackInputError, TrackGroupNotFoundError:
         await _invalidate_track_intake_buffer(
             message=message,
@@ -1475,7 +1816,38 @@ async def _execute_track_store_with_album_reuse(
 
     await state.clear()
     services.chat_message_buffer.flush(chat_id)
-    await message.answer(text='Done')
+    await _complete_track_store(
+        message=message,
+        services=services,
+        settings=settings,
+        bot=bot,
+        completion_mode=completion_mode,
+        group=group,
+        stored_track_infos=[stored_track_info],
+    )
+
+
+async def _complete_track_store(
+    *,
+    message: Message,
+    services: Services,
+    settings: Settings,
+    bot: Bot,
+    completion_mode: TrackStoreCompletionMode,
+    group: TrackGroup,
+    stored_track_infos: list[TrackInfo],
+) -> None:
+    if completion_mode is TrackStoreCompletionMode.SKIP:
+        await message.answer(text='Done')
+        return
+    await send_fetched_tracks_by_ids(
+        bot=bot,
+        chat_id=message.chat.id,
+        group=group,
+        track_ids=[track_info.id for track_info in stored_track_infos],
+        services=services,
+        settings=settings,
+    )
 
 
 async def _execute_track_update(
@@ -1722,6 +2094,8 @@ def _state_for_step(step: TrackStoreStep) -> State:
             return TrackStoreFlow.cover_source
         case TrackStoreStep.ALBUM:
             return TrackStoreFlow.album
+        case TrackStoreStep.FINAL:
+            return TrackStoreFlow.final
 
 
 def _available_store_seasons(*, year: int, today: date) -> list[Season]:
@@ -1766,6 +2140,36 @@ def _selected_sub_season(data: dict[str, object]) -> SubSeason | None:
     sub_season = data.get('sub_season')
     if isinstance(sub_season, SubSeason):
         return sub_season
+    return None
+
+
+def _parse_track_store_completion_mode(value: str) -> TrackStoreCompletionMode | None:
+    if value == _TRACK_STORE_FINAL_SKIP:
+        return TrackStoreCompletionMode.SKIP
+    if value == _TRACK_STORE_FINAL_FETCH:
+        return TrackStoreCompletionMode.FETCH
+    return None
+
+
+def _final_from_step(data: dict[str, object]) -> TrackStoreStep | None:
+    raw_value = data.get('final_from_step')
+    if not isinstance(raw_value, str):
+        return None
+    try:
+        final_from_step = TrackStoreStep(raw_value)
+    except ValueError:
+        return None
+    if final_from_step not in (TrackStoreStep.SUB_SEASON, TrackStoreStep.COVER_SOURCE, TrackStoreStep.ALBUM):
+        return None
+    return final_from_step
+
+
+def _final_album_id(data: dict[str, object]) -> str | None:
+    value = data.get('final_album_id')
+    if value is None:
+        return None
+    if isinstance(value, str) and value:
+        return value
     return None
 
 

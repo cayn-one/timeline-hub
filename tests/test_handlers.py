@@ -4434,6 +4434,14 @@ async def test_track_store_happy_path_stores_all_prepared_tracks_in_order(monkey
             settings,
             bot,
         )
+    await on_track_store_menu(
+        _fake_callback(menu_message),
+        TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.FINAL, value='skip'),
+        state,
+        services,
+        settings,
+        bot,
+    )
 
     assert track_store.store.await_count == 2
     first_call, second_call = track_store.store.await_args_list
@@ -4460,6 +4468,152 @@ async def test_track_store_happy_path_stores_all_prepared_tracks_in_order(monkey
     menu_message.answer.assert_awaited_once_with(text='Done')
     assert services.chat_message_buffer.peek_raw(42) == []
     assert state.current_state is None
+
+
+@pytest.mark.asyncio
+async def test_track_store_final_menu_layout_from_sub_season_path() -> None:
+    settings = _settings()
+    buffer = ChatMessageBuffer()
+    buffer.append(
+        _fake_message(chat_id=42, message_id=1, photo=_fake_photo(file_id='photo-1'), caption='Artist\nTitle'),
+        chat_id=42,
+    )
+    buffer.append(
+        _fake_message(chat_id=42, message_id=2, audio=_fake_audio(file_id='audio-1', file_name='one.mp3')),
+        chat_id=42,
+    )
+    track_store = SimpleNamespace(
+        list_tracks=AsyncMock(
+            return_value={track_store_module.SubSeason.A: []},
+        ),
+        store=AsyncMock(),
+    )
+    services = _services(clip_store=SimpleNamespace(), track_store=track_store, buffer=buffer)
+    menu_message = _fake_message(text='Select action:', chat_id=42, message_id=501)
+    state = _FakeState()
+    bot = SimpleNamespace(get_file=AsyncMock(), download_file=AsyncMock())
+    year = date.today().year - 1
+
+    await on_track_intake_action(
+        _fake_callback(menu_message),
+        TrackIntakeActionCallbackData(action=TrackIntakeAction.STORE, buffer_version=buffer.version(42)),
+        state,
+        services,
+        settings,
+    )
+    for callback_data in [
+        TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.UNIVERSE, value='west'),
+        TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.YEAR, value=str(year)),
+        TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.SEASON, value='1'),
+        TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.SUB_SEASON, value='A'),
+    ]:
+        await on_track_store_menu(_fake_callback(menu_message), callback_data, state, services, settings, bot)
+
+    assert state.current_state == TrackStoreFlow.final.state
+    assert _keyboard_rows(menu_message.edit_text.await_args.kwargs['reply_markup']) == [['Skip'], ['Fetch'], ['Back']]
+
+
+@pytest.mark.asyncio
+async def test_track_store_final_menu_layout_from_cover_source_path() -> None:
+    settings = _settings()
+    album_id = '018f05c1f1a37b348d291f53a1ca4a1'
+    track_store = SimpleNamespace(
+        list_tracks=AsyncMock(
+            return_value={
+                track_store_module.SubSeason.A: [
+                    track_store_module.TrackInfo(
+                        id='018f05c1f1a37b348d291f53a1ca4a2',
+                        album_id=album_id,
+                        artists=('artist',),
+                        title='Album A',
+                        has_instrumental=False,
+                    )
+                ]
+            }
+        ),
+        store=AsyncMock(),
+    )
+    buffer = ChatMessageBuffer()
+    buffer.append(
+        _fake_message(chat_id=42, message_id=1, text='https://www.youtube.com/watch?v=abc123\nArtist\nTitle'),
+        chat_id=42,
+    )
+    services = _services(clip_store=SimpleNamespace(), track_store=track_store, buffer=buffer)
+    menu_message = _fake_message(text='Select action:', chat_id=42, message_id=502)
+    state = _FakeState()
+    bot = SimpleNamespace(get_file=AsyncMock(), download_file=AsyncMock())
+    year = date.today().year - 1
+
+    await on_track_intake_action(
+        _fake_callback(menu_message),
+        TrackIntakeActionCallbackData(action=TrackIntakeAction.STORE, buffer_version=buffer.version(42)),
+        state,
+        services,
+        settings,
+    )
+    for callback_data in [
+        TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.UNIVERSE, value='west'),
+        TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.YEAR, value=str(year)),
+        TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.SEASON, value='1'),
+        TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.SUB_SEASON, value='A'),
+        TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.COVER_SOURCE, value='auto'),
+    ]:
+        await on_track_store_menu(_fake_callback(menu_message), callback_data, state, services, settings, bot)
+
+    assert state.current_state == TrackStoreFlow.final.state
+    assert _keyboard_rows(menu_message.edit_text.await_args.kwargs['reply_markup']) == [['Skip'], ['Fetch'], ['Back']]
+
+
+@pytest.mark.asyncio
+async def test_track_store_final_menu_layout_from_album_path() -> None:
+    settings = _settings()
+    album_id = '018f05c1f1a37b348d291f53a1ca4b1'
+    track_store = SimpleNamespace(
+        list_tracks=AsyncMock(
+            return_value={
+                track_store_module.SubSeason.A: [
+                    track_store_module.TrackInfo(
+                        id='018f05c1f1a37b348d291f53a1ca4b2',
+                        album_id=album_id,
+                        artists=('artist',),
+                        title='Album A',
+                        has_instrumental=False,
+                    )
+                ]
+            }
+        ),
+        store=AsyncMock(),
+    )
+    buffer = ChatMessageBuffer()
+    buffer.append(_fake_message(chat_id=42, message_id=1, text='Artist\nTitle'), chat_id=42)
+    buffer.append(
+        _fake_message(chat_id=42, message_id=2, audio=_fake_audio(file_id='audio-1', file_name='one.mp3')),
+        chat_id=42,
+    )
+    services = _services(clip_store=SimpleNamespace(), track_store=track_store, buffer=buffer)
+    menu_message = _fake_message(text='Select action:', chat_id=42, message_id=503)
+    state = _FakeState()
+    bot = SimpleNamespace(get_file=AsyncMock(), download_file=AsyncMock())
+    year = date.today().year - 1
+
+    await on_track_intake_action(
+        _fake_callback(menu_message),
+        TrackIntakeActionCallbackData(action=TrackIntakeAction.STORE, buffer_version=buffer.version(42)),
+        state,
+        services,
+        settings,
+    )
+    for callback_data in [
+        TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.UNIVERSE, value='west'),
+        TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.YEAR, value=str(year)),
+        TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.SEASON, value='1'),
+        TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.SUB_SEASON, value='A'),
+        TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.ALBUM, value=album_id),
+    ]:
+        await on_track_store_menu(_fake_callback(menu_message), callback_data, state, services, settings, bot)
+
+    assert state.current_state == TrackStoreFlow.final.state
+    assert _keyboard_rows(menu_message.edit_text.await_args.kwargs['reply_markup']) == [['Skip'], ['Fetch'], ['Back']]
 
 
 @pytest.mark.asyncio
@@ -4549,6 +4703,14 @@ async def test_track_store_audio_only_reuses_selected_album_cover(monkeypatch: p
         settings,
         bot,
     )
+    await on_track_store_menu(
+        _fake_callback(menu_message),
+        TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.FINAL, value='skip'),
+        state,
+        services,
+        settings,
+        bot,
+    )
 
     _assert_format_kwargs(
         menu_message.edit_text.await_args.kwargs,
@@ -4628,10 +4790,17 @@ async def test_track_store_audio_caption_fallback_reuses_selected_album_cover(
         TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.SUB_SEASON, value='A'),
     ]:
         await on_track_store_menu(_fake_callback(menu_message), callback_data, state, services, settings, bot)
-
     await on_track_store_menu(
         _fake_callback(menu_message),
         TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.ALBUM, value=selected_album_id),
+        state,
+        services,
+        settings,
+        bot,
+    )
+    await on_track_store_menu(
+        _fake_callback(menu_message),
+        TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.FINAL, value='skip'),
         state,
         services,
         settings,
@@ -5254,6 +5423,14 @@ async def test_track_store_preserves_message_id_order_even_if_buffer_out_of_orde
             settings,
             bot,
         )
+    await on_track_store_menu(
+        _fake_callback(menu_message),
+        TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.FINAL, value='skip'),
+        state,
+        services,
+        settings,
+        bot,
+    )
 
     first_call, second_call = track_store.store.await_args_list
     assert first_call.kwargs['track'].artists == ('Artist 1',)
@@ -5880,6 +6057,14 @@ async def test_track_store_photo_caption_link_with_explicit_metadata_stores_with
         TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.SUB_SEASON, value='A'),
     ]:
         await on_track_store_menu(_fake_callback(menu_message), callback_data, state, services, settings, bot)
+    await on_track_store_menu(
+        _fake_callback(menu_message),
+        TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.FINAL, value='skip'),
+        state,
+        services,
+        settings,
+        bot,
+    )
 
     download_audio_as_opus.assert_awaited_once_with(
         'https://www.youtube.com/watch?v=abc123',
@@ -5946,6 +6131,14 @@ async def test_track_store_cover_plus_link_url_only_metadata_error_invalidates_w
         TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.SUB_SEASON, value='A'),
     ]:
         await on_track_store_menu(_fake_callback(menu_message), callback_data, state, services, settings, bot)
+    await on_track_store_menu(
+        _fake_callback(menu_message),
+        TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.FINAL, value='skip'),
+        state,
+        services,
+        settings,
+        bot,
+    )
 
     menu_message.edit_text.assert_awaited_with('No artists and title available', reply_markup=None)
     assert services.chat_message_buffer.peek_raw(42) == []
@@ -6002,6 +6195,14 @@ async def test_track_store_photo_caption_link_url_only_derives_metadata_with_use
         TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.SUB_SEASON, value='A'),
     ]:
         await on_track_store_menu(_fake_callback(menu_message), callback_data, state, services, settings, bot)
+    await on_track_store_menu(
+        _fake_callback(menu_message),
+        TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.FINAL, value='skip'),
+        state,
+        services,
+        settings,
+        bot,
+    )
 
     download_audio_as_opus.assert_awaited_once_with(
         'https://www.youtube.com/watch?v=abc123',
@@ -6061,6 +6262,14 @@ async def test_track_store_photo_caption_link_with_explicit_metadata_uses_captio
         TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.SUB_SEASON, value='A'),
     ]:
         await on_track_store_menu(_fake_callback(menu_message), callback_data, state, services, settings, bot)
+    await on_track_store_menu(
+        _fake_callback(menu_message),
+        TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.FINAL, value='skip'),
+        state,
+        services,
+        settings,
+        bot,
+    )
 
     download_audio_as_opus.assert_awaited_once_with(
         'https://www.youtube.com/watch?v=abc123',
@@ -6305,6 +6514,14 @@ async def test_track_store_audio_only_missing_album_error_maps_to_invalid_input(
         settings,
         bot,
     )
+    await on_track_store_menu(
+        _fake_callback(menu_message),
+        TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.FINAL, value='skip'),
+        state,
+        services,
+        settings,
+        bot,
+    )
 
     menu_message.edit_text.assert_awaited_with('Invalid input', reply_markup=None)
     assert services.chat_message_buffer.peek_raw(42) == []
@@ -6363,7 +6580,6 @@ async def test_track_store_link_only_reuses_selected_album_cover(
         TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.SUB_SEASON, value='A'),
     ]:
         await on_track_store_menu(_fake_callback(menu_message), callback_data, state, services, settings, bot)
-
     assert download_audio_as_opus.await_count == 0
     assert track_store.store.await_count == 0
     assert state.current_state == TrackStoreFlow.cover_source.state
@@ -6391,6 +6607,14 @@ async def test_track_store_link_only_reuses_selected_album_cover(
     await on_track_store_menu(
         _fake_callback(menu_message),
         TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.ALBUM, value=album_id),
+        state,
+        services,
+        settings,
+        bot,
+    )
+    await on_track_store_menu(
+        _fake_callback(menu_message),
+        TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.FINAL, value='skip'),
         state,
         services,
         settings,
@@ -6474,10 +6698,17 @@ async def test_track_store_link_download_failure_invalidates_buffer(
         TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.SUB_SEASON, value='A'),
     ]:
         await on_track_store_menu(_fake_callback(menu_message), callback_data, state, services, settings, bot)
-
     await on_track_store_menu(
         _fake_callback(menu_message),
         TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.COVER_SOURCE, value='auto'),
+        state,
+        services,
+        settings,
+        bot,
+    )
+    await on_track_store_menu(
+        _fake_callback(menu_message),
+        TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.FINAL, value='skip'),
         state,
         services,
         settings,
@@ -6547,10 +6778,17 @@ async def test_track_store_link_download_timeout_logs_exception_and_invalidates_
         TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.SUB_SEASON, value='A'),
     ]:
         await on_track_store_menu(_fake_callback(menu_message), callback_data, state, services, settings, bot)
-
     await on_track_store_menu(
         _fake_callback(menu_message),
         TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.COVER_SOURCE, value='auto'),
+        state,
+        services,
+        settings,
+        bot,
+    )
+    await on_track_store_menu(
+        _fake_callback(menu_message),
+        TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.FINAL, value='skip'),
         state,
         services,
         settings,
@@ -6617,10 +6855,17 @@ async def test_track_store_link_only_cover_source_auto_stores_downloaded_cover(
         TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.SUB_SEASON, value='A'),
     ]:
         await on_track_store_menu(_fake_callback(menu_message), callback_data, state, services, settings, bot)
-
     await on_track_store_menu(
         _fake_callback(menu_message),
         TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.COVER_SOURCE, value='auto'),
+        state,
+        services,
+        settings,
+        bot,
+    )
+    await on_track_store_menu(
+        _fake_callback(menu_message),
+        TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.FINAL, value='skip'),
         state,
         services,
         settings,
@@ -6696,6 +6941,14 @@ async def test_track_store_link_url_only_cover_source_auto_derives_metadata(
         TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.SUB_SEASON, value='A'),
     ]:
         await on_track_store_menu(_fake_callback(menu_message), callback_data, state, services, settings, bot)
+    await on_track_store_menu(
+        _fake_callback(menu_message),
+        TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.FINAL, value='skip'),
+        state,
+        services,
+        settings,
+        bot,
+    )
 
     download_audio_as_opus.assert_awaited_once_with(
         'https://www.youtube.com/watch?v=abc123',
@@ -6761,6 +7014,14 @@ async def test_track_store_link_url_only_metadata_error_invalidates_with_specifi
         TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.SUB_SEASON, value='A'),
     ]:
         await on_track_store_menu(_fake_callback(menu_message), callback_data, state, services, settings, bot)
+    await on_track_store_menu(
+        _fake_callback(menu_message),
+        TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.FINAL, value='skip'),
+        state,
+        services,
+        settings,
+        bot,
+    )
 
     menu_message.edit_text.assert_awaited_with('No artists and title available', reply_markup=None)
     assert services.chat_message_buffer.peek_raw(42) == []
@@ -6812,6 +7073,14 @@ async def test_track_store_cover_plus_link_download_failure_invalidates_buffer(
         TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.SUB_SEASON, value='A'),
     ]:
         await on_track_store_menu(_fake_callback(menu_message), callback_data, state, services, settings, bot)
+    await on_track_store_menu(
+        _fake_callback(menu_message),
+        TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.FINAL, value='skip'),
+        state,
+        services,
+        settings,
+        bot,
+    )
 
     menu_message.edit_text.assert_awaited_with('Download failed', reply_markup=None)
     assert services.chat_message_buffer.peek_raw(42) == []
@@ -6893,6 +7162,14 @@ async def test_track_store_album_reuse_link_download_failure_invalidates_buffer(
         settings,
         bot,
     )
+    await on_track_store_menu(
+        _fake_callback(menu_message),
+        TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.FINAL, value='skip'),
+        state,
+        services,
+        settings,
+        bot,
+    )
 
     menu_message.edit_text.assert_awaited_with('Download failed', reply_markup=None)
     assert services.chat_message_buffer.peek_raw(42) == []
@@ -6950,7 +7227,6 @@ async def test_track_store_cover_source_back_returns_to_sub_season_menu() -> Non
         TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.SUB_SEASON, value='A'),
     ]:
         await on_track_store_menu(_fake_callback(menu_message), callback_data, state, services, settings, bot)
-
     await on_track_store_menu(
         _fake_callback(menu_message),
         TrackStoreCallbackData(action=TrackStoreAction.BACK, step=TrackStoreStep.COVER_SOURCE, value='back'),
@@ -6964,6 +7240,238 @@ async def test_track_store_cover_source_back_returns_to_sub_season_menu() -> Non
     assert _keyboard_rows(sub_season_menu) == [['C', 'None'], ['D', 'B', 'A'], ['Back']]
     assert state.current_state == TrackStoreFlow.sub_season.state
     track_store.store.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ('from_step', 'expected_state', 'expected_rows'),
+    [
+        (TrackStoreStep.SUB_SEASON, TrackStoreFlow.sub_season.state, [['C', 'None'], ['D', 'B', 'A'], ['Back']]),
+        (TrackStoreStep.COVER_SOURCE, TrackStoreFlow.cover_source.state, [['Auto'], ['Album'], ['Back']]),
+        (TrackStoreStep.ALBUM, TrackStoreFlow.album.state, [['Album A'], ['Back']]),
+    ],
+)
+async def test_track_store_final_back_returns_to_origin_menu(
+    from_step: TrackStoreStep,
+    expected_state: str,
+    expected_rows: list[list[str]],
+) -> None:
+    settings = _settings()
+    album_id = '018f05c1f1a37b348d291f53a1ca4c1'
+    year = date.today().year - 1
+    track_store = SimpleNamespace(
+        list_tracks=AsyncMock(
+            return_value={
+                track_store_module.SubSeason.A: [
+                    track_store_module.TrackInfo(
+                        id='018f05c1f1a37b348d291f53a1ca4c2',
+                        album_id=album_id,
+                        artists=('artist',),
+                        title='Album A',
+                        has_instrumental=False,
+                    )
+                ]
+            }
+        ),
+        store=AsyncMock(),
+    )
+    buffer = ChatMessageBuffer()
+    if from_step is TrackStoreStep.SUB_SEASON:
+        buffer.append(
+            _fake_message(chat_id=42, message_id=1, photo=_fake_photo(file_id='photo-1'), caption='Artist\nTitle'),
+            chat_id=42,
+        )
+        buffer.append(
+            _fake_message(chat_id=42, message_id=2, audio=_fake_audio(file_id='audio-1', file_name='one.mp3')),
+            chat_id=42,
+        )
+    elif from_step is TrackStoreStep.ALBUM:
+        buffer.append(_fake_message(chat_id=42, message_id=1, text='Artist\nTitle'), chat_id=42)
+        buffer.append(
+            _fake_message(chat_id=42, message_id=2, audio=_fake_audio(file_id='audio-1', file_name='one.mp3')),
+            chat_id=42,
+        )
+    else:
+        buffer.append(
+            _fake_message(chat_id=42, message_id=1, text='https://www.youtube.com/watch?v=abc123\nArtist\nTitle'),
+            chat_id=42,
+        )
+    services = _services(clip_store=SimpleNamespace(), track_store=track_store, buffer=buffer)
+    menu_message = _fake_message(text='Select action:', chat_id=42, message_id=9881)
+    state = _FakeState()
+    bot = SimpleNamespace(get_file=AsyncMock(), download_file=AsyncMock())
+
+    await on_track_intake_action(
+        _fake_callback(menu_message),
+        TrackIntakeActionCallbackData(action=TrackIntakeAction.STORE, buffer_version=buffer.version(42)),
+        state,
+        services,
+        settings,
+    )
+    base_steps = [
+        TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.UNIVERSE, value='west'),
+        TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.YEAR, value=str(year)),
+        TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.SEASON, value='1'),
+        TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.SUB_SEASON, value='A'),
+    ]
+    for callback_data in base_steps:
+        await on_track_store_menu(_fake_callback(menu_message), callback_data, state, services, settings, bot)
+
+    if from_step is TrackStoreStep.COVER_SOURCE:
+        await on_track_store_menu(
+            _fake_callback(menu_message),
+            TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.COVER_SOURCE, value='auto'),
+            state,
+            services,
+            settings,
+            bot,
+        )
+    elif from_step is TrackStoreStep.ALBUM:
+        await on_track_store_menu(
+            _fake_callback(menu_message),
+            TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.ALBUM, value=album_id),
+            state,
+            services,
+            settings,
+            bot,
+        )
+
+    await on_track_store_menu(
+        _fake_callback(menu_message),
+        TrackStoreCallbackData(action=TrackStoreAction.BACK, step=TrackStoreStep.FINAL, value='back'),
+        state,
+        services,
+        settings,
+        bot,
+    )
+
+    assert state.current_state == expected_state
+    assert _keyboard_rows(menu_message.edit_text.await_args.kwargs['reply_markup']) == expected_rows
+
+
+@pytest.mark.asyncio
+async def test_track_store_final_back_from_album_stale_when_album_options_disappear() -> None:
+    settings = _settings()
+    album_id = '018f05c1f1a37b348d291f53a1ca4e1'
+    year = date.today().year - 1
+    track_store = SimpleNamespace(
+        list_tracks=AsyncMock(
+            side_effect=[
+                {
+                    track_store_module.SubSeason.A: [
+                        track_store_module.TrackInfo(
+                            id='018f05c1f1a37b348d291f53a1ca4e2',
+                            album_id=album_id,
+                            artists=('artist',),
+                            title='Album A',
+                            has_instrumental=False,
+                        )
+                    ]
+                },
+                {track_store_module.SubSeason.A: []},
+            ]
+        ),
+        store=AsyncMock(),
+    )
+    buffer = ChatMessageBuffer()
+    buffer.append(_fake_message(chat_id=42, message_id=1, text='Artist\nTitle'), chat_id=42)
+    buffer.append(
+        _fake_message(chat_id=42, message_id=2, audio=_fake_audio(file_id='audio-1', file_name='one.mp3')),
+        chat_id=42,
+    )
+    services = _services(clip_store=SimpleNamespace(), track_store=track_store, buffer=buffer)
+    menu_message = _fake_message(text='Select action:', chat_id=42, message_id=9883)
+    state = _FakeState()
+    bot = SimpleNamespace(get_file=AsyncMock(), download_file=AsyncMock())
+
+    await on_track_intake_action(
+        _fake_callback(menu_message),
+        TrackIntakeActionCallbackData(action=TrackIntakeAction.STORE, buffer_version=buffer.version(42)),
+        state,
+        services,
+        settings,
+    )
+    for callback_data in [
+        TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.UNIVERSE, value='west'),
+        TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.YEAR, value=str(year)),
+        TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.SEASON, value='1'),
+        TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.SUB_SEASON, value='A'),
+        TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.ALBUM, value=album_id),
+    ]:
+        await on_track_store_menu(_fake_callback(menu_message), callback_data, state, services, settings, bot)
+
+    await on_track_store_menu(
+        _fake_callback(menu_message),
+        TrackStoreCallbackData(action=TrackStoreAction.BACK, step=TrackStoreStep.FINAL, value='back'),
+        state,
+        services,
+        settings,
+        bot,
+    )
+
+    menu_message.edit_text.assert_awaited_with('Selection is no longer available', reply_markup=None)
+
+
+@pytest.mark.asyncio
+async def test_track_store_fetch_mode_uses_stored_track_ids_and_skips_done(monkeypatch: pytest.MonkeyPatch) -> None:
+    settings = _settings()
+    stored_track_id = '018f05c1f1a37b348d291f53a1ca4d1'
+    track_store = SimpleNamespace(
+        store=AsyncMock(
+            return_value=track_store_module.TrackInfo(
+                id=stored_track_id,
+                album_id='018f05c1f1a37b348d291f53a1ca4d2',
+                artists=('artist',),
+                title='title',
+                has_instrumental=False,
+            )
+        )
+    )
+    send_fetched_tracks_by_ids = AsyncMock()
+    monkeypatch.setattr(track_ingest_module, 'send_fetched_tracks_by_ids', send_fetched_tracks_by_ids)
+    monkeypatch.setattr(track_store_execution_module, 'normalize_cover_to_jpg', Mock(return_value=b'jpg'))
+    monkeypatch.setattr(track_store_execution_module, 'to_opus', AsyncMock(return_value=b'opus'))
+
+    buffer = ChatMessageBuffer()
+    buffer.append(
+        _fake_message(chat_id=42, message_id=1, photo=_fake_photo(file_id='photo-1'), caption='A\nB'), chat_id=42
+    )
+    buffer.append(
+        _fake_message(chat_id=42, message_id=2, audio=_fake_audio(file_id='audio-1', file_name='one.mp3')),
+        chat_id=42,
+    )
+    services = _services(clip_store=SimpleNamespace(), track_store=track_store, buffer=buffer)
+    menu_message = _fake_message(text='Select action:', chat_id=42, message_id=9882)
+    state = _FakeState()
+    bot = SimpleNamespace(
+        get_file=AsyncMock(
+            side_effect=[SimpleNamespace(file_path='cover-path'), SimpleNamespace(file_path='audio-path')]
+        ),
+        download_file=AsyncMock(side_effect=[BytesIO(b'cover'), BytesIO(b'audio')]),
+    )
+    year = date.today().year - 1
+
+    await on_track_intake_action(
+        _fake_callback(menu_message),
+        TrackIntakeActionCallbackData(action=TrackIntakeAction.STORE, buffer_version=buffer.version(42)),
+        state,
+        services,
+        settings,
+    )
+    for callback_data in [
+        TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.UNIVERSE, value='west'),
+        TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.YEAR, value=str(year)),
+        TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.SEASON, value='1'),
+        TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.SUB_SEASON, value='A'),
+        TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.FINAL, value='fetch'),
+    ]:
+        await on_track_store_menu(_fake_callback(menu_message), callback_data, state, services, settings, bot)
+
+    send_fetched_tracks_by_ids.assert_awaited_once()
+    kwargs = send_fetched_tracks_by_ids.await_args.kwargs
+    assert kwargs['track_ids'] == [stored_track_id]
+    assert kwargs['chat_id'] == 42
+    menu_message.answer.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -7006,6 +7514,14 @@ async def test_track_store_link_only_without_albums_executes_auto_immediately(
         TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.SUB_SEASON, value='A'),
     ]:
         await on_track_store_menu(_fake_callback(menu_message), callback_data, state, services, settings, bot)
+    await on_track_store_menu(
+        _fake_callback(menu_message),
+        TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.FINAL, value='skip'),
+        state,
+        services,
+        settings,
+        bot,
+    )
 
     download_audio_as_opus.assert_awaited_once_with(
         'https://www.youtube.com/watch?v=abc123',
@@ -7073,6 +7589,14 @@ async def test_track_store_link_only_missing_group_executes_auto_immediately(
         TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.SUB_SEASON, value='A'),
     ]:
         await on_track_store_menu(_fake_callback(menu_message), callback_data, state, services, settings, bot)
+    await on_track_store_menu(
+        _fake_callback(menu_message),
+        TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.FINAL, value='skip'),
+        state,
+        services,
+        settings,
+        bot,
+    )
 
     download_audio_as_opus.assert_awaited_once_with(
         'https://www.youtube.com/watch?v=tDoVzwp-f_g&pp=ygUQYnJpbCBOb3cgaXQgZ29lcw%3D%3D',
@@ -7203,6 +7727,14 @@ async def test_track_store_partial_failure_reports_stored_titles_and_flushes_buf
     await on_track_store_menu(
         _fake_callback(menu_message),
         TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.SUB_SEASON, value='A'),
+        state,
+        services,
+        settings,
+        bot,
+    )
+    await on_track_store_menu(
+        _fake_callback(menu_message),
+        TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.FINAL, value='skip'),
         state,
         services,
         settings,

@@ -1401,7 +1401,7 @@ class TrackStore:
         *,
         track: Track,
         preset_id: PresetId | None = None,
-    ) -> None:
+    ) -> TrackInfo:
         """Store one original track plus its mandatory per-track cover object.
 
         `track.audio` must be Opus `FileBytes` and is persisted under a
@@ -1552,6 +1552,13 @@ class TrackStore:
             )
             sync_error.add_note(f'Original manifest write error: {error!r}')
             raise sync_error from error
+        return TrackInfo(
+            id=track_id,
+            album_id=album_id,
+            artists=track.artists,
+            title=track.title,
+            has_instrumental=False,
+        )
 
     async def update(
         self,

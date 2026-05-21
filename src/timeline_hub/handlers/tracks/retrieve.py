@@ -40,6 +40,7 @@ from timeline_hub.services.track_store import (
     SubSeason,
     TrackGroup,
     TrackGroupNotFoundError,
+    TrackId,
     TrackInfo,
     TrackStore,
     TrackUniverse,
@@ -736,28 +737,42 @@ async def _execute_track_get(
     )
     await state.clear()
 
-    fetched_tracks: list[FetchedVariants] = []
     try:
-        for track_info in track_infos:
-            try:
-                fetched_tracks.append(await services.track_store.fetch(group, track_info.id))
-            except ValueError as error:
-                missing_track_error = (
-                    f'Track id {track_info.id} does not exist in group '
-                    f'{group.universe.value}-{group.year}-{int(group.season)}'
-                )
-                if str(error) != missing_track_error:
-                    raise
-                await handle_stale_selection(message=message, state=state)
-                return
+        await send_fetched_tracks_by_ids(
+            bot=bot,
+            chat_id=message.chat.id,
+            group=group,
+            track_ids=[track_info.id for track_info in track_infos],
+            services=services,
+            settings=settings,
+        )
+    except ValueError as error:
+        # Track ids in menu state can become stale between selection and fetch.
+        if not _is_missing_track_error(error):
+            raise
+        await handle_stale_selection(message=message, state=state)
+        return
     except TrackGroupNotFoundError:
         await handle_stale_selection(message=message, state=state)
         return
 
+
+async def send_fetched_tracks_by_ids(
+    *,
+    bot: Bot,
+    chat_id: int,
+    group: TrackGroup,
+    track_ids: Sequence[TrackId],
+    services: Services,
+    settings: Settings,
+) -> None:
+    fetched_tracks: list[FetchedVariants] = []
+    for track_id in track_ids:
+        fetched_tracks.append(await services.track_store.fetch(group, track_id))
     for fetched_track in reversed(fetched_tracks):
         await _send_fetched_track(
             bot=bot,
-            chat_id=message.chat.id,
+            chat_id=chat_id,
             group=group,
             fetched_track=fetched_track,
             settings=settings,
@@ -1131,3 +1146,8 @@ def _validate_variant_count(variants: Sequence[FetchedVariant]) -> None:
         raise ValueError('Fetched track variants must not be empty')
     if len(variants) > 10:
         raise ValueError('Fetched track variants must contain at most 10 items')
+
+
+def _is_missing_track_error(error: ValueError) -> bool:
+    text = str(error)
+    return text.startswith('Track id ') and ' does not exist in group ' in text
