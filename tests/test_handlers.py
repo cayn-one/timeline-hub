@@ -6144,7 +6144,7 @@ async def test_track_store_cover_plus_link_url_only_metadata_error_invalidates_w
     assert services.chat_message_buffer.peek_raw(42) == []
     assert state.current_state is None
     track_store.store.assert_not_awaited()
-    log_exception.assert_called_once_with('Track link metadata unavailable')
+    log_exception.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -6996,6 +6996,67 @@ async def test_track_store_link_url_only_metadata_error_invalidates_with_specifi
         track_store_execution_module,
         'download_audio_as_opus',
         AsyncMock(side_effect=YtDlpMetadataError('yt-dlp produced incomplete metadata output')),
+    )
+    log_exception = Mock()
+    monkeypatch.setattr(track_ingest_module.logger, 'exception', log_exception)
+
+    await on_track_intake_action(
+        _fake_callback(menu_message),
+        TrackIntakeActionCallbackData(action=TrackIntakeAction.STORE, buffer_version=buffer.version(42)),
+        state,
+        services,
+        settings,
+    )
+    for callback_data in [
+        TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.UNIVERSE, value='west'),
+        TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.YEAR, value=str(year)),
+        TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.SEASON, value='1'),
+        TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.SUB_SEASON, value='A'),
+    ]:
+        await on_track_store_menu(_fake_callback(menu_message), callback_data, state, services, settings, bot)
+    await on_track_store_menu(
+        _fake_callback(menu_message),
+        TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.FINAL, value='skip'),
+        state,
+        services,
+        settings,
+        bot,
+    )
+
+    menu_message.edit_text.assert_awaited_with('No artists and title available', reply_markup=None)
+    assert services.chat_message_buffer.peek_raw(42) == []
+    assert state.current_state is None
+    track_store.store.assert_not_awaited()
+    log_exception.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_track_store_link_url_only_unexpected_metadata_error_logs_exception_and_invalidates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings()
+    year = date.today().year - 1
+    track_store = SimpleNamespace(
+        list_tracks=AsyncMock(return_value={track_store_module.SubSeason.B: []}),
+        store=AsyncMock(),
+    )
+    buffer = ChatMessageBuffer()
+    buffer.append(
+        _fake_message(
+            chat_id=42,
+            message_id=1,
+            text='https://www.youtube.com/watch?v=abc123',
+        ),
+        chat_id=42,
+    )
+    services = _services(clip_store=SimpleNamespace(), track_store=track_store, buffer=buffer)
+    menu_message = _fake_message(text='Select action:', chat_id=42, message_id=993)
+    state = _FakeState()
+    bot = SimpleNamespace(get_file=AsyncMock(), download_file=AsyncMock())
+    monkeypatch.setattr(
+        track_store_execution_module,
+        'download_audio_as_opus',
+        AsyncMock(side_effect=YtDlpMetadataError('yt-dlp produced invalid metadata output')),
     )
     log_exception = Mock()
     monkeypatch.setattr(track_ingest_module.logger, 'exception', log_exception)

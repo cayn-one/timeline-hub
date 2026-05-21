@@ -73,6 +73,12 @@ _TRACK_COVER_SOURCE_AUTO = 'auto'
 _TRACK_COVER_SOURCE_ALBUM = 'album'
 _TRACK_STORE_FINAL_SKIP = 'skip'
 _TRACK_STORE_FINAL_FETCH = 'fetch'
+_EXPECTED_TRACK_METADATA_UNAVAILABLE_ERRORS = frozenset(
+    {
+        'yt-dlp produced incomplete metadata output',
+        'yt-dlp did not produce metadata output',
+    }
+)
 
 
 class TrackIntakeAction(StrEnum):
@@ -116,6 +122,10 @@ class TrackStoreCallbackData(CallbackData, prefix='track_store'):
     action: TrackStoreAction
     step: TrackStoreStep
     value: str
+
+
+def _is_expected_track_metadata_unavailable(error: YtDlpMetadataError) -> bool:
+    return str(error) in _EXPECTED_TRACK_METADATA_UNAVAILABLE_ERRORS
 
 
 class TrackStoreFlow(StatesGroup):
@@ -1503,8 +1513,9 @@ async def _execute_track_store_with_auto_cover(
                 parsed_link_input=parsed_link_input,
                 metadata=downloaded_result.metadata,
             )
-        except YtDlpMetadataError:
-            logger.exception('Track link metadata unavailable')
+        except YtDlpMetadataError as error:
+            if not _is_expected_track_metadata_unavailable(error):
+                logger.exception('Track link metadata unavailable')
             await _invalidate_track_intake_buffer(
                 message=message,
                 state=state,
@@ -1621,8 +1632,9 @@ async def _execute_track_store_with_user_cover_link(
                 parsed_link_input=link_only_input,
                 metadata=downloaded_result.metadata,
             )
-        except YtDlpMetadataError:
-            logger.exception('Track link metadata unavailable')
+        except YtDlpMetadataError as error:
+            if not _is_expected_track_metadata_unavailable(error):
+                logger.exception('Track link metadata unavailable')
             await _invalidate_track_intake_buffer(
                 message=message,
                 state=state,
