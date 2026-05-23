@@ -300,7 +300,7 @@ async def download_link_audio(url: str, *, max_duration: timedelta | None = None
     try:
         result = await download_audio_as_opus(url, max_duration=max_duration)
     except Exception as error:
-        raise TrackLinkDownloadError("Can't process audio") from error
+        raise TrackLinkDownloadError(str(error)) from error
     return FileBytes(data=result.audio, extension=Extension.OPUS)
 
 

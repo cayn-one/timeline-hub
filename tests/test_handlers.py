@@ -7086,6 +7086,104 @@ async def test_track_store_link_download_failure_invalidates_buffer(
 
 
 @pytest.mark.asyncio
+async def test_download_link_audio_preserves_upstream_error_text_for_classification(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        track_store_execution_module,
+        'download_audio_as_opus',
+        AsyncMock(side_effect=RuntimeError('Use --cookies-from-browser or --cookies')),
+    )
+
+    with pytest.raises(
+        track_store_execution_module.TrackLinkDownloadError, match='--cookies-from-browser or --cookies'
+    ):
+        await track_store_execution_module.download_link_audio('https://www.youtube.com/watch?v=abc123')
+
+
+@pytest.mark.asyncio
+async def test_track_store_link_download_cookies_required_invalidates_without_logging(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings()
+    album_id = '018f05c1f1a37b348d291f53a1ca215'
+    year = date.today().year - 1
+    track_store = SimpleNamespace(
+        list_tracks=AsyncMock(
+            return_value={
+                track_store_module.SubSeason.A: [
+                    track_store_module.TrackInfo(
+                        id='018f05c1f1a37b348d291f53a1ca216',
+                        album_id=album_id,
+                        artists=('artist',),
+                        title='Album A',
+                        has_instrumental=False,
+                    )
+                ]
+            }
+        ),
+        store=AsyncMock(),
+    )
+    buffer = ChatMessageBuffer()
+    buffer.append(
+        _fake_message(
+            chat_id=42,
+            message_id=1,
+            text='https://music.youtube.com/watch?v=abc123\nArtist\nTitle',
+        ),
+        chat_id=42,
+    )
+    services = _services(clip_store=SimpleNamespace(), track_store=track_store, buffer=buffer)
+    menu_message = _fake_message(text='Select action:', chat_id=42, message_id=9862)
+    state = _FakeState()
+    bot = SimpleNamespace(get_file=AsyncMock(), download_file=AsyncMock())
+    monkeypatch.setattr(
+        track_store_execution_module,
+        'download_audio_as_opus',
+        AsyncMock(side_effect=RuntimeError('Sign in to confirm your age')),
+    )
+    log_exception = Mock()
+    monkeypatch.setattr(track_ingest_module.logger, 'exception', log_exception)
+
+    await on_track_intake_action(
+        _fake_callback(menu_message),
+        TrackIntakeActionCallbackData(action=TrackIntakeAction.STORE, buffer_version=buffer.version(42)),
+        state,
+        services,
+        settings,
+    )
+    for callback_data in [
+        TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.UNIVERSE, value='west'),
+        TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.YEAR, value=str(year)),
+        TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.SEASON, value='1'),
+        TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.SUB_SEASON, value='A'),
+    ]:
+        await on_track_store_menu(_fake_callback(menu_message), callback_data, state, services, settings, bot)
+    await on_track_store_menu(
+        _fake_callback(menu_message),
+        TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.COVER_SOURCE, value='auto'),
+        state,
+        services,
+        settings,
+        bot,
+    )
+    await on_track_store_menu(
+        _fake_callback(menu_message),
+        TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.FINAL, value='skip'),
+        state,
+        services,
+        settings,
+        bot,
+    )
+
+    menu_message.edit_text.assert_awaited_with('Cookies required', reply_markup=None)
+    assert state.current_state is None
+    assert services.chat_message_buffer.peek_raw(42) == []
+    track_store.store.assert_not_awaited()
+    log_exception.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_track_store_link_download_timeout_logs_exception_and_invalidates_buffer(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -7514,6 +7612,69 @@ async def test_track_store_cover_plus_link_download_failure_invalidates_buffer(
 
 
 @pytest.mark.asyncio
+async def test_track_store_cover_plus_link_cookies_required_invalidates_without_logging(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings()
+    year = date.today().year - 1
+    track_store = SimpleNamespace(store=AsyncMock())
+    buffer = ChatMessageBuffer()
+    buffer.append(
+        _fake_message(
+            chat_id=42,
+            message_id=1,
+            photo=_fake_photo(file_id='photo-1'),
+            caption='https://www.youtube.com/watch?v=abc123\nArtist 1\nTitle',
+        ),
+        chat_id=42,
+    )
+    services = _services(clip_store=SimpleNamespace(), track_store=track_store, buffer=buffer)
+    menu_message = _fake_message(text='Select action:', chat_id=42, message_id=9922)
+    state = _FakeState()
+    bot = SimpleNamespace(
+        get_file=AsyncMock(return_value=SimpleNamespace(file_path='cover-path-1')),
+        download_file=AsyncMock(return_value=BytesIO(b'raw-cover-1')),
+    )
+    monkeypatch.setattr(track_ingest_module, 'normalize_cover_to_jpg', Mock(return_value=b'user-cover-jpg'))
+    monkeypatch.setattr(
+        track_ingest_module,
+        'download_audio_as_opus',
+        AsyncMock(side_effect=RuntimeError('Use --cookies-from-browser or --cookies')),
+    )
+    log_exception = Mock()
+    monkeypatch.setattr(track_ingest_module.logger, 'exception', log_exception)
+
+    await on_track_intake_action(
+        _fake_callback(menu_message),
+        TrackIntakeActionCallbackData(action=TrackIntakeAction.STORE, buffer_version=buffer.version(42)),
+        state,
+        services,
+        settings,
+    )
+    for callback_data in [
+        TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.UNIVERSE, value='west'),
+        TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.YEAR, value=str(year)),
+        TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.SEASON, value='1'),
+        TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.SUB_SEASON, value='A'),
+    ]:
+        await on_track_store_menu(_fake_callback(menu_message), callback_data, state, services, settings, bot)
+    await on_track_store_menu(
+        _fake_callback(menu_message),
+        TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.FINAL, value='skip'),
+        state,
+        services,
+        settings,
+        bot,
+    )
+
+    menu_message.edit_text.assert_awaited_with('Cookies required', reply_markup=None)
+    assert services.chat_message_buffer.peek_raw(42) == []
+    assert state.current_state is None
+    track_store.store.assert_not_awaited()
+    log_exception.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_track_store_album_reuse_link_download_failure_invalidates_buffer(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -7600,6 +7761,101 @@ async def test_track_store_album_reuse_link_download_failure_invalidates_buffer(
     assert state.current_state is None
     track_store.store.assert_not_awaited()
     log_exception.assert_called_once_with('Track link audio download failed')
+
+
+@pytest.mark.asyncio
+async def test_track_store_album_reuse_link_cookies_required_invalidates_without_logging(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings()
+    album_id = '018f05c1f1a37b348d291f53a1ca313'
+    year = date.today().year - 1
+    track_store = SimpleNamespace(
+        list_tracks=AsyncMock(
+            return_value={
+                track_store_module.SubSeason.A: [
+                    track_store_module.TrackInfo(
+                        id='018f05c1f1a37b348d291f53a1ca314',
+                        album_id=album_id,
+                        artists=('artist',),
+                        title='Album A',
+                        has_instrumental=False,
+                    )
+                ]
+            }
+        ),
+        store=AsyncMock(),
+    )
+    buffer = ChatMessageBuffer()
+    buffer.append(
+        _fake_message(
+            chat_id=42,
+            message_id=1,
+            text='https://www.youtube.com/watch?v=abc123\nArtist 1\nArtist 2\nTitle',
+        ),
+        chat_id=42,
+    )
+    services = _services(clip_store=SimpleNamespace(), track_store=track_store, buffer=buffer)
+    menu_message = _fake_message(text='Select action:', chat_id=42, message_id=9932)
+    state = _FakeState()
+    bot = SimpleNamespace(get_file=AsyncMock(), download_file=AsyncMock())
+    monkeypatch.setattr(
+        track_store_execution_module,
+        'download_audio_as_opus',
+        AsyncMock(
+            side_effect=RuntimeError(
+                'Sign in to confirm your age. Use --cookies-from-browser or --cookies for the authentication.'
+            )
+        ),
+    )
+    log_exception = Mock()
+    monkeypatch.setattr(track_ingest_module.logger, 'exception', log_exception)
+
+    await on_track_intake_action(
+        _fake_callback(menu_message),
+        TrackIntakeActionCallbackData(action=TrackIntakeAction.STORE, buffer_version=buffer.version(42)),
+        state,
+        services,
+        settings,
+    )
+    for callback_data in [
+        TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.UNIVERSE, value='west'),
+        TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.YEAR, value=str(year)),
+        TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.SEASON, value='1'),
+        TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.SUB_SEASON, value='A'),
+    ]:
+        await on_track_store_menu(_fake_callback(menu_message), callback_data, state, services, settings, bot)
+
+    await on_track_store_menu(
+        _fake_callback(menu_message),
+        TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.COVER_SOURCE, value='album'),
+        state,
+        services,
+        settings,
+        bot,
+    )
+    await on_track_store_menu(
+        _fake_callback(menu_message),
+        TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.ALBUM, value=album_id),
+        state,
+        services,
+        settings,
+        bot,
+    )
+    await on_track_store_menu(
+        _fake_callback(menu_message),
+        TrackStoreCallbackData(action=TrackStoreAction.SELECT, step=TrackStoreStep.FINAL, value='skip'),
+        state,
+        services,
+        settings,
+        bot,
+    )
+
+    menu_message.edit_text.assert_awaited_with('Cookies required', reply_markup=None)
+    assert services.chat_message_buffer.peek_raw(42) == []
+    assert state.current_state is None
+    track_store.store.assert_not_awaited()
+    log_exception.assert_not_called()
 
 
 @pytest.mark.asyncio

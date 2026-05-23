@@ -122,7 +122,7 @@ def _configure_logging() -> None:
     logger.remove()
     logger.add(
         sys.stderr,
-        format='{message}',
+        format='{time:HH:mm:ss}: {message}',
         enqueue=True,
         backtrace=False,
         diagnose=False,
