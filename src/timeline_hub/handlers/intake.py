@@ -14,7 +14,10 @@ from timeline_hub.handlers.menu import (
     single_button_keyboard,
 )
 from timeline_hub.handlers.tracks.ingest import try_dispatch_track_intake
-from timeline_hub.handlers.tracks.store_execution import is_supported_youtube_store_url
+from timeline_hub.handlers.tracks.store_execution import (
+    extract_track_audio_attachment,
+    is_supported_youtube_store_url,
+)
 from timeline_hub.services.container import Services
 from timeline_hub.settings import Settings
 
@@ -26,7 +29,7 @@ class IntakeFallbackCallbackData(CallbackData, prefix='intake_fallback'):
     buffer_version: int
 
 
-@router.message(F.chat.type == ChatType.PRIVATE, F.text | F.photo | F.audio | F.video)
+@router.message(F.chat.type == ChatType.PRIVATE, F.text | F.photo | F.audio | F.document | F.video)
 async def on_buffered_relevant_message(
     message: Message,
     services: Services,
@@ -39,14 +42,17 @@ async def on_buffered_relevant_message(
         ordered_buffered_messages = services.chat_message_buffer.peek_flat(chat_id)
         message_count = len(ordered_buffered_messages)
         has_photo = any(buffered_message.photo is not None for buffered_message in ordered_buffered_messages)
-        has_audio = any(buffered_message.audio is not None for buffered_message in ordered_buffered_messages)
+        has_track_audio_candidate = any(
+            extract_track_audio_attachment(buffered_message) is not None
+            for buffered_message in ordered_buffered_messages
+        )
         has_video = any(
             buffered_message.video is not None or getattr(buffered_message, 'animation', None) is not None
             for buffered_message in ordered_buffered_messages
         )
         text_messages = [buffered_message for buffered_message in ordered_buffered_messages if buffered_message.text]
 
-        if has_video and (has_photo or has_audio):
+        if has_video and (has_photo or has_track_audio_candidate):
             services.chat_message_buffer.flush(chat_id)
             await message.answer(text="Can't dispatch")
             return
@@ -59,7 +65,7 @@ async def on_buffered_relevant_message(
             )
             if handled:
                 return
-        elif has_photo or (has_audio and not has_video):
+        elif has_photo or (has_track_audio_candidate and not has_video):
             handled = await try_dispatch_track_intake(
                 message=message,
                 services=services,

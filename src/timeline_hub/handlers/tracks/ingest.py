@@ -34,6 +34,7 @@ from timeline_hub.handlers.tracks.store_execution import (
     extract_photo_messages_for_remove,
     extract_single_photo_audio_messages,
     extract_store_messages,
+    extract_track_audio_attachment,
     extract_track_identity_from_photo_message,
     is_supported_youtube_store_url,
     parse_cover_link_store_input,
@@ -2247,7 +2248,7 @@ def _validate_store_input_at_entry(messages: list[Message]) -> None:
         message.video is not None or getattr(message, 'animation', None) is not None for message in messages
     )
     has_photo = any(message.photo is not None for message in messages)
-    has_audio = any(message.audio is not None for message in messages)
+    has_audio = any(extract_track_audio_attachment(message) is not None for message in messages)
     if has_video:
         raise TrackInputError('Invalid input')
     try:

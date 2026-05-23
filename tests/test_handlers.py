@@ -457,6 +457,7 @@ def _fake_message(
     caption: str | None = None,
     caption_entities=None,
     audio=None,
+    document=None,
     photo=None,
     video=None,
     media_group_id: str | None = None,
@@ -467,6 +468,7 @@ def _fake_message(
         text=text,
         video=video,
         audio=audio,
+        document=document,
         photo=photo,
         media_group_id=media_group_id,
         caption=caption,
@@ -483,6 +485,10 @@ def _fake_video(*, file_id: str, file_name: str | None) -> SimpleNamespace:
 
 
 def _fake_audio(*, file_id: str, file_name: str | None) -> SimpleNamespace:
+    return SimpleNamespace(file_id=file_id, file_name=file_name)
+
+
+def _fake_document(*, file_id: str, file_name: str | None) -> SimpleNamespace:
     return SimpleNamespace(file_id=file_id, file_name=file_name)
 
 
@@ -2043,6 +2049,117 @@ async def test_audio_only_batch_dispatches_to_track_menu() -> None:
     _assert_three_rows(reply_markup)
     assert _keyboard_rows(reply_markup) == [['Store'], ['Remove', 'Replace'], ['Cancel']]
     assert [buffered_message.message_id for buffered_message in services.chat_message_buffer.peek_raw(42)] == [1, 2]
+
+
+@pytest.mark.asyncio
+async def test_supported_audio_document_only_batch_dispatches_to_track_menu() -> None:
+    scheduler = _FakeScheduler()
+    buffer = ChatMessageBuffer()
+    services = _services(clip_store=SimpleNamespace(), scheduler=scheduler, buffer=buffer)
+    message = _fake_message(
+        chat_id=42,
+        message_id=2,
+        document=_fake_document(file_id='document-1', file_name='one.wav'),
+    )
+
+    await on_buffered_relevant_message(message, services, _settings())
+    assert scheduler.job is not None
+
+    await scheduler.job()
+
+    expected = Text(
+        create_padding_line(_settings().message_width),
+        '\n',
+        Text('Messages: ', Bold('1')),
+        '. Select action:',
+    ).as_kwargs()
+    _assert_format_kwargs(message.answer.await_args.kwargs, expected)
+    reply_markup = message.answer.await_args.kwargs['reply_markup']
+    _assert_three_rows(reply_markup)
+    assert _keyboard_rows(reply_markup) == [['Store'], ['Remove', 'Replace'], ['Cancel']]
+    assert [buffered_message.message_id for buffered_message in services.chat_message_buffer.peek_raw(42)] == [2]
+
+
+@pytest.mark.asyncio
+async def test_unsupported_document_only_batch_shows_fallback_menu() -> None:
+    scheduler = _FakeScheduler()
+    buffer = ChatMessageBuffer()
+    services = _services(clip_store=SimpleNamespace(), scheduler=scheduler, buffer=buffer)
+    message = _fake_message(
+        chat_id=42,
+        message_id=2,
+        document=_fake_document(file_id='document-1', file_name='one.zip'),
+    )
+
+    await on_buffered_relevant_message(message, services, _settings())
+    assert scheduler.job is not None
+
+    await scheduler.job()
+
+    expected = Text(
+        create_padding_line(_settings().message_width),
+        '\n',
+        Text('Messages: ', Bold('1')),
+    ).as_kwargs()
+    _assert_format_kwargs(message.answer.await_args.kwargs, expected)
+    assert _keyboard_rows(message.answer.await_args.kwargs['reply_markup']) == [['Cancel']]
+
+
+@pytest.mark.asyncio
+async def test_video_and_supported_audio_document_batch_is_rejected_and_flushed() -> None:
+    scheduler = _FakeScheduler()
+    buffer = ChatMessageBuffer()
+    services = _services(clip_store=SimpleNamespace(), scheduler=scheduler, buffer=buffer)
+    first_message = _fake_message(
+        chat_id=42,
+        message_id=1,
+        document=_fake_document(file_id='document-1', file_name='one.flac'),
+    )
+    message = _fake_message(chat_id=42, message_id=2, video=_fake_video(file_id='video-1', file_name='clip.mp4'))
+
+    await on_buffered_relevant_message(first_message, services, _settings())
+    await on_buffered_relevant_message(message, services, _settings())
+    assert scheduler.job is not None
+
+    await scheduler.job()
+
+    message.answer.assert_awaited_once_with(text="Can't dispatch")
+    assert services.chat_message_buffer.peek_raw(42) == []
+
+
+@pytest.mark.asyncio
+async def test_video_and_unsupported_document_batch_dispatches_to_clip_menu() -> None:
+    scheduler = _FakeScheduler()
+    buffer = ChatMessageBuffer()
+    services = _services(clip_store=SimpleNamespace(), scheduler=scheduler, buffer=buffer)
+    settings = _settings()
+    first_message = _fake_message(
+        chat_id=42,
+        message_id=1,
+        document=_fake_document(file_id='document-1', file_name='one.txt'),
+    )
+    message = _fake_message(chat_id=42, message_id=2, video=_fake_video(file_id='video-1', file_name='clip.mp4'))
+
+    await on_buffered_relevant_message(first_message, services, settings)
+    await on_buffered_relevant_message(message, services, settings)
+    assert scheduler.job is not None
+
+    await scheduler.job()
+
+    expected = Text(
+        create_padding_line(settings.message_width),
+        '\n',
+        Text('Messages: ', Bold('2')),
+        '. Select action:',
+    ).as_kwargs()
+    _assert_format_kwargs(message.answer.await_args.kwargs, expected)
+    reply_markup = message.answer.await_args.kwargs['reply_markup']
+    _assert_three_rows(reply_markup)
+    assert _keyboard_rows(reply_markup) == [
+        ['Route', 'Store', 'Reorder'],
+        ['Reconcile', 'Produce', 'Compact'],
+        ['Cancel'],
+    ]
 
 
 @pytest.mark.asyncio
@@ -3650,6 +3767,107 @@ async def test_track_replace_action_hides_none_sub_season_in_selected_state(
 
 
 @pytest.mark.asyncio
+async def test_track_replace_action_accepts_photo_supported_document_audio(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    group = track_store_module.TrackGroup(
+        universe=track_store_module.TrackUniverse.WEST,
+        year=2026,
+        season=track_store_module.Season.S1,
+    )
+    track_id = _CLIP_ID_2
+    identity = track_store_module.TrackStore.track_identity_to_string(group, track_id)
+    buffer = ChatMessageBuffer()
+    buffer.append(
+        _fake_message(
+            chat_id=42,
+            message_id=1,
+            photo=_fake_photo(file_id='photo-1'),
+            caption='·Title',
+            caption_entities=[_linked_dot_entity(f'https://{identity}.com')],
+        ),
+        chat_id=42,
+    )
+    buffer.append(
+        _fake_message(
+            chat_id=42,
+            message_id=2,
+            document=_fake_document(file_id='document-1', file_name='one.flac'),
+        ),
+        chat_id=42,
+    )
+    track_store = SimpleNamespace(
+        list_tracks=AsyncMock(return_value=_tracks_by_sub_season_with_id(track_id)),
+        update=AsyncMock(),
+    )
+    services = _services(clip_store=SimpleNamespace(), track_store=track_store, buffer=buffer)
+    message = _fake_message(text='Select action:', chat_id=42, message_id=15)
+    state = _FakeState()
+    bot = SimpleNamespace(
+        get_file=AsyncMock(return_value=SimpleNamespace(file_path='audio-path-1')),
+        download_file=AsyncMock(return_value=BytesIO(b'audio-1')),
+    )
+    monkeypatch.setattr(track_store_execution_module, 'to_opus', AsyncMock(return_value=b'opus-1'))
+
+    await on_track_intake_action(
+        _fake_callback(message, bot=bot),
+        TrackIntakeActionCallbackData(action=TrackIntakeAction.TRACK, buffer_version=buffer.version(42)),
+        state,
+        services,
+        _settings(),
+    )
+
+    track_store.update.assert_awaited_once()
+    assert services.chat_message_buffer.peek_raw(42) == []
+
+
+@pytest.mark.asyncio
+async def test_track_replace_action_photo_and_unsupported_document_invalidates() -> None:
+    group = track_store_module.TrackGroup(
+        universe=track_store_module.TrackUniverse.WEST,
+        year=2026,
+        season=track_store_module.Season.S1,
+    )
+    track_id = _CLIP_ID_1
+    identity = track_store_module.TrackStore.track_identity_to_string(group, track_id)
+    buffer = ChatMessageBuffer()
+    buffer.append(
+        _fake_message(
+            chat_id=42,
+            message_id=1,
+            photo=_fake_photo(file_id='photo-1'),
+            caption='·Title',
+            caption_entities=[_linked_dot_entity(f'https://{identity}.com')],
+        ),
+        chat_id=42,
+    )
+    buffer.append(
+        _fake_message(
+            chat_id=42,
+            message_id=2,
+            document=_fake_document(file_id='document-1', file_name='one.txt'),
+        ),
+        chat_id=42,
+    )
+    track_store = SimpleNamespace(update=AsyncMock())
+    services = _services(clip_store=SimpleNamespace(), track_store=track_store, buffer=buffer)
+    message = _fake_message(text='Select action:', chat_id=42, message_id=15)
+    state = _FakeState()
+
+    await on_track_intake_action(
+        _fake_callback(message, bot=SimpleNamespace()),
+        TrackIntakeActionCallbackData(action=TrackIntakeAction.TRACK, buffer_version=buffer.version(42)),
+        state,
+        services,
+        _settings(),
+    )
+
+    track_store.update.assert_not_awaited()
+    message.edit_text.assert_awaited_with('Invalid input', reply_markup=None)
+    assert services.chat_message_buffer.peek_raw(42) == []
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     'messages',
     [
@@ -5170,6 +5388,79 @@ async def test_prepare_tracks_from_buffer_skips_to_opus_for_opus_input(
 
 
 @pytest.mark.asyncio
+async def test_prepare_tracks_from_buffer_skips_to_opus_for_supported_opus_document_input(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    messages = [
+        _fake_message(chat_id=42, message_id=1, photo=_fake_photo(file_id='photo-1'), caption='Artist\nTitle'),
+        _fake_message(
+            chat_id=42,
+            message_id=2,
+            document=_fake_document(file_id='document-1', file_name='track.opus'),
+        ),
+    ]
+    bot = SimpleNamespace(
+        get_file=AsyncMock(
+            side_effect=[
+                SimpleNamespace(file_path='photo-path-1'),
+                SimpleNamespace(file_path='audio-path-1'),
+            ]
+        ),
+        download_file=AsyncMock(
+            side_effect=[
+                BytesIO(b'cover-1'),
+                BytesIO(b'already-opus'),
+            ]
+        ),
+    )
+    to_opus = AsyncMock()
+    monkeypatch.setattr(track_store_execution_module, 'normalize_cover_to_jpg', Mock(return_value=b'jpg-1'))
+    monkeypatch.setattr(track_store_execution_module, 'to_opus', to_opus)
+
+    prepared_tracks = await track_store_execution_module.prepare_tracks_from_buffer(
+        bot=bot,
+        messages=messages,
+    )
+
+    assert prepared_tracks == [
+        track_store_module.Track(
+            artists=('Artist',),
+            title='Title',
+            cover=FileBytes(data=b'jpg-1', extension=Extension.JPG),
+            audio=FileBytes(data=b'already-opus', extension=Extension.OPUS),
+        )
+    ]
+    to_opus.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('file_name', ['one.wav', 'one.flac'])
+async def test_prepare_audio_from_message_converts_supported_document_audio(
+    file_name: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    message = _fake_message(
+        chat_id=42,
+        message_id=2,
+        document=_fake_document(file_id='document-1', file_name=file_name),
+    )
+    bot = SimpleNamespace(
+        get_file=AsyncMock(return_value=SimpleNamespace(file_path='audio-path-1')),
+        download_file=AsyncMock(return_value=BytesIO(b'source-audio')),
+    )
+    to_opus = AsyncMock(return_value=b'opus-converted')
+    monkeypatch.setattr(track_store_execution_module, 'to_opus', to_opus)
+
+    prepared = await track_store_execution_module.prepare_audio_from_message(
+        bot=bot,
+        audio_message=message,
+    )
+
+    assert prepared == FileBytes(data=b'opus-converted', extension=Extension.OPUS)
+    to_opus.assert_awaited_once_with(b'source-audio')
+
+
+@pytest.mark.asyncio
 async def test_prepare_tracks_from_buffer_normalizes_cover_via_image_infra(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -5749,6 +6040,78 @@ async def test_track_store_valid_text_audio_enters_store_fsm() -> None:
         menu_message.edit_text.await_args.kwargs,
         _selected_kwargs('Store', prompt='Select universe:', message_width=settings.message_width),
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'file_name',
+    [
+        'one.wav',
+        'one.flac',
+        'one.opus',
+        'one.WAV',
+    ],
+)
+async def test_track_store_valid_text_supported_document_enters_store_fsm(file_name: str) -> None:
+    settings = _settings()
+    buffer = ChatMessageBuffer()
+    buffer.append(_fake_message(chat_id=42, message_id=1, text='Artist\nTitle'), chat_id=42)
+    buffer.append(
+        _fake_message(
+            chat_id=42,
+            message_id=2,
+            document=_fake_document(file_id='document-1', file_name=file_name),
+        ),
+        chat_id=42,
+    )
+    services = _services(clip_store=SimpleNamespace(), buffer=buffer)
+    menu_message = _fake_message(text='Select action:', chat_id=42, message_id=6721)
+    state = _FakeState()
+
+    await on_track_intake_action(
+        _fake_callback(menu_message),
+        TrackIntakeActionCallbackData(action=TrackIntakeAction.STORE, buffer_version=buffer.version(42)),
+        state,
+        services,
+        settings,
+    )
+
+    assert state.current_state == TrackStoreFlow.universe.state
+    _assert_format_kwargs(
+        menu_message.edit_text.await_args.kwargs,
+        _selected_kwargs('Store', prompt='Select universe:', message_width=settings.message_width),
+    )
+
+
+@pytest.mark.asyncio
+async def test_track_store_text_and_unsupported_document_invalidates() -> None:
+    settings = _settings()
+    track_store = SimpleNamespace(list_tracks=AsyncMock(), store=AsyncMock())
+    buffer = ChatMessageBuffer()
+    buffer.append(_fake_message(chat_id=42, message_id=1, text='Artist\nTitle'), chat_id=42)
+    buffer.append(
+        _fake_message(
+            chat_id=42,
+            message_id=2,
+            document=_fake_document(file_id='document-1', file_name='one.zip'),
+        ),
+        chat_id=42,
+    )
+    services = _services(clip_store=SimpleNamespace(), track_store=track_store, buffer=buffer)
+    menu_message = _fake_message(text='Select action:', chat_id=42, message_id=6722)
+    state = _FakeState()
+
+    await on_track_intake_action(
+        _fake_callback(menu_message),
+        TrackIntakeActionCallbackData(action=TrackIntakeAction.STORE, buffer_version=buffer.version(42)),
+        state,
+        services,
+        settings,
+    )
+
+    menu_message.edit_text.assert_awaited_with('Invalid input', reply_markup=None)
+    track_store.list_tracks.assert_not_awaited()
+    track_store.store.assert_not_awaited()
 
 
 @pytest.mark.asyncio

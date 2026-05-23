@@ -50,13 +50,45 @@ class CoverLinkTrackInput:
         return self.artists is None or self.title is None
 
 
+@dataclass(frozen=True, slots=True)
+class TrackAudioAttachment:
+    file_id: str
+    file_name: str | None
+
+
+_SUPPORTED_DOCUMENT_AUDIO_EXTENSIONS = frozenset({'.wav', '.flac', '.opus'})
+
+
+def extract_track_audio_attachment(message: Message) -> TrackAudioAttachment | None:
+    audio = message.audio
+    if audio is not None:
+        return TrackAudioAttachment(file_id=audio.file_id, file_name=audio.file_name)
+
+    document = getattr(message, 'document', None)
+    if document is None:
+        return None
+    file_name = getattr(document, 'file_name', None)
+    if not _is_supported_document_audio_filename(file_name):
+        return None
+    file_id = getattr(document, 'file_id', None)
+    if not isinstance(file_id, str) or not file_id:
+        return None
+    return TrackAudioAttachment(file_id=file_id, file_name=file_name)
+
+
+def _is_supported_document_audio_filename(file_name: str | None) -> bool:
+    if file_name is None:
+        return False
+    return any(file_name.lower().endswith(suffix) for suffix in _SUPPORTED_DOCUMENT_AUDIO_EXTENSIONS)
+
+
 def extract_single_photo_audio_messages(messages: Sequence[Message]) -> tuple[Message, Message]:
     """Return exactly one photo message and one audio message, order-independent."""
     if len(messages) != 2:
         raise TrackInputError('Invalid input')
 
     photo_messages = [message for message in messages if message.photo is not None]
-    audio_messages = [message for message in messages if message.audio is not None]
+    audio_messages = [message for message in messages if extract_track_audio_attachment(message) is not None]
     if len(photo_messages) != 1 or len(audio_messages) != 1:
         raise TrackInputError('Invalid input')
     return photo_messages[0], audio_messages[0]
@@ -111,13 +143,13 @@ def extract_track_identity_from_photo_message(photo_message: Message) -> tuple[T
 
 async def prepare_audio_from_message(*, bot: Bot, audio_message: Message) -> FileBytes:
     """Download one audio message and normalize to OPUS `FileBytes`."""
-    audio = audio_message.audio
-    if audio is None:
+    attachment = extract_track_audio_attachment(audio_message)
+    if attachment is None:
         raise TrackInputError('Invalid input')
 
-    audio_bytes = await _download_file_bytes(bot=bot, file_id=audio.file_id)
+    audio_bytes = await _download_file_bytes(bot=bot, file_id=attachment.file_id)
     try:
-        audio_extension = Extension.try_from_filename(audio.file_name)
+        audio_extension = Extension.try_from_filename(attachment.file_name)
         if audio_extension is Extension.OPUS:
             audio_opus = audio_bytes
         else:
@@ -130,7 +162,11 @@ async def prepare_audio_from_message(*, bot: Bot, audio_message: Message) -> Fil
 
 def extract_store_messages(messages: Sequence[Message]) -> list[Message]:
     """Return store-relevant messages in original order."""
-    return [message for message in messages if message.photo is not None or message.audio is not None]
+    return [
+        message
+        for message in messages
+        if message.photo is not None or extract_track_audio_attachment(message) is not None
+    ]
 
 
 def track_count_from_store_messages(messages: Sequence[Message]) -> int:
@@ -147,7 +183,7 @@ def extract_audio_only_store_messages(messages: Sequence[Message]) -> tuple[Mess
     ):
         raise TrackInputError('Invalid input')
     text_messages = [message for message in messages if message.text is not None]
-    audio_messages = [message for message in messages if message.audio is not None]
+    audio_messages = [message for message in messages if extract_track_audio_attachment(message) is not None]
     if len(audio_messages) != 1 or len(text_messages) > 1:
         raise TrackInputError('Invalid input')
     audio_message = audio_messages[0]
@@ -227,7 +263,7 @@ def validate_link_only_store_input(messages: Sequence[Message]) -> LinkOnlyTrack
     if len(messages) != 1:
         raise TrackInputError('Invalid input')
     message = messages[0]
-    if message.photo is not None or message.audio is not None:
+    if message.photo is not None or extract_track_audio_attachment(message) is not None:
         raise TrackInputError('Invalid input')
     if message.video is not None or getattr(message, 'animation', None) is not None:
         raise TrackInputError('Invalid input')
@@ -243,7 +279,11 @@ def parse_cover_link_store_input(messages: Sequence[Message]) -> CoverLinkTrackI
     message = messages[0]
     if message.photo is None:
         raise TrackInputError('Invalid input')
-    if message.audio is not None or message.video is not None or getattr(message, 'animation', None) is not None:
+    if (
+        extract_track_audio_attachment(message) is not None
+        or message.video is not None
+        or getattr(message, 'animation', None) is not None
+    ):
         raise TrackInputError('Invalid input')
     if message.caption is None:
         raise TrackInputError('Invalid input')
@@ -298,7 +338,7 @@ def validate_track_batch(messages: Sequence[Message]) -> list[tuple[tuple[str, .
     for index in range(0, len(messages), 2):
         photo_message = messages[index]
         audio_message = messages[index + 1]
-        if photo_message.photo is None or audio_message.audio is None:
+        if photo_message.photo is None or extract_track_audio_attachment(audio_message) is None:
             raise TrackInputError("Can't dispatch input")
         if photo_message.caption is None or not photo_message.caption.strip():
             raise TrackInputError("Can't dispatch input")
@@ -319,8 +359,8 @@ async def prepare_tracks_from_buffer(*, bot: Bot, messages: Sequence[Message]) -
         photo_message = store_messages[index]
         audio_message = store_messages[index + 1]
         photo = photo_message.photo
-        audio = audio_message.audio
-        if photo is None or audio is None:
+        attachment = extract_track_audio_attachment(audio_message)
+        if photo is None or attachment is None:
             raise TrackInputError("Can't dispatch input")
 
         artists, title = parsed_track
@@ -330,7 +370,7 @@ async def prepare_tracks_from_buffer(*, bot: Bot, messages: Sequence[Message]) -
         )
         audio_bytes = await _download_file_bytes(
             bot=bot,
-            file_id=audio.file_id,
+            file_id=attachment.file_id,
         )
 
         try:
@@ -340,7 +380,7 @@ async def prepare_tracks_from_buffer(*, bot: Bot, messages: Sequence[Message]) -
 
         try:
             # Best-effort extension parse (filename may be missing or invalid).
-            audio_extension = Extension.try_from_filename(audio.file_name)
+            audio_extension = Extension.try_from_filename(attachment.file_name)
             if audio_extension is Extension.OPUS:
                 # Fast-path: avoid re-encoding already-Opus input.
                 audio_opus = audio_bytes
