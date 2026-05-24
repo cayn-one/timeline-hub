@@ -4906,7 +4906,13 @@ async def test_track_store_audio_only_reuses_selected_album_cover(monkeypatch: p
     _assert_format_kwargs(
         menu_message.edit_text.await_args.kwargs,
         _selected_kwargs(
-            'Store', 'West', str(year), '1', 'A', 'Album', prompt='Select album:', message_width=settings.message_width
+            'Store',
+            'West',
+            str(year),
+            '1',
+            'A',
+            prompt='Select album:',
+            message_width=settings.message_width,
         ),
     )
     album_menu = menu_message.edit_text.await_args.kwargs['reply_markup']
@@ -4932,7 +4938,7 @@ async def test_track_store_audio_only_reuses_selected_album_cover(monkeypatch: p
 
     _assert_format_kwargs(
         menu_message.edit_text.await_args.kwargs,
-        _selected_kwargs('Store', 'West', str(year), '1', 'A', 'Album', 'Album A'),
+        _selected_kwargs('Store', 'West', str(year), '1', 'A'),
     )
     call_args = track_store.store.await_args
     expected_group = track_store_module.TrackGroup(
@@ -6986,7 +6992,7 @@ async def test_track_store_link_only_reuses_selected_album_cover(
 
     _assert_format_kwargs(
         menu_message.edit_text.await_args.kwargs,
-        _selected_kwargs('Store', 'West', str(year), '1', 'A', 'Album', 'Album A'),
+        _selected_kwargs('Store', 'West', str(year), '1', 'A'),
     )
     download_audio_as_opus.assert_awaited_once_with(
         'https://www.youtube.com/watch?v=abc123',
@@ -7335,7 +7341,7 @@ async def test_track_store_link_only_cover_source_auto_stores_downloaded_cover(
 
     _assert_format_kwargs(
         menu_message.edit_text.await_args.kwargs,
-        _selected_kwargs('Store', 'West', str(year), '1', 'A', 'Auto'),
+        _selected_kwargs('Store', 'West', str(year), '1', 'A'),
     )
     download_audio_as_opus.assert_awaited_once_with(
         'https://www.youtube.com/watch?v=abc123',

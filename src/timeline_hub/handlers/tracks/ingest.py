@@ -827,15 +827,12 @@ async def _show_store_album_menu(
     )
     await message.edit_text(
         **selection_text(
-            selected=[
-                *_selected_store_path(
-                    universe=universe,
-                    year=year,
-                    season=season,
-                    sub_season=sub_season,
-                ),
-                'Album',
-            ],
+            selected=_selected_store_path(
+                universe=universe,
+                year=year,
+                season=season,
+                sub_season=sub_season,
+            ),
             prompt='Select album:',
             message_width=settings.message_width,
         ),
@@ -923,16 +920,6 @@ async def _show_store_final_menu(
     from_step: TrackStoreStep,
     album_id: str | None = None,
 ) -> None:
-    selected = _selected_store_path(
-        universe=universe,
-        year=year,
-        season=season,
-        sub_season=sub_season,
-    )
-    if from_step is TrackStoreStep.COVER_SOURCE:
-        selected.append('Auto')
-    if from_step is TrackStoreStep.ALBUM:
-        selected.append('Album')
     await _set_track_store_context(
         state=state,
         fsm_state=TrackStoreFlow.final,
@@ -949,7 +936,12 @@ async def _show_store_final_menu(
     )
     await message.edit_text(
         **selection_text(
-            selected=selected,
+            selected=_selected_store_path(
+                universe=universe,
+                year=year,
+                season=season,
+                sub_season=sub_season,
+            ),
             prompt='Select finish mode:',
             message_width=settings.message_width,
         ),
@@ -1501,15 +1493,12 @@ async def _execute_track_store_with_auto_cover(
 
     await message.edit_text(
         **selected_text(
-            selected=[
-                *_selected_store_path(
-                    universe=universe,
-                    year=year,
-                    season=season,
-                    sub_season=sub_season,
-                ),
-                'Auto',
-            ],
+            selected=_selected_store_path(
+                universe=universe,
+                year=year,
+                season=season,
+                sub_season=sub_season,
+            ),
         ),
         reply_markup=None,
     )
@@ -1768,26 +1757,14 @@ async def _execute_track_store_with_album_reuse(
         await handle_stale_selection(message=message, state=state)
         return
 
-    album_label = await _resolve_album_label(
-        services=services,
-        universe=universe,
-        year=year,
-        season=season,
-        sub_season=sub_season,
-        album_id=album_id,
-    )
     await message.edit_text(
         **selected_text(
-            selected=[
-                *_selected_store_path(
-                    universe=universe,
-                    year=year,
-                    season=season,
-                    sub_season=sub_season,
-                ),
-                'Album',
-                album_label,
-            ],
+            selected=_selected_store_path(
+                universe=universe,
+                year=year,
+                season=season,
+                sub_season=sub_season,
+            ),
         ),
         reply_markup=None,
     )
