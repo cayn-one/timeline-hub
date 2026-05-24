@@ -868,7 +868,7 @@ async def _send_variant_audio(
         except TelegramEntityTooLarge:
             logger.warning(
                 (
-                    'Track variant media group too large; falling back to sequential send '
+                    'track variant media group too large; falling back to sequential send '
                     '(count={}, total_mib={}, threshold_mib={}, sizes_mib={})'
                 ),
                 len(variants),

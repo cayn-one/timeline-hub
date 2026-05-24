@@ -93,7 +93,7 @@ class TaskSupervisor:
         try:
             await self._on_failure(failure)
         except Exception:
-            logger.exception('Detached task failure hook failed')
+            logger.exception('detached task failure hook failed')
 
 
 class TaskScheduler:

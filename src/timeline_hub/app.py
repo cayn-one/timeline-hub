@@ -35,7 +35,7 @@ class _AllowlistMiddleware(BaseMiddleware):
             return None
         if user.id not in self._user_ids:
             logger.info(
-                'User {} (@{} {!r}) attempting to use bot',
+                'user {} (@{} {!r}) attempting to use bot',
                 user.id,
                 user.username or '',
                 user.full_name,
@@ -95,9 +95,9 @@ async def _main(settings: Settings) -> None:
         dp.include_router(handlers_router)
         dp.update.middleware(_AllowlistMiddleware(user_ids=settings.user_ids))
 
-        logger.info('Starting bot')
+        logger.info('bot started')
         await dp.start_polling(bot, polling_timeout=30)
-        logger.info('Bot stopped')
+        logger.info('bot stopped')
 
 
 async def _notify_superusers_and_stop_polling(
@@ -111,7 +111,7 @@ async def _notify_superusers_and_stop_polling(
             try:
                 await bot.send_message(chat_id=superuser_id, text='Stopping bot due to error')
             except Exception:
-                logger.exception('Failed to notify superuser {} about shutdown', superuser_id)
+                logger.exception('failed to notify superuser {} about shutdown', superuser_id)
     finally:
         await dispatcher.stop_polling()
 
@@ -119,8 +119,8 @@ async def _notify_superusers_and_stop_polling(
 def _configure_logging() -> None:
     logger.remove()
     logger.add(
-        sys.stderr,
-        format='{time:HH:mm:ss}: {message}',
+        sys.stdout,
+        format='{time:HH:mm:ss} {message}',
         enqueue=True,
         backtrace=False,
         diagnose=False,

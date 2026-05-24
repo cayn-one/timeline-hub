@@ -355,7 +355,7 @@ async def on_intake_action(
                     )
                 except Exception:
                     logger.exception(
-                        'Post-store clip compaction failed for {} {}',
+                        'post-store clip compaction failed for {} {}',
                         clip_group,
                         ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.SOURCE),
                     )

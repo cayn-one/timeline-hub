@@ -7082,7 +7082,7 @@ async def test_track_store_link_download_failure_invalidates_buffer(
     assert state.current_state is None
     assert services.chat_message_buffer.peek_raw(42) == []
     track_store.store.assert_not_awaited()
-    log_exception.assert_called_once_with('Track link download failed')
+    log_exception.assert_called_once_with('track link download failed')
 
 
 @pytest.mark.asyncio
@@ -7260,7 +7260,7 @@ async def test_track_store_link_download_timeout_logs_exception_and_invalidates_
     assert state.current_state is None
     assert services.chat_message_buffer.peek_raw(42) == []
     track_store.store.assert_not_awaited()
-    log_exception.assert_called_once_with('Track link download failed')
+    log_exception.assert_called_once_with('track link download failed')
 
 
 @pytest.mark.asyncio
@@ -7549,7 +7549,7 @@ async def test_track_store_link_url_only_unexpected_metadata_error_logs_exceptio
     assert services.chat_message_buffer.peek_raw(42) == []
     assert state.current_state is None
     track_store.store.assert_not_awaited()
-    log_exception.assert_called_once_with('Track link metadata unavailable')
+    log_exception.assert_called_once_with('track link metadata unavailable')
 
 
 @pytest.mark.asyncio
@@ -7608,7 +7608,7 @@ async def test_track_store_cover_plus_link_download_failure_invalidates_buffer(
     assert services.chat_message_buffer.peek_raw(42) == []
     assert state.current_state is None
     track_store.store.assert_not_awaited()
-    log_exception.assert_called_once_with('Track link download failed')
+    log_exception.assert_called_once_with('track link download failed')
 
 
 @pytest.mark.asyncio
@@ -7760,7 +7760,7 @@ async def test_track_store_album_reuse_link_download_failure_invalidates_buffer(
     assert services.chat_message_buffer.peek_raw(42) == []
     assert state.current_state is None
     track_store.store.assert_not_awaited()
-    log_exception.assert_called_once_with('Track link audio download failed')
+    log_exception.assert_called_once_with('track link audio download failed')
 
 
 @pytest.mark.asyncio

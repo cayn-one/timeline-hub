@@ -53,7 +53,7 @@ async def execute_store_or_produce(
             )
         except Exception:
             logger.exception(
-                'Post-store clip compaction failed for {} {}',
+                'post-store clip compaction failed for {} {}',
                 clip_group,
                 clip_sub_group,
             )

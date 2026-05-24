@@ -1225,7 +1225,7 @@ class ClipStore:
             try:
                 await self._s3_client.delete_key(raw_clip_key)
             except Exception as exc:
-                logger.error('Failed to delete key {}: {}', raw_clip_key, exc)
+                logger.error('failed to delete key {}: {}', raw_clip_key, exc)
                 raise ReconcileDeleteError(
                     stage='raw_clip_delete',
                     clip_ids=removed_ids,
@@ -1244,7 +1244,7 @@ class ClipStore:
             try:
                 await self._s3_client.delete_key(normalized_clip_key)
             except Exception as exc:
-                logger.error('Failed to delete key {}: {}', normalized_clip_key, exc)
+                logger.error('failed to delete key {}: {}', normalized_clip_key, exc)
                 raise ReconcileDeleteError(
                     stage='normalized_clip_delete',
                     clip_ids=removed_ids,

@@ -1277,7 +1277,7 @@ async def _execute_track_store(
             stored_titles.append(track.title)
             stored_track_infos.append(stored_info)
     except Exception:
-        logger.exception('Track store failed')
+        logger.exception('track store failed')
         await state.clear()
         services.chat_message_buffer.flush(chat_id)
         if stored_titles:
@@ -1529,7 +1529,7 @@ async def _execute_track_store_with_auto_cover(
             )
         except YtDlpMetadataError as error:
             if not _is_expected_track_metadata_unavailable(error):
-                logger.exception('Track link metadata unavailable')
+                logger.exception('track link metadata unavailable')
             await _invalidate_track_intake_buffer(
                 message=message,
                 state=state,
@@ -1546,7 +1546,7 @@ async def _execute_track_store_with_auto_cover(
                     text='Cookies required',
                 )
                 return
-            logger.exception('Track link download failed')
+            logger.exception('track link download failed')
             await _invalidate_track_intake_buffer(
                 message=message,
                 state=state,
@@ -1571,7 +1571,7 @@ async def _execute_track_store_with_auto_cover(
         )
         return
     except Exception:
-        logger.exception('Track store failed')
+        logger.exception('track store failed')
         await state.clear()
         services.chat_message_buffer.flush(chat_id)
         await message.answer(text='Storing failed\nNo tracks were stored')
@@ -1656,7 +1656,7 @@ async def _execute_track_store_with_user_cover_link(
             )
         except YtDlpMetadataError as error:
             if not _is_expected_track_metadata_unavailable(error):
-                logger.exception('Track link metadata unavailable')
+                logger.exception('track link metadata unavailable')
             await _invalidate_track_intake_buffer(
                 message=message,
                 state=state,
@@ -1673,7 +1673,7 @@ async def _execute_track_store_with_user_cover_link(
                     text='Cookies required',
                 )
                 return
-            logger.exception('Track link download failed')
+            logger.exception('track link download failed')
             await _invalidate_track_intake_buffer(
                 message=message,
                 state=state,
@@ -1703,7 +1703,7 @@ async def _execute_track_store_with_user_cover_link(
         )
         return
     except Exception:
-        logger.exception('Track store failed')
+        logger.exception('track store failed')
         await state.clear()
         services.chat_message_buffer.flush(chat_id)
         await message.answer(text='Storing failed\nNo tracks were stored')
@@ -1822,7 +1822,7 @@ async def _execute_track_store_with_album_reuse(
                         text='Cookies required',
                     )
                     return
-                logger.exception('Track link audio download failed')
+                logger.exception('track link audio download failed')
                 await _invalidate_track_intake_buffer(
                     message=message,
                     state=state,
@@ -1858,7 +1858,7 @@ async def _execute_track_store_with_album_reuse(
             return
         raise
     except Exception:
-        logger.exception('Track store failed')
+        logger.exception('track store failed')
         await state.clear()
         services.chat_message_buffer.flush(chat_id)
         await message.answer(text='Storing failed\nNo tracks were stored')

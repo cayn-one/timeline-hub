@@ -17,7 +17,7 @@ router = Router()
 
 @router.error()
 async def on_error_shutdown(_: ErrorEvent, on_failure: Callable[[], Awaitable[None]]) -> None:
-    logger.exception('Handler exception')
+    logger.exception('handler exception')
     await on_failure()
 
 
