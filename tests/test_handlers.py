@@ -709,10 +709,10 @@ def test_route_progress_kwargs_preserves_arrow_path_rendering_without_route_labe
 
 
 def test_handlers_package_router_imports_cleanly() -> None:
-    from timeline_hub.app import run
+    from timeline_hub.app import main
     from timeline_hub.handlers.router import router
 
-    assert callable(run)
+    assert callable(main)
     assert router is not None
 
 

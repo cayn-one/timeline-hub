@@ -44,7 +44,7 @@ class _AllowlistMiddleware(BaseMiddleware):
         return await handler(event, data)
 
 
-def run() -> None:
+def main() -> None:
     _configure_logging()
     settings = Settings.load()
     asyncio.run(_main(settings))
@@ -137,3 +137,7 @@ def _default_track_preset() -> Preset:
         reverb_start=0.01,
         reverb_step=0.01,
     )
+
+
+if __name__ == '__main__':
+    main()
