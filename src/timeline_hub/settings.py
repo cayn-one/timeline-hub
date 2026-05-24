@@ -46,25 +46,12 @@ class Settings(BaseModel):
     )
 
     @classmethod
-    def load(cls, is_dev: bool) -> Self:
-        env_settings = _EnvSettings()
-
-        if env_settings.superuser_ids is None:
-            raise ValueError('`SUPERUSER_IDS` is required in `.env`')
-        if env_settings.s3 is None:
-            raise ValueError('`S3__*` settings are required in `.env`')
-
-        if is_dev:
-            if env_settings.bot_token_dev is None:
-                raise ValueError('`BOT_TOKEN_DEV` is required in `.env` in dev mode')
-            bot_token = env_settings.bot_token_dev
-        else:
-            if env_settings.bot_token is None:
-                raise ValueError('`BOT_TOKEN` is required in `.env`')
-            bot_token = env_settings.bot_token
+    def load(cls) -> Self:
+        # BaseSettings resolves required fields from environment at runtime.
+        env_settings = _EnvSettings()  # pyright: ignore[reportCallIssue]
 
         return cls(
-            bot_token=bot_token,
+            bot_token=env_settings.bot_token,
             superuser_ids=env_settings.superuser_ids,
             user_ids=env_settings.user_ids,
             s3=env_settings.s3,
@@ -87,11 +74,10 @@ class Settings(BaseModel):
 
 
 class _EnvSettings(BaseSettings):
-    bot_token: SecretStr | None = None
-    bot_token_dev: SecretStr | None = None
-    superuser_ids: set[UserId] | None = None
+    bot_token: SecretStr
+    superuser_ids: set[UserId]
     user_ids: set[UserId] = Field(default_factory=set)
-    s3: S3Settings | None = None
+    s3: S3Settings
 
     model_config = SettingsConfigDict(
         env_file='.env',

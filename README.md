@@ -31,7 +31,7 @@ The project is split into small layers with narrow responsibilities.
 - `handlers` own Telegram-facing behavior. `clips_store.py` manages buffered uploads, action selection, normalization, and storage menus. `clips_retrieve.py` drives the Get/Pull flow from entry menu to batched clip delivery. `clips_common.py` holds shared FSM state, menu parsing, text formatting, and fixed-layout keyboard primitives.
 - `services` provide the domain-facing operations used by handlers. `ClipStore` maps logical clip groups to S3 objects and manifests, `ChatMessageBuffer` batches incoming messages per chat and reconstructs media groups, and `Services` is an explicit container rather than implicit global state.
 - `infra` contains reusable plumbing. `S3Client` is a generic async wrapper over S3-compatible storage, and `tasks.py` provides a detached task supervisor plus a per-key debouncing scheduler.
-- `settings` loads configuration from `.env` with `pydantic-settings`, selects `BOT_TOKEN_DEV` when running with `--dev`, and automatically folds `SUPERUSER_IDS` into the main allowlist.
+- `settings` loads configuration from `.env` with `pydantic-settings` and automatically folds `SUPERUSER_IDS` into the main allowlist.
 - `domain.py` contains media-specific logic that does not belong in Telegram handlers. At the moment this is two-pass audio normalization via `ffmpeg loudnorm`, using temporary files because MP4 output must remain seekable.
 
 At runtime, Telegram updates enter handlers, handlers translate them into domain-level operations, services execute those operations, and infrastructure provides the underlying storage and task primitives. The app layer stays responsible for wiring, lifecycle, and failure policy.
@@ -93,7 +93,6 @@ Required settings:
 
 Optional settings used by the code include:
 
-- BOT_TOKEN_DEV for `--dev` runs
 - USER_IDS for additional allowlisted users beyond `SUPERUSER_IDS`
 
 `ffmpeg` must also be available on PATH; it is used for audio normalization and clip processing.
@@ -103,10 +102,6 @@ Optional settings used by the code include:
 Run the bot through the package entry point:
 
 uv run python -m timeline_hub
-
-For the development bot token:
-
-uv run python -m timeline_hub --dev
 
 The main entry point is `src/timeline_hub/__main__.py`, which delegates to `timeline_hub.app.run()`.
 

@@ -1,4 +1,3 @@
-import argparse
 import asyncio
 import logging
 import sys
@@ -46,9 +45,8 @@ class _AllowlistMiddleware(BaseMiddleware):
 
 
 def run() -> None:
-    args = _parse_args()
-    settings = Settings.load(args.dev)
     _configure_logging()
+    settings = Settings.load()
     asyncio.run(_main(settings))
 
 
@@ -139,13 +137,3 @@ def _default_track_preset() -> Preset:
         reverb_start=0.01,
         reverb_step=0.01,
     )
-
-
-def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        '--dev',
-        action='store_true',
-        help='Run bot in development mode',
-    )
-    return parser.parse_args()
