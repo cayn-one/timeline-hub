@@ -1,5 +1,6 @@
 import asyncio
 import re
+import urllib.error
 from datetime import timedelta
 from pathlib import Path
 
@@ -7,6 +8,344 @@ import pytest
 
 from timeline_hub.infra import ytdlp as ytdlp_module
 from timeline_hub.infra.ytdlp import YtDlpMetadataError
+
+
+@pytest.mark.asyncio
+async def test_fetch_track_info_with_cover_and_metadata_returns_all_outputs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: dict[str, object] = {}
+
+    async def _fake_cover(url: str, *, timeout: timedelta) -> bytes:
+        observed['cover_url'] = url
+        observed['cover_timeout'] = timeout
+        return b'cover-jpg'
+
+    async def _fake_metadata(
+        url: str,
+        *,
+        timeout: timedelta,
+    ) -> ytdlp_module.TrackMetadata:
+        observed['metadata_url'] = url
+        observed['metadata_timeout'] = timeout
+        return ytdlp_module.TrackMetadata(artists=('Artist 1', 'Artist 2'), title='Song')
+
+    monkeypatch.setattr(ytdlp_module, '_download_cover_as_jpg', _fake_cover)
+    monkeypatch.setattr(ytdlp_module, '_download_track_metadata', _fake_metadata)
+
+    result = await ytdlp_module.fetch_track_info(
+        ' https://example.com/watch?v=abc ',
+        with_cover=True,
+        with_metadata=True,
+        timeout=timedelta(seconds=11),
+    )
+
+    assert result == ytdlp_module.UrlTrackInfo(
+        cover=b'cover-jpg',
+        metadata=ytdlp_module.TrackMetadata(artists=('Artist 1', 'Artist 2'), title='Song'),
+    )
+    assert observed['cover_url'] == 'https://example.com/watch?v=abc'
+    assert observed['metadata_url'] == 'https://example.com/watch?v=abc'
+    assert observed['cover_timeout'] == timedelta(seconds=11)
+    assert observed['metadata_timeout'] == timedelta(seconds=11)
+
+
+@pytest.mark.asyncio
+async def test_fetch_track_info_with_cover_only_fetches_only_cover(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed = {'metadata_called': False}
+
+    async def _fake_cover(url: str, *, timeout: timedelta) -> bytes:
+        return b'cover-only'
+
+    async def _fake_metadata(url: str, *, timeout: timedelta) -> ytdlp_module.TrackMetadata:
+        observed['metadata_called'] = True
+        return ytdlp_module.TrackMetadata(artists=('Artist 1',), title='Song')
+
+    monkeypatch.setattr(ytdlp_module, '_download_cover_as_jpg', _fake_cover)
+    monkeypatch.setattr(ytdlp_module, '_download_track_metadata', _fake_metadata)
+
+    result = await ytdlp_module.fetch_track_info(
+        'https://example.com/watch?v=abc',
+        with_cover=True,
+        with_metadata=False,
+    )
+
+    assert result == ytdlp_module.UrlTrackInfo(cover=b'cover-only', metadata=None)
+    assert observed['metadata_called'] is False
+
+
+@pytest.mark.asyncio
+async def test_fetch_track_info_with_youtube_cover_only_uses_direct_thumbnail_and_skips_ytdlp(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: dict[str, object] = {}
+
+    async def _fake_download_http_bytes(url: str, *, timeout_seconds: float) -> bytes:
+        observed['thumbnail_url'] = url
+        observed['timeout_seconds'] = timeout_seconds
+        return b'\xff\xd8\xff\xe0jpg'
+
+    async def _unexpected_create_subprocess_exec(*args: str, **kwargs: object) -> object:
+        raise AssertionError('yt-dlp subprocess should not be spawned for youtube cover-only fetch_track_info')
+
+    monkeypatch.setattr(ytdlp_module, '_download_http_bytes', _fake_download_http_bytes)
+    monkeypatch.setattr(ytdlp_module.asyncio, 'create_subprocess_exec', _unexpected_create_subprocess_exec)
+
+    result = await ytdlp_module.fetch_track_info(
+        'https://www.youtube.com/watch?v=EuVFrXWIGAw',
+        with_cover=True,
+        with_metadata=False,
+        timeout=timedelta(seconds=9),
+    )
+
+    assert result == ytdlp_module.UrlTrackInfo(cover=b'\xff\xd8\xff\xe0jpg', metadata=None)
+    assert observed['thumbnail_url'] == 'https://i.ytimg.com/vi/EuVFrXWIGAw/maxresdefault.jpg'
+    assert observed['timeout_seconds'] == pytest.approx(9.0, rel=0, abs=0.02)
+
+
+@pytest.mark.asyncio
+async def test_fetch_track_info_with_music_youtube_cover_only_uses_direct_thumbnail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: dict[str, object] = {}
+
+    async def _fake_download_http_bytes(url: str, *, timeout_seconds: float) -> bytes:
+        observed['thumbnail_url'] = url
+        return b'\xff\xd8jpg'
+
+    async def _unexpected_create_subprocess_exec(*args: str, **kwargs: object) -> object:
+        raise AssertionError('yt-dlp subprocess should not be spawned for youtube cover-only fetch_track_info')
+
+    monkeypatch.setattr(ytdlp_module, '_download_http_bytes', _fake_download_http_bytes)
+    monkeypatch.setattr(ytdlp_module.asyncio, 'create_subprocess_exec', _unexpected_create_subprocess_exec)
+
+    result = await ytdlp_module.fetch_track_info(
+        'https://music.youtube.com/watch?v=EuVFrXWIGAw',
+        with_cover=True,
+        with_metadata=False,
+    )
+
+    assert result == ytdlp_module.UrlTrackInfo(cover=b'\xff\xd8jpg', metadata=None)
+    assert observed['thumbnail_url'] == 'https://i.ytimg.com/vi/EuVFrXWIGAw/maxresdefault.jpg'
+
+
+@pytest.mark.asyncio
+async def test_fetch_track_info_with_youtu_be_cover_only_uses_direct_thumbnail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: dict[str, object] = {}
+
+    async def _fake_download_http_bytes(url: str, *, timeout_seconds: float) -> bytes:
+        observed['thumbnail_url'] = url
+        return b'\xff\xd8jpg'
+
+    async def _unexpected_create_subprocess_exec(*args: str, **kwargs: object) -> object:
+        raise AssertionError('yt-dlp subprocess should not be spawned for youtube cover-only fetch_track_info')
+
+    monkeypatch.setattr(ytdlp_module, '_download_http_bytes', _fake_download_http_bytes)
+    monkeypatch.setattr(ytdlp_module.asyncio, 'create_subprocess_exec', _unexpected_create_subprocess_exec)
+
+    result = await ytdlp_module.fetch_track_info(
+        'https://youtu.be/EuVFrXWIGAw',
+        with_cover=True,
+        with_metadata=False,
+    )
+
+    assert result == ytdlp_module.UrlTrackInfo(cover=b'\xff\xd8jpg', metadata=None)
+    assert observed['thumbnail_url'] == 'https://i.ytimg.com/vi/EuVFrXWIGAw/maxresdefault.jpg'
+
+
+@pytest.mark.asyncio
+async def test_fetch_track_info_with_youtube_cover_only_falls_back_across_thumbnail_candidates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed_urls: list[str] = []
+
+    async def _fake_download_http_bytes(url: str, *, timeout_seconds: float) -> bytes:
+        del timeout_seconds
+        observed_urls.append(url)
+        if url.endswith('/maxresdefault.jpg'):
+            return b'not-jpeg'
+        if url.endswith('/sddefault.jpg'):
+            return b'\xff\xd8good'
+        return b'\xff\xd8unused'
+
+    async def _unexpected_create_subprocess_exec(*args: str, **kwargs: object) -> object:
+        raise AssertionError('yt-dlp subprocess should not be spawned for youtube cover-only fetch_track_info')
+
+    monkeypatch.setattr(ytdlp_module, '_download_http_bytes', _fake_download_http_bytes)
+    monkeypatch.setattr(ytdlp_module.asyncio, 'create_subprocess_exec', _unexpected_create_subprocess_exec)
+
+    result = await ytdlp_module.fetch_track_info(
+        'https://www.youtube.com/watch?v=EuVFrXWIGAw',
+        with_cover=True,
+        with_metadata=False,
+    )
+
+    assert result == ytdlp_module.UrlTrackInfo(cover=b'\xff\xd8good', metadata=None)
+    assert observed_urls == [
+        'https://i.ytimg.com/vi/EuVFrXWIGAw/maxresdefault.jpg',
+        'https://i.ytimg.com/vi/EuVFrXWIGAw/sddefault.jpg',
+    ]
+
+
+@pytest.mark.asyncio
+async def test_fetch_track_info_with_youtube_cover_only_shrinks_timeout_budget_across_attempts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed_timeouts: list[float] = []
+
+    class _FakeLoop:
+        def __init__(self) -> None:
+            self._times = iter((100.0, 100.0, 103.0, 106.0))
+
+        def time(self) -> float:
+            return next(self._times)
+
+    async def _fake_download_http_bytes(url: str, *, timeout_seconds: float) -> bytes:
+        observed_timeouts.append(timeout_seconds)
+        if url.endswith('/maxresdefault.jpg'):
+            raise urllib.error.URLError('first attempt failed')
+        return b'\xff\xd8ok'
+
+    async def _unexpected_create_subprocess_exec(*args: str, **kwargs: object) -> object:
+        raise AssertionError('yt-dlp subprocess should not be spawned for youtube cover-only fetch_track_info')
+
+    monkeypatch.setattr(ytdlp_module.asyncio, 'get_running_loop', lambda: _FakeLoop())
+    monkeypatch.setattr(ytdlp_module, '_download_http_bytes', _fake_download_http_bytes)
+    monkeypatch.setattr(ytdlp_module.asyncio, 'create_subprocess_exec', _unexpected_create_subprocess_exec)
+
+    result = await ytdlp_module.fetch_track_info(
+        'https://www.youtube.com/watch?v=EuVFrXWIGAw',
+        with_cover=True,
+        with_metadata=False,
+        timeout=timedelta(seconds=10),
+    )
+
+    assert result == ytdlp_module.UrlTrackInfo(cover=b'\xff\xd8ok', metadata=None)
+    assert observed_timeouts == [10.0, 7.0]
+
+
+@pytest.mark.asyncio
+async def test_fetch_track_info_with_non_youtube_cover_only_keeps_ytdlp_cover_behavior(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed = {'cover_called': False}
+
+    async def _fake_cover(url: str, *, timeout: timedelta) -> bytes:
+        observed['cover_called'] = True
+        assert url == 'https://example.com/watch?v=abc'
+        return b'cover-jpg'
+
+    async def _unexpected_download_http_bytes(url: str, *, timeout_seconds: float) -> bytes:
+        raise AssertionError(f'unexpected direct thumbnail fetch for non-youtube url: {url}')
+
+    monkeypatch.setattr(ytdlp_module, '_download_cover_as_jpg', _fake_cover)
+    monkeypatch.setattr(ytdlp_module, '_download_http_bytes', _unexpected_download_http_bytes)
+
+    result = await ytdlp_module.fetch_track_info(
+        'https://example.com/watch?v=abc',
+        with_cover=True,
+        with_metadata=False,
+    )
+
+    assert result == ytdlp_module.UrlTrackInfo(cover=b'cover-jpg', metadata=None)
+    assert observed['cover_called'] is True
+
+
+@pytest.mark.asyncio
+async def test_fetch_track_info_with_metadata_only_fetches_only_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed = {'cover_called': False}
+
+    async def _fake_cover(url: str, *, timeout: timedelta) -> bytes:
+        observed['cover_called'] = True
+        return b'cover'
+
+    async def _fake_metadata(url: str, *, timeout: timedelta) -> ytdlp_module.TrackMetadata:
+        return ytdlp_module.TrackMetadata(artists=('Artist 1',), title='Song')
+
+    monkeypatch.setattr(ytdlp_module, '_download_cover_as_jpg', _fake_cover)
+    monkeypatch.setattr(ytdlp_module, '_download_track_metadata', _fake_metadata)
+
+    result = await ytdlp_module.fetch_track_info(
+        'https://example.com/watch?v=abc',
+        with_cover=False,
+        with_metadata=True,
+    )
+
+    assert result == ytdlp_module.UrlTrackInfo(
+        cover=None,
+        metadata=ytdlp_module.TrackMetadata(artists=('Artist 1',), title='Song'),
+    )
+    assert observed['cover_called'] is False
+
+
+@pytest.mark.asyncio
+async def test_fetch_track_info_with_no_flags_returns_empty_and_spawns_no_process(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def _unexpected_create_subprocess_exec(*args: str, **kwargs: object) -> object:
+        raise AssertionError('yt-dlp should not be spawned when no outputs are requested')
+
+    monkeypatch.setattr(ytdlp_module.asyncio, 'create_subprocess_exec', _unexpected_create_subprocess_exec)
+
+    result = await ytdlp_module.fetch_track_info(
+        'https://example.com/watch?v=abc',
+        with_cover=False,
+        with_metadata=False,
+    )
+
+    assert result == ytdlp_module.UrlTrackInfo()
+
+
+@pytest.mark.asyncio
+async def test_fetch_track_info_rejects_non_string_url() -> None:
+    with pytest.raises(ValueError, match='url must be a string'):
+        await ytdlp_module.fetch_track_info(123)  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_fetch_track_info_rejects_blank_url() -> None:
+    with pytest.raises(ValueError, match='url must not be empty'):
+        await ytdlp_module.fetch_track_info('   ')
+
+
+@pytest.mark.asyncio
+async def test_fetch_track_info_with_cover_propagates_cover_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def _failing_cover(url: str, *, timeout: timedelta) -> bytes:
+        raise RuntimeError('yt-dlp did not produce cover output')
+
+    monkeypatch.setattr(ytdlp_module, '_download_cover_as_jpg', _failing_cover)
+
+    with pytest.raises(RuntimeError, match='yt-dlp did not produce cover output'):
+        await ytdlp_module.fetch_track_info(
+            'https://example.com/watch?v=abc',
+            with_cover=True,
+            with_metadata=False,
+        )
+
+
+@pytest.mark.asyncio
+async def test_fetch_track_info_with_metadata_propagates_metadata_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def _failing_metadata(url: str, *, timeout: timedelta) -> ytdlp_module.TrackMetadata:
+        raise YtDlpMetadataError('yt-dlp produced incomplete metadata output')
+
+    monkeypatch.setattr(ytdlp_module, '_download_track_metadata', _failing_metadata)
+
+    with pytest.raises(YtDlpMetadataError, match='yt-dlp produced incomplete metadata output'):
+        await ytdlp_module.fetch_track_info(
+            'https://example.com/watch?v=abc',
+            with_cover=False,
+            with_metadata=True,
+        )
 
 
 @pytest.mark.asyncio

@@ -272,6 +272,35 @@ def validate_link_only_store_input(messages: Sequence[Message]) -> LinkOnlyTrack
     return parse_link_only_store_input(message.text)
 
 
+def extract_audio_link_store_messages(messages: Sequence[Message]) -> tuple[Message, Message]:
+    """Return validated URL text + audio messages, order-independent."""
+    if len(messages) != 2:
+        raise TrackInputError('Invalid input')
+    if any(
+        message.photo is not None or message.video is not None or getattr(message, 'animation', None) is not None
+        for message in messages
+    ):
+        raise TrackInputError('Invalid input')
+
+    text_messages = [message for message in messages if message.text is not None]
+    audio_messages = [message for message in messages if extract_track_audio_attachment(message) is not None]
+    if len(text_messages) != 1 or len(audio_messages) != 1:
+        raise TrackInputError('Invalid input')
+    text_message = text_messages[0]
+    audio_message = audio_messages[0]
+    if audio_message.caption is not None:
+        raise TrackInputError('Invalid input')
+    return text_message, audio_message
+
+
+def validate_audio_link_store_input(messages: Sequence[Message]) -> tuple[Message, LinkOnlyTrackInput]:
+    """Validate one URL text + audio input and parse URL metadata lines."""
+    text_message, audio_message = extract_audio_link_store_messages(messages)
+    if text_message.text is None:
+        raise TrackInputError('Invalid input')
+    return audio_message, parse_link_only_store_input(text_message.text)
+
+
 def parse_cover_link_store_input(messages: Sequence[Message]) -> CoverLinkTrackInput:
     if len(messages) != 1:
         raise TrackInputError('Invalid input')
@@ -425,6 +454,13 @@ def prepare_link_only_track_from_buffer(
     messages: Sequence[Message],
 ) -> LinkOnlyTrackInput:
     return validate_link_only_store_input(messages)
+
+
+def prepare_audio_link_track_from_buffer(
+    *,
+    messages: Sequence[Message],
+) -> tuple[Message, LinkOnlyTrackInput]:
+    return validate_audio_link_store_input(messages)
 
 
 def _caption_to_artists_and_title(caption: str | None) -> tuple[tuple[str, ...], str]:

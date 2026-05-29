@@ -39,15 +39,17 @@ from timeline_hub.handlers.tracks.store_execution import (
     is_supported_youtube_store_url,
     parse_cover_link_store_input,
     prepare_audio_from_message,
+    prepare_audio_link_track_from_buffer,
     prepare_audio_only_track_from_buffer,
     prepare_link_only_track_from_buffer,
     prepare_tracks_from_buffer,
+    validate_audio_link_store_input,
     validate_audio_only_store_input,
     validate_link_only_store_input,
     validate_track_batch,
 )
 from timeline_hub.infra.images import normalize_cover_to_jpg
-from timeline_hub.infra.ytdlp import YtDlpMetadataError, download_audio_as_opus
+from timeline_hub.infra.ytdlp import YtDlpMetadataError, download_audio_as_opus, fetch_track_info
 from timeline_hub.services.container import Services
 from timeline_hub.services.track_store import (
     InvalidTrackIdentityError,
@@ -1397,6 +1399,40 @@ async def _on_store_sub_season_selected_with_mode(
         return
 
     try:
+        audio_message, parsed_link_input = prepare_audio_link_track_from_buffer(messages=buffered_messages)
+    except TrackInputError:
+        audio_message = None
+        parsed_link_input = None
+    if audio_message is not None and parsed_link_input is not None:
+        if completion_mode is None:
+            await _show_store_final_menu(
+                message=message,
+                state=state,
+                settings=settings,
+                universe=universe,
+                year=year,
+                season=season,
+                sub_season=sub_season,
+                from_step=TrackStoreStep.SUB_SEASON,
+            )
+            return
+        await _execute_track_store_with_uploaded_audio_link_info(
+            message=message,
+            state=state,
+            services=services,
+            settings=settings,
+            bot=bot,
+            universe=universe,
+            year=year,
+            season=season,
+            sub_season=sub_season,
+            audio_message=audio_message,
+            parsed_link_input=parsed_link_input,
+            completion_mode=completion_mode,
+        )
+        return
+
+    try:
         is_link_only = False
         try:
             _ = validate_audio_only_store_input(buffered_messages)
@@ -1470,6 +1506,121 @@ async def _on_store_sub_season_selected_with_mode(
             services=services,
             text='Invalid input',
         )
+
+
+async def _execute_track_store_with_uploaded_audio_link_info(
+    *,
+    message: Message,
+    state: FSMContext,
+    services: Services,
+    settings: Settings,
+    bot: Bot,
+    universe: TrackUniverse,
+    year: int,
+    season: Season,
+    sub_season: SubSeason,
+    audio_message: Message,
+    parsed_link_input: LinkOnlyTrackInput,
+    completion_mode: TrackStoreCompletionMode = TrackStoreCompletionMode.SKIP,
+) -> None:
+    chat_id = message.chat.id
+    expected_version = _buffer_version_from_state(await state.get_data())
+    if services.chat_message_buffer.version(chat_id) != expected_version:
+        await handle_stale_selection(message=message, state=state)
+        return
+
+    await message.edit_text(
+        **selected_text(
+            selected=_selected_store_path(
+                universe=universe,
+                year=year,
+                season=season,
+                sub_season=sub_season,
+            ),
+        ),
+        reply_markup=None,
+    )
+
+    try:
+        audio = await prepare_audio_from_message(bot=bot, audio_message=audio_message)
+        try:
+            fetched_track_info = await fetch_track_info(
+                parsed_link_input.url,
+                with_cover=True,
+                with_metadata=parsed_link_input.requires_metadata,
+            )
+            artists, title = _resolve_track_link_metadata(
+                parsed_link_input=parsed_link_input,
+                metadata=fetched_track_info.metadata,
+            )
+            if fetched_track_info.cover is None:
+                raise RuntimeError('yt-dlp did not produce cover output')
+        except YtDlpMetadataError as error:
+            if not _is_expected_track_metadata_unavailable(error):
+                logger.exception('track link metadata unavailable')
+            await _invalidate_track_intake_buffer(
+                message=message,
+                state=state,
+                services=services,
+                text='No artists and title available',
+            )
+            return
+        except Exception as error:
+            if _is_youtube_cookies_required_error(error):
+                await _invalidate_track_intake_buffer(
+                    message=message,
+                    state=state,
+                    services=services,
+                    text='Cookies required',
+                )
+                return
+            logger.exception('track link info fetch failed')
+            await _invalidate_track_intake_buffer(
+                message=message,
+                state=state,
+                services=services,
+                text='Download failed',
+            )
+            return
+
+        group = TrackGroup(universe=universe, year=year, season=season)
+        stored_track_info = await services.track_store.store(
+            group,
+            sub_season,
+            track=Track(
+                artists=artists,
+                title=title,
+                audio=audio,
+                cover=FileBytes(data=fetched_track_info.cover, extension=Extension.JPG),
+                album_id=None,
+            ),
+        )
+    except TrackInputError, TrackGroupNotFoundError:
+        await _invalidate_track_intake_buffer(
+            message=message,
+            state=state,
+            services=services,
+            text='Invalid input',
+        )
+        return
+    except Exception:
+        logger.exception('track store failed')
+        await state.clear()
+        services.chat_message_buffer.flush(chat_id)
+        await message.answer(text='Storing failed\nNo tracks were stored')
+        return
+
+    await state.clear()
+    services.chat_message_buffer.flush(chat_id)
+    await _complete_track_store(
+        message=message,
+        services=services,
+        settings=settings,
+        bot=bot,
+        completion_mode=completion_mode,
+        group=group,
+        stored_track_infos=[stored_track_info],
+    )
 
 
 async def _execute_track_store_with_auto_cover(
@@ -2274,7 +2425,8 @@ def _validate_store_input_at_entry(messages: list[Message]) -> None:
         validate_track_batch(extract_store_messages(messages))
         return
     if has_audio and any(_first_non_empty_line_is_supported_store_link(message.text) for message in messages):
-        raise TrackInputError('Invalid input')
+        _ = validate_audio_link_store_input(messages)
+        return
     try:
         validate_audio_only_store_input(messages)
     except TrackInputError:

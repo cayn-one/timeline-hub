@@ -2,6 +2,9 @@ import asyncio
 import contextlib
 import json
 import tempfile
+import urllib.error
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
@@ -22,6 +25,54 @@ class DownloadedAudio:
     audio: bytes
     cover: bytes | None = None
     metadata: TrackMetadata | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class UrlTrackInfo:
+    cover: bytes | None = None
+    metadata: TrackMetadata | None = None
+
+
+async def fetch_track_info(
+    url: str,
+    *,
+    with_cover: bool = True,
+    with_metadata: bool = True,
+    timeout: timedelta = timedelta(minutes=1),
+) -> UrlTrackInfo:
+    """Fetch URL-derived cover and metadata without downloading audio.
+
+    Args:
+        url: Source URL to inspect.
+        with_cover: Whether to fetch cover bytes.
+        with_metadata: Whether to fetch parsed track metadata.
+        timeout: Maximum time allowed per `yt-dlp` subprocess run.
+
+    Returns:
+        UrlTrackInfo with optional cover and metadata.
+
+    Raises:
+        ValueError: If `url` is invalid.
+        RuntimeError: If cover extraction fails or `yt-dlp` fails.
+        YtDlpMetadataError: If metadata extraction or parsing fails.
+    """
+    normalized_url = _normalize_url(url)
+    if not with_cover and not with_metadata:
+        return UrlTrackInfo()
+
+    cover: bytes | None = None
+    metadata: TrackMetadata | None = None
+    if with_cover:
+        youtube_video_id = None
+        if not with_metadata:
+            youtube_video_id = _extract_youtube_video_id(normalized_url)
+        if youtube_video_id is not None:
+            cover = await _download_youtube_thumbnail_as_jpg(youtube_video_id, timeout=timeout)
+        else:
+            cover = await _download_cover_as_jpg(normalized_url, timeout=timeout)
+    if with_metadata:
+        metadata = await _download_track_metadata(normalized_url, timeout=timeout)
+    return UrlTrackInfo(cover=cover, metadata=metadata)
 
 
 async def download_audio_as_opus(
@@ -160,6 +211,85 @@ def _validate_max_duration(max_duration: timedelta) -> None:
         raise ValueError('max_duration must be a timedelta')
     if max_duration <= timedelta(0):
         raise ValueError('max_duration must be > 0')
+
+
+def _extract_youtube_video_id(url: str) -> str | None:
+    parsed = urllib.parse.urlparse(url)
+    host = parsed.netloc.lower()
+    if host in ('youtube.com', 'www.youtube.com', 'music.youtube.com'):
+        if parsed.path == '/watch':
+            video_ids = urllib.parse.parse_qs(parsed.query).get('v', ())
+            for video_id in video_ids:
+                normalized_video_id = video_id.strip()
+                if _is_valid_youtube_video_id(normalized_video_id):
+                    return normalized_video_id
+            return None
+        path_segments = [segment for segment in parsed.path.split('/') if segment]
+        if len(path_segments) >= 2 and path_segments[0] == 'shorts':
+            short_video_id = path_segments[1].strip()
+            if _is_valid_youtube_video_id(short_video_id):
+                return short_video_id
+            return None
+        return None
+
+    if host == 'youtu.be':
+        path_segments = [segment for segment in parsed.path.split('/') if segment]
+        if len(path_segments) != 1:
+            return None
+        short_video_id = path_segments[0].strip()
+        if _is_valid_youtube_video_id(short_video_id):
+            return short_video_id
+    return None
+
+
+def _is_valid_youtube_video_id(value: str) -> bool:
+    if len(value) != 11:
+        return False
+    return all(character.isalnum() or character in {'-', '_'} for character in value)
+
+
+async def _download_youtube_thumbnail_as_jpg(
+    video_id: str,
+    *,
+    timeout: timedelta,
+) -> bytes:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout.total_seconds()
+
+    thumbnail_names = ('maxresdefault.jpg', 'sddefault.jpg', 'hqdefault.jpg')
+    for thumbnail_name in thumbnail_names:
+        remaining_seconds = deadline - loop.time()
+        if remaining_seconds <= 0:
+            raise asyncio.TimeoutError
+        thumbnail_url = f'https://i.ytimg.com/vi/{video_id}/{thumbnail_name}'
+        try:
+            cover_bytes = await _download_http_bytes(
+                thumbnail_url,
+                timeout_seconds=remaining_seconds,
+            )
+        except urllib.error.URLError, TimeoutError:
+            continue
+        if not cover_bytes:
+            continue
+        if not cover_bytes.startswith(b'\xff\xd8'):
+            continue
+        return cover_bytes
+
+    raise RuntimeError('youtube thumbnail did not produce cover output')
+
+
+async def _download_http_bytes(url: str, *, timeout_seconds: float) -> bytes:
+    if timeout_seconds <= 0:
+        raise asyncio.TimeoutError
+
+    def _fetch() -> bytes:
+        with urllib.request.urlopen(url, timeout=timeout_seconds) as response:
+            status = response.getcode()
+            if status != 200:
+                raise RuntimeError(f'http download failed with status {status}')
+            return response.read()
+
+    return await asyncio.to_thread(_fetch)
 
 
 async def _download_audio_as_opus_internal(
