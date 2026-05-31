@@ -152,7 +152,6 @@ class TrackInfo:
 class FetchedVariant:
     """One generated playable track variant returned by `fetch()` as MP3 `FileBytes`."""
 
-    level: int
     speed: float
     reverb: float
     audio: FileBytes
@@ -459,7 +458,6 @@ class ManifestEntry:
 
 @dataclass(frozen=True, slots=True)
 class _ResolvedVariantSpec:
-    level: int
     speed: float
     reverb: float
 
@@ -2555,7 +2553,6 @@ class TrackStore:
             for level in range(1, preset.slowed.levels + 1):
                 variant_specs.append(
                     _ResolvedVariantSpec(
-                        level=level,
                         speed=1.0 - level * preset.slowed.step,
                         reverb=0.0,
                     )
@@ -2564,7 +2561,6 @@ class TrackStore:
             for level in range(1, preset.sped_up.levels + 1):
                 variant_specs.append(
                     _ResolvedVariantSpec(
-                        level=level,
                         speed=1.0 + level * preset.sped_up.step,
                         reverb=0.0,
                     )
@@ -2599,7 +2595,6 @@ class TrackStore:
         variant_bytes_list = await asyncio.gather(*(self._s3_client.get_bytes(key) for key in variant_keys))
         return tuple(
             FetchedVariant(
-                level=spec.level,
                 speed=spec.speed,
                 reverb=spec.reverb,
                 audio=FileBytes(data=variant_bytes, extension=Extension.MP3),
@@ -2648,7 +2643,6 @@ class TrackStore:
                 uploaded_keys.append(variant_key)
             variants.append(
                 FetchedVariant(
-                    level=spec.level,
                     speed=spec.speed,
                     reverb=spec.reverb,
                     audio=FileBytes(data=generated_bytes, extension=Extension.MP3),

@@ -419,12 +419,10 @@ def _opus_file(data: bytes) -> FileBytes:
 def _fetched_variant(
     *,
     data: bytes,
-    level: int = 1,
     speed: float = 1.0,
     reverb: float = 0.0,
 ) -> track_store_module.FetchedVariant:
     return track_store_module.FetchedVariant(
-        level=level,
         speed=speed,
         reverb=reverb,
         audio=_opus_file(data),
@@ -1372,17 +1370,17 @@ async def test_track_retrieve_sub_season_selection_fetches_all_before_sending_an
                 track_id=track_1.id,
                 title='First',
                 cover=b'cover-1',
-                variants=[_fetched_variant(data=b'first-main', level=1, speed=0.95, reverb=0.06)],
+                variants=[_fetched_variant(data=b'first-main', speed=0.95, reverb=0.06)],
             ),
             track_2.id: _fetched_track(
                 track_id=track_2.id,
                 title='Second',
                 cover=b'cover-2',
                 variants=[
-                    _fetched_variant(data=b'second-main-1', level=2, speed=1.12, reverb=0.01),
-                    _fetched_variant(data=b'second-main-2', level=1, speed=0.95, reverb=0.12),
+                    _fetched_variant(data=b'second-main-1', speed=1.12, reverb=0.01),
+                    _fetched_variant(data=b'second-main-2', speed=0.95, reverb=0.12),
                 ],
-                instrumental_variants=[_fetched_variant(data=b'second-inst', level=3, speed=1.08, reverb=0.01)],
+                instrumental_variants=[_fetched_variant(data=b'second-inst', speed=1.08, reverb=0.01)],
             ),
         },
         events=events,
@@ -1525,7 +1523,7 @@ async def test_track_retrieve_sub_season_selection_fetches_all_before_sending_an
 @pytest.mark.asyncio
 async def test_send_variant_audio_single_variant_uses_send_audio() -> None:
     bot = AsyncMock()
-    variants = [_fetched_variant(data=b'only', level=1, speed=0.95, reverb=0.06)]
+    variants = [_fetched_variant(data=b'only', speed=0.95, reverb=0.06)]
 
     await track_retrieve_module._send_variant_audio(
         bot=bot,
@@ -1545,8 +1543,8 @@ async def test_send_variant_audio_single_variant_uses_send_audio() -> None:
 async def test_send_variant_audio_small_multi_variant_uses_media_group() -> None:
     bot = AsyncMock()
     variants = [
-        _fetched_variant(data=b'first', level=2, speed=1.12, reverb=0.01),
-        _fetched_variant(data=b'second', level=1, speed=0.95, reverb=0.12),
+        _fetched_variant(data=b'first', speed=1.12, reverb=0.01),
+        _fetched_variant(data=b'second', speed=0.95, reverb=0.12),
     ]
 
     await track_retrieve_module._send_variant_audio(
@@ -1570,8 +1568,8 @@ async def test_send_variant_audio_large_multi_variant_skips_media_group_and_send
 ) -> None:
     bot = AsyncMock()
     variants = [
-        _fetched_variant(data=(b'a' * 700_000), level=2, speed=1.12, reverb=0.01),
-        _fetched_variant(data=(b'b' * 700_000), level=1, speed=0.95, reverb=0.12),
+        _fetched_variant(data=(b'a' * 700_000), speed=1.12, reverb=0.01),
+        _fetched_variant(data=(b'b' * 700_000), speed=0.95, reverb=0.12),
     ]
     log_info = Mock()
     monkeypatch.setattr(track_retrieve_module.logger, 'info', log_info)
@@ -1595,8 +1593,8 @@ async def test_send_variant_audio_large_multi_variant_skips_media_group_and_send
 async def test_send_variant_audio_falls_back_when_media_group_too_large(monkeypatch: pytest.MonkeyPatch) -> None:
     bot = AsyncMock()
     variants = [
-        _fetched_variant(data=b'first', level=2, speed=1.12, reverb=0.01),
-        _fetched_variant(data=b'second', level=1, speed=0.95, reverb=0.12),
+        _fetched_variant(data=b'first', speed=1.12, reverb=0.01),
+        _fetched_variant(data=b'second', speed=0.95, reverb=0.12),
     ]
     bot.send_media_group.side_effect = TelegramEntityTooLarge(
         method=SendMediaGroup(chat_id=9, media=[]),
@@ -1621,15 +1619,15 @@ async def test_send_variant_audio_falls_back_when_media_group_too_large(monkeypa
 
 
 def test_track_retrieve_variant_filename_rejects_unmodified_speed() -> None:
-    variant = _fetched_variant(data=b'audio', level=1, speed=1.0, reverb=0.06)
+    variant = _fetched_variant(data=b'audio', speed=1.0, reverb=0.06)
 
     with pytest.raises(ValueError, match='speed must not be 1.0'):
         track_retrieve_module._variant_filename(variant)
 
 
 def test_track_retrieve_variant_filename_uses_directional_tokens() -> None:
-    fast_variant = _fetched_variant(data=b'audio', level=1, speed=1.12, reverb=0.06)
-    slow_variant = _fetched_variant(data=b'audio', level=1, speed=0.95, reverb=0.06)
+    fast_variant = _fetched_variant(data=b'audio', speed=1.12, reverb=0.06)
+    slow_variant = _fetched_variant(data=b'audio', speed=0.95, reverb=0.06)
 
     assert track_retrieve_module._variant_filename(fast_variant) == '++'
     assert track_retrieve_module._variant_filename(slow_variant) == '--'

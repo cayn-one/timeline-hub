@@ -4431,7 +4431,6 @@ async def test_fetch_with_explicit_preset_returns_current_original_and_instrumen
     assert result.cover.extension is Extension.JPG
     assert not hasattr(result, 'cover_filename')
     assert isinstance(result.variants[0], FetchedVariant)
-    assert [variant.level for variant in result.variants] == [3, 2, 1, 1, 2]
     assert [variant.speed for variant in result.variants] == sorted(variant.speed for variant in result.variants)
     assert [variant.reverb for variant in result.variants] == [0.05, 0.04, 0.03, 0.02, 0.01]
     assert [variant.audio.data for variant in result.variants] == [
