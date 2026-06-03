@@ -39,6 +39,9 @@ from timeline_hub.services.track_store import (
     TrackStore,
     TrackUniverse,
     TrackUpdateManifestSyncError,
+    UploadedVariant,
+    UploadedVariantMetadata,
+    VariantSpec,
 )
 from timeline_hub.types import Extension, FileBytes, InvalidExtensionError
 
@@ -277,6 +280,7 @@ def _entry(
     has_variants: bool = False,
     has_instrumental: bool = False,
     has_instrumental_variants: bool = False,
+    uploaded_variants: UploadedVariantMetadata | None = None,
 ) -> ManifestEntry:
     return ManifestEntry(
         id=id,
@@ -289,6 +293,7 @@ def _entry(
         has_variants=has_variants,
         has_instrumental=has_instrumental,
         has_instrumental_variants=has_instrumental_variants,
+        uploaded_variants=uploaded_variants,
     )
 
 
@@ -341,6 +346,14 @@ def _track(
     )
 
 
+def _uploaded_variant(*, speed: float, reverb: float, audio_bytes: bytes = b'variant') -> UploadedVariant:
+    return UploadedVariant(
+        speed=speed,
+        reverb=reverb,
+        audio=FileBytes(data=audio_bytes, extension=Extension.MP3),
+    )
+
+
 def test_season_from_month_uses_exact_mapping() -> None:
     assert Season.from_month(2) is Season.S1
     assert Season.from_month(3) is Season.S2
@@ -377,6 +390,75 @@ def test_preset_rejects_empty_name() -> None:
 def test_preset_rejects_negative_reverb_start() -> None:
     with pytest.raises(ValueError, match='Preset.reverb_start must be >= 0'):
         _preset(name='default', reverb_start=-0.01)
+
+
+@pytest.mark.parametrize(
+    ('kwargs', 'message'),
+    [
+        ({'speed': 0}, 'VariantSpec.speed must be > 0'),
+        ({'speed': float('inf')}, 'VariantSpec.speed must be finite'),
+        ({'speed': 'slow'}, 'VariantSpec.speed must be numeric'),
+        ({'reverb': -0.1}, 'VariantSpec.reverb must be >= 0'),
+        ({'reverb': float('nan')}, 'VariantSpec.reverb must be finite'),
+        ({'reverb': 'wet'}, 'VariantSpec.reverb must be numeric'),
+    ],
+)
+def test_variant_spec_rejects_invalid_fields(kwargs: dict[str, object], message: str) -> None:
+    with pytest.raises(ValueError, match=message):
+        VariantSpec(
+            speed=kwargs.get('speed', 1.0),  # type: ignore[arg-type]
+            reverb=kwargs.get('reverb', 0.1),  # type: ignore[arg-type]
+        )
+
+
+def test_uploaded_variant_rejects_non_mp3_audio() -> None:
+    with pytest.raises(InvalidExtensionError, match='UploadedVariant.audio must use Extension.MP3'):
+        UploadedVariant(
+            speed=1.0,
+            reverb=0.1,
+            audio=FileBytes(data=b'variant', extension=Extension.OPUS),
+        )
+
+
+def test_uploaded_variant_metadata_rejects_empty_variants() -> None:
+    with pytest.raises(ValueError, match='UploadedVariantMetadata.variants must not be empty'):
+        UploadedVariantMetadata(variants=(), instrumental_variants=None)
+
+
+def test_uploaded_variant_metadata_rejects_unsorted_speeds() -> None:
+    with pytest.raises(
+        ValueError,
+        match='UploadedVariantMetadata.variants speeds must be strictly sorted ascending without duplicates',
+    ):
+        UploadedVariantMetadata(
+            variants=(
+                VariantSpec(speed=1.1, reverb=0.0),
+                VariantSpec(speed=0.9, reverb=0.1),
+            ),
+            instrumental_variants=None,
+        )
+
+
+def test_uploaded_variant_metadata_rejects_duplicate_speeds() -> None:
+    with pytest.raises(
+        ValueError,
+        match='UploadedVariantMetadata.variants speeds must be strictly sorted ascending without duplicates',
+    ):
+        UploadedVariantMetadata(
+            variants=(
+                VariantSpec(speed=1.0, reverb=0.0),
+                VariantSpec(speed=1.0, reverb=0.1),
+            ),
+            instrumental_variants=None,
+        )
+
+
+def test_uploaded_variant_metadata_rejects_family_count_over_ten() -> None:
+    with pytest.raises(ValueError, match='UploadedVariantMetadata.variants must contain at most 10 items'):
+        UploadedVariantMetadata(
+            variants=tuple(VariantSpec(speed=1.0 + index, reverb=0.0) for index in range(11)),
+            instrumental_variants=None,
+        )
 
 
 def test_resolve_variant_specs_assigns_reverb_from_fastest_to_slowest() -> None:
@@ -657,6 +739,7 @@ def test_manifest_uses_data_root_with_preferred_field_order() -> None:
                 'has_variants': False,
                 'has_instrumental': False,
                 'has_instrumental_variants': False,
+                'uploaded_variants': None,
             }
         ]
     }
@@ -671,6 +754,7 @@ def test_manifest_uses_data_root_with_preferred_field_order() -> None:
         'has_variants',
         'has_instrumental',
         'has_instrumental_variants',
+        'uploaded_variants',
     ]
     assert list(Manifest.from_dict(payload)) == [entry]
 
@@ -707,10 +791,121 @@ def test_manifest_round_trips_has_instrumental_variants() -> None:
                 'has_variants': True,
                 'has_instrumental': True,
                 'has_instrumental_variants': True,
+                'uploaded_variants': None,
             }
         ]
     }
     assert list(Manifest.from_dict(payload)) == [entry]
+
+
+def test_manifest_round_trips_uploaded_variants() -> None:
+    entry = _entry(
+        id=_UUID_1,
+        has_variants=True,
+        has_instrumental=False,
+        has_instrumental_variants=True,
+        uploaded_variants=UploadedVariantMetadata(
+            variants=(
+                VariantSpec(speed=0.85, reverb=0.3),
+                VariantSpec(speed=1.15, reverb=0.4),
+            ),
+            instrumental_variants=(VariantSpec(speed=0.9, reverb=0.2),),
+        ),
+    )
+
+    payload = Manifest([entry]).to_dict()
+
+    assert payload['data'][0]['uploaded_variants'] == {
+        'variants': [
+            {'speed': 0.85, 'reverb': 0.3},
+            {'speed': 1.15, 'reverb': 0.4},
+        ],
+        'instrumental_variants': [{'speed': 0.9, 'reverb': 0.2}],
+    }
+    assert list(Manifest.from_dict(payload)) == [entry]
+
+
+def test_manifest_accepts_uploaded_mode_instrumental_variants_without_instrumental_source() -> None:
+    payload = {
+        'data': [
+            {
+                'id': _UUID_1,
+                'album_id': _UUID_1,
+                'artists': ['artist'],
+                'title': 'title',
+                'sub_season': 'A',
+                'order': 1,
+                'preset': _applied_preset_dict(_applied_preset()),
+                'has_variants': True,
+                'has_instrumental': False,
+                'has_instrumental_variants': True,
+                'uploaded_variants': {
+                    'variants': [{'speed': 0.9, 'reverb': 0.1}],
+                    'instrumental_variants': [{'speed': 1.1, 'reverb': 0.2}],
+                },
+            }
+        ]
+    }
+
+    [parsed] = list(Manifest.from_dict(payload))
+    assert parsed.uploaded_variants is not None
+    assert parsed.has_instrumental is False
+    assert parsed.has_instrumental_variants is True
+
+
+def test_manifest_rejects_uploaded_mode_without_has_variants() -> None:
+    with pytest.raises(ValueError, match='ManifestEntry uploaded mode requires `has_variants`'):
+        Manifest.from_dict(
+            {
+                'data': [
+                    {
+                        'id': _UUID_1,
+                        'album_id': _UUID_1,
+                        'artists': ['artist'],
+                        'title': 'title',
+                        'sub_season': 'A',
+                        'order': 1,
+                        'preset': _applied_preset_dict(_applied_preset()),
+                        'has_variants': False,
+                        'has_instrumental': False,
+                        'has_instrumental_variants': False,
+                        'uploaded_variants': {
+                            'variants': [{'speed': 0.9, 'reverb': 0.1}],
+                            'instrumental_variants': None,
+                        },
+                    }
+                ]
+            }
+        )
+
+
+def test_manifest_rejects_uploaded_mode_instrumental_mismatch() -> None:
+    with pytest.raises(
+        ValueError,
+        match='ManifestEntry uploaded mode requires `has_instrumental_variants` to match uploaded metadata',
+    ):
+        Manifest.from_dict(
+            {
+                'data': [
+                    {
+                        'id': _UUID_1,
+                        'album_id': _UUID_1,
+                        'artists': ['artist'],
+                        'title': 'title',
+                        'sub_season': 'A',
+                        'order': 1,
+                        'preset': _applied_preset_dict(_applied_preset()),
+                        'has_variants': True,
+                        'has_instrumental': False,
+                        'has_instrumental_variants': False,
+                        'uploaded_variants': {
+                            'variants': [{'speed': 0.9, 'reverb': 0.1}],
+                            'instrumental_variants': [{'speed': 1.1, 'reverb': 0.2}],
+                        },
+                    }
+                ]
+            }
+        )
 
 
 def test_manifest_next_order_is_dense_per_sub_season() -> None:
@@ -769,6 +964,7 @@ def test_manifest_rejects_duplicate_sub_season_order_position() -> None:
                         'has_variants': False,
                         'has_instrumental': False,
                         'has_instrumental_variants': False,
+                        'uploaded_variants': None,
                     },
                     {
                         'id': _UUID_2,
@@ -781,6 +977,7 @@ def test_manifest_rejects_duplicate_sub_season_order_position() -> None:
                         'has_variants': False,
                         'has_instrumental': True,
                         'has_instrumental_variants': False,
+                        'uploaded_variants': None,
                     },
                 ]
             }
@@ -803,6 +1000,7 @@ def test_manifest_rejects_invalid_preset_shape() -> None:
                         'has_variants': False,
                         'has_instrumental': False,
                         'has_instrumental_variants': False,
+                        'uploaded_variants': None,
                     }
                 ]
             }
@@ -825,6 +1023,7 @@ def test_manifest_rejects_invalid_album_id_shape() -> None:
                         'has_variants': False,
                         'has_instrumental': False,
                         'has_instrumental_variants': False,
+                        'uploaded_variants': None,
                     }
                 ]
             }
@@ -845,6 +1044,7 @@ def test_manifest_accepts_orphan_album_id_when_shape_is_valid() -> None:
                 'has_variants': False,
                 'has_instrumental': False,
                 'has_instrumental_variants': False,
+                'uploaded_variants': None,
             }
         ]
     }
@@ -852,8 +1052,11 @@ def test_manifest_accepts_orphan_album_id_when_shape_is_valid() -> None:
     assert list(Manifest.from_dict(payload)) == [_entry(id=_UUID_1, album_id=_UUID_2)]
 
 
-def test_manifest_rejects_instrumental_variants_without_instrumental() -> None:
-    with pytest.raises(ValueError, match=r'manifest `has_instrumental_variants` requires `has_instrumental`'):
+def test_manifest_rejects_generated_mode_instrumental_variants_without_instrumental() -> None:
+    with pytest.raises(
+        ValueError,
+        match=r'ManifestEntry generated mode requires `has_instrumental` for instrumental variants',
+    ):
         Manifest.from_dict(
             {
                 'data': [
@@ -875,6 +1078,7 @@ def test_manifest_rejects_instrumental_variants_without_instrumental() -> None:
                         'has_variants': False,
                         'has_instrumental': False,
                         'has_instrumental_variants': True,
+                        'uploaded_variants': None,
                     }
                 ]
             }
@@ -896,6 +1100,7 @@ def test_manifest_rejects_missing_has_variants() -> None:
                         'preset': _applied_preset_dict(_applied_preset()),
                         'has_instrumental': True,
                         'has_instrumental_variants': True,
+                        'uploaded_variants': None,
                     }
                 ]
             }
@@ -917,6 +1122,7 @@ def test_manifest_rejects_missing_has_variants() -> None:
                 'has_variants': False,
                 'has_instrumental': False,
                 'has_instrumental_variants': False,
+                'uploaded_variants': None,
             },
             'manifest `artists` must be a list',
         ),
@@ -932,6 +1138,7 @@ def test_manifest_rejects_missing_has_variants() -> None:
                 'has_variants': False,
                 'has_instrumental': False,
                 'has_instrumental_variants': False,
+                'uploaded_variants': None,
             },
             'manifest `artists` must not be empty',
         ),
@@ -947,6 +1154,7 @@ def test_manifest_rejects_missing_has_variants() -> None:
                 'has_variants': False,
                 'has_instrumental': False,
                 'has_instrumental_variants': False,
+                'uploaded_variants': None,
             },
             'manifest `artists[]` must be a string',
         ),
@@ -962,6 +1170,7 @@ def test_manifest_rejects_missing_has_variants() -> None:
                 'has_variants': False,
                 'has_instrumental': False,
                 'has_instrumental_variants': False,
+                'uploaded_variants': None,
             },
             'manifest `artists[]` must be a non-empty string',
         ),
@@ -977,6 +1186,7 @@ def test_manifest_rejects_missing_has_variants() -> None:
                 'has_variants': False,
                 'has_instrumental': False,
                 'has_instrumental_variants': False,
+                'uploaded_variants': None,
             },
             'manifest `title` must be a non-empty string',
         ),
@@ -4306,6 +4516,495 @@ async def test_reconcile_manifest_failure_keeps_requested_track_ids_for_pure_mov
     assert s3_client.objects[manifest_key] == original_manifest
 
 
+@pytest.mark.asyncio
+async def test_upload_variants_rejects_missing_families() -> None:
+    group = _track_group()
+    manifest_key = _manifest_key(universe=group.universe, year=group.year, season=group.season)
+    store = _store(
+        _FakeS3Client(
+            objects={
+                _presets_key(): _presets_bytes(),
+                manifest_key: _manifest_bytes([_entry(id=_UUID_1)]),
+            }
+        )
+    )
+
+    with pytest.raises(ValueError, match='upload_variants\\(\\) requires at least one uploaded variant family'):
+        await store.upload_variants(group, _UUID_1)
+
+
+@pytest.mark.asyncio
+async def test_upload_variants_rejects_first_instrumental_only_upload() -> None:
+    group = _track_group()
+    manifest_key = _manifest_key(universe=group.universe, year=group.year, season=group.season)
+    store = _store(
+        _FakeS3Client(
+            objects={
+                _presets_key(): _presets_bytes(),
+                manifest_key: _manifest_bytes([_entry(id=_UUID_1)]),
+            }
+        )
+    )
+
+    with pytest.raises(
+        ValueError,
+        match='cannot upload instrumental variants before an uploaded normal family exists',
+    ):
+        await store.upload_variants(
+            group,
+            _UUID_1,
+            instrumental_variants=(_uploaded_variant(speed=0.9, reverb=0.1, audio_bytes=b'inst-1'),),
+        )
+
+
+@pytest.mark.asyncio
+async def test_upload_variants_sorts_normal_family_before_storage_and_manifest_write() -> None:
+    group = _track_group()
+    manifest_key = _manifest_key(universe=group.universe, year=group.year, season=group.season)
+    s3_client = _FakeS3Client(
+        objects={
+            _presets_key(): _presets_bytes(),
+            manifest_key: _manifest_bytes([_entry(id=_UUID_1, has_variants=False)]),
+        }
+    )
+    store = _store(s3_client)
+
+    await store.upload_variants(
+        group,
+        _UUID_1,
+        variants=(
+            _uploaded_variant(speed=1.2, reverb=0.2, audio_bytes=b'fast'),
+            _uploaded_variant(speed=0.8, reverb=0.1, audio_bytes=b'slow'),
+        ),
+    )
+
+    group_prefix = _track_group_prefix(universe=group.universe, year=group.year, season=group.season)
+    assert s3_client.objects[store._variant_key(group_prefix, _UUID_1, index=1)] == b'slow'
+    assert s3_client.objects[store._variant_key(group_prefix, _UUID_1, index=2)] == b'fast'
+    rewritten_manifest = json.loads(s3_client.objects[manifest_key].decode('utf-8'))
+    assert rewritten_manifest['data'][0]['uploaded_variants'] == {
+        'variants': [
+            {'speed': 0.8, 'reverb': 0.1},
+            {'speed': 1.2, 'reverb': 0.2},
+        ],
+        'instrumental_variants': None,
+    }
+    assert rewritten_manifest['data'][0]['has_variants'] is True
+    assert rewritten_manifest['data'][0]['has_instrumental_variants'] is False
+
+
+@pytest.mark.asyncio
+async def test_upload_variants_rejects_duplicate_speeds() -> None:
+    group = _track_group()
+    manifest_key = _manifest_key(universe=group.universe, year=group.year, season=group.season)
+    store = _store(
+        _FakeS3Client(
+            objects={
+                _presets_key(): _presets_bytes(),
+                manifest_key: _manifest_bytes([_entry(id=_UUID_1)]),
+            }
+        )
+    )
+
+    with pytest.raises(ValueError, match='variants speeds must be unique'):
+        await store.upload_variants(
+            group,
+            _UUID_1,
+            variants=(
+                _uploaded_variant(speed=1.0, reverb=0.1),
+                _uploaded_variant(speed=1.0, reverb=0.2),
+            ),
+        )
+
+
+@pytest.mark.asyncio
+async def test_upload_variants_accepts_later_instrumental_only_upload_without_authoritative_instrumental() -> None:
+    group = _track_group()
+    manifest_key = _manifest_key(universe=group.universe, year=group.year, season=group.season)
+    entry = _entry(
+        id=_UUID_1,
+        has_variants=True,
+        has_instrumental=False,
+        has_instrumental_variants=False,
+        uploaded_variants=UploadedVariantMetadata(
+            variants=(VariantSpec(speed=0.9, reverb=0.1),),
+            instrumental_variants=None,
+        ),
+    )
+    group_prefix = _track_group_prefix(universe=group.universe, year=group.year, season=group.season)
+    seed_store = _store(_FakeS3Client())
+    normal_key = seed_store._variant_key(group_prefix, _UUID_1, index=1)
+    s3_client = _FakeS3Client(
+        objects={
+            _presets_key(): _presets_bytes(),
+            manifest_key: _manifest_bytes([entry]),
+            normal_key: b'normal',
+        }
+    )
+    store = _store(s3_client)
+
+    await store.upload_variants(
+        group,
+        _UUID_1,
+        instrumental_variants=(_uploaded_variant(speed=1.1, reverb=0.2, audio_bytes=b'inst'),),
+    )
+
+    instrumental_key = store._instrumental_variant_key(group_prefix, _UUID_1, index=1)
+    assert s3_client.objects[normal_key] == b'normal'
+    assert s3_client.objects[instrumental_key] == b'inst'
+    rewritten_manifest = json.loads(s3_client.objects[manifest_key].decode('utf-8'))
+    assert rewritten_manifest['data'][0]['has_instrumental'] is False
+    assert rewritten_manifest['data'][0]['has_instrumental_variants'] is True
+    assert rewritten_manifest['data'][0]['uploaded_variants']['instrumental_variants'] == [
+        {'speed': 1.1, 'reverb': 0.2}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_upload_variants_replaces_only_provided_family_and_deletes_stale_extra_keys() -> None:
+    group = _track_group()
+    manifest_key = _manifest_key(universe=group.universe, year=group.year, season=group.season)
+    entry = _entry(
+        id=_UUID_1,
+        has_variants=True,
+        has_instrumental=False,
+        has_instrumental_variants=True,
+        uploaded_variants=UploadedVariantMetadata(
+            variants=(
+                VariantSpec(speed=0.8, reverb=0.1),
+                VariantSpec(speed=1.0, reverb=0.2),
+                VariantSpec(speed=1.2, reverb=0.3),
+            ),
+            instrumental_variants=(
+                VariantSpec(speed=0.9, reverb=0.1),
+                VariantSpec(speed=1.1, reverb=0.2),
+            ),
+        ),
+    )
+    s3_client = _FakeS3Client(
+        objects={
+            _presets_key(): _presets_bytes(),
+            manifest_key: _manifest_bytes([entry]),
+        }
+    )
+    store = _store(s3_client)
+    group_prefix = _track_group_prefix(universe=group.universe, year=group.year, season=group.season)
+    for index, payload in enumerate((b'old-1', b'old-2', b'old-3'), start=1):
+        s3_client.objects[store._variant_key(group_prefix, _UUID_1, index=index)] = payload
+    for index, payload in enumerate((b'inst-1', b'inst-2'), start=1):
+        s3_client.objects[store._instrumental_variant_key(group_prefix, _UUID_1, index=index)] = payload
+
+    await store.upload_variants(
+        group,
+        _UUID_1,
+        variants=(
+            _uploaded_variant(speed=0.85, reverb=0.4, audio_bytes=b'new-1'),
+            _uploaded_variant(speed=1.15, reverb=0.5, audio_bytes=b'new-2'),
+        ),
+    )
+
+    assert store._variant_key(group_prefix, _UUID_1, index=1) in s3_client.objects
+    assert store._variant_key(group_prefix, _UUID_1, index=2) in s3_client.objects
+    assert store._variant_key(group_prefix, _UUID_1, index=3) not in s3_client.objects
+    assert store._instrumental_variant_key(group_prefix, _UUID_1, index=1) in s3_client.objects
+    assert store._instrumental_variant_key(group_prefix, _UUID_1, index=2) in s3_client.objects
+    rewritten_manifest = json.loads(s3_client.objects[manifest_key].decode('utf-8'))
+    assert rewritten_manifest['data'][0]['uploaded_variants']['variants'] == [
+        {'speed': 0.85, 'reverb': 0.4},
+        {'speed': 1.15, 'reverb': 0.5},
+    ]
+    assert rewritten_manifest['data'][0]['uploaded_variants']['instrumental_variants'] == [
+        {'speed': 0.9, 'reverb': 0.1},
+        {'speed': 1.1, 'reverb': 0.2},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_clear_uploaded_variants_is_idempotent_and_preserves_authoritative_instrumental_flag() -> None:
+    group = _track_group()
+    manifest_key = _manifest_key(universe=group.universe, year=group.year, season=group.season)
+    entry = _entry(
+        id=_UUID_1,
+        has_variants=True,
+        has_instrumental=True,
+        has_instrumental_variants=True,
+        uploaded_variants=UploadedVariantMetadata(
+            variants=(VariantSpec(speed=0.9, reverb=0.1),),
+            instrumental_variants=(VariantSpec(speed=1.1, reverb=0.2),),
+        ),
+    )
+    s3_client = _FakeS3Client(
+        objects={
+            _presets_key(): _presets_bytes(),
+            manifest_key: _manifest_bytes([entry]),
+        }
+    )
+    store = _store(s3_client)
+    group_prefix = _track_group_prefix(universe=group.universe, year=group.year, season=group.season)
+    s3_client.objects[store._variant_key(group_prefix, _UUID_1, index=1)] = b'normal'
+    s3_client.objects[store._instrumental_variant_key(group_prefix, _UUID_1, index=1)] = b'inst'
+
+    await store.clear_uploaded_variants(group, _UUID_1)
+    await store.clear_uploaded_variants(group, _UUID_1)
+
+    rewritten_manifest = json.loads(s3_client.objects[manifest_key].decode('utf-8'))
+    assert rewritten_manifest['data'][0]['uploaded_variants'] is None
+    assert rewritten_manifest['data'][0]['has_variants'] is False
+    assert rewritten_manifest['data'][0]['has_instrumental_variants'] is False
+    assert rewritten_manifest['data'][0]['has_instrumental'] is True
+    assert s3_client.delete_keys_calls == [
+        (store._variant_key(group_prefix, _UUID_1, index=1),),
+        (store._instrumental_variant_key(group_prefix, _UUID_1, index=1),),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_clear_uploaded_variants_uses_asymmetric_uploaded_family_counts_for_cleanup() -> None:
+    group = _track_group()
+    manifest_key = _manifest_key(universe=group.universe, year=group.year, season=group.season)
+    entry = _entry(
+        id=_UUID_1,
+        preset=AppliedPreset(id=1, version=3, variant_count=5),
+        has_variants=True,
+        has_instrumental=True,
+        has_instrumental_variants=True,
+        uploaded_variants=UploadedVariantMetadata(
+            variants=(
+                VariantSpec(speed=0.8, reverb=0.1),
+                VariantSpec(speed=1.0, reverb=0.2),
+                VariantSpec(speed=1.2, reverb=0.3),
+            ),
+            instrumental_variants=(VariantSpec(speed=1.1, reverb=0.4),),
+        ),
+    )
+    s3_client = _FakeS3Client(
+        objects={
+            _presets_key(): _presets_bytes(),
+            manifest_key: _manifest_bytes([entry]),
+        }
+    )
+    store = _store(s3_client)
+    group_prefix = _track_group_prefix(universe=group.universe, year=group.year, season=group.season)
+    normal_keys = tuple(store._variant_key(group_prefix, _UUID_1, index=index) for index in range(1, 4))
+    instrumental_keys = (store._instrumental_variant_key(group_prefix, _UUID_1, index=1),)
+    for index, key in enumerate(normal_keys, start=1):
+        s3_client.objects[key] = f'normal-{index}'.encode()
+    s3_client.objects[instrumental_keys[0]] = b'inst-1'
+
+    await store.clear_uploaded_variants(group, _UUID_1)
+
+    assert s3_client.delete_keys_calls == [
+        normal_keys,
+        instrumental_keys,
+    ]
+    assert all(key not in s3_client.objects for key in (*normal_keys, *instrumental_keys))
+
+
+@pytest.mark.asyncio
+async def test_update_track_in_uploaded_mode_preserves_uploaded_variants(monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_probe_audio_sample_rate(monkeypatch)
+    group = _track_group()
+    manifest_key = _manifest_key(universe=group.universe, year=group.year, season=group.season)
+    track_key = _track_key(universe=group.universe, year=group.year, season=group.season, track_id=_UUID_1)
+    entry = _entry(
+        id=_UUID_1,
+        has_variants=True,
+        has_instrumental=False,
+        has_instrumental_variants=True,
+        uploaded_variants=UploadedVariantMetadata(
+            variants=(VariantSpec(speed=0.9, reverb=0.1),),
+            instrumental_variants=(VariantSpec(speed=1.1, reverb=0.2),),
+        ),
+    )
+    s3_client = _FakeS3Client(
+        objects={
+            _presets_key(): _presets_bytes(),
+            manifest_key: _manifest_bytes([entry]),
+            track_key: b'old-track',
+        }
+    )
+    store = _store(s3_client)
+
+    await store.update(group, _UUID_1, track=FileBytes(data=b'new-track', extension=Extension.OPUS))
+
+    rewritten_manifest = json.loads(s3_client.objects[manifest_key].decode('utf-8'))
+    assert rewritten_manifest['data'][0]['uploaded_variants'] == {
+        'variants': [{'speed': 0.9, 'reverb': 0.1}],
+        'instrumental_variants': [{'speed': 1.1, 'reverb': 0.2}],
+    }
+    assert rewritten_manifest['data'][0]['has_variants'] is True
+    assert rewritten_manifest['data'][0]['has_instrumental_variants'] is True
+
+
+@pytest.mark.asyncio
+async def test_update_instrumental_in_uploaded_mode_sets_authoritative_flag_and_preserves_uploaded_variants(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_probe_audio_sample_rate(monkeypatch)
+    group = _track_group()
+    manifest_key = _manifest_key(universe=group.universe, year=group.year, season=group.season)
+    instrumental_key = _instrumental_key(
+        universe=group.universe,
+        year=group.year,
+        season=group.season,
+        track_id=_UUID_1,
+    )
+    entry = _entry(
+        id=_UUID_1,
+        has_variants=True,
+        has_instrumental=False,
+        has_instrumental_variants=True,
+        uploaded_variants=UploadedVariantMetadata(
+            variants=(VariantSpec(speed=0.9, reverb=0.1),),
+            instrumental_variants=(VariantSpec(speed=1.1, reverb=0.2),),
+        ),
+    )
+    s3_client = _FakeS3Client(
+        objects={
+            _presets_key(): _presets_bytes(),
+            manifest_key: _manifest_bytes([entry]),
+        }
+    )
+    store = _store(s3_client)
+
+    await store.update(group, _UUID_1, instrumental=FileBytes(data=b'new-inst', extension=Extension.OPUS))
+
+    assert s3_client.objects[instrumental_key] == b'new-inst'
+    rewritten_manifest = json.loads(s3_client.objects[manifest_key].decode('utf-8'))
+    assert rewritten_manifest['data'][0]['has_instrumental'] is True
+    assert rewritten_manifest['data'][0]['has_instrumental_variants'] is True
+    assert rewritten_manifest['data'][0]['uploaded_variants']['instrumental_variants'] == [
+        {'speed': 1.1, 'reverb': 0.2}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_remove_instrumental_in_uploaded_mode_preserves_uploaded_instrumental_variants() -> None:
+    group = _track_group()
+    manifest_key = _manifest_key(universe=group.universe, year=group.year, season=group.season)
+    instrumental_key = _instrumental_key(
+        universe=group.universe,
+        year=group.year,
+        season=group.season,
+        track_id=_UUID_1,
+    )
+    entry = _entry(
+        id=_UUID_1,
+        has_variants=True,
+        has_instrumental=True,
+        has_instrumental_variants=True,
+        uploaded_variants=UploadedVariantMetadata(
+            variants=(VariantSpec(speed=0.9, reverb=0.1),),
+            instrumental_variants=(VariantSpec(speed=1.1, reverb=0.2),),
+        ),
+    )
+    s3_client = _FakeS3Client(
+        objects={
+            _presets_key(): _presets_bytes(),
+            manifest_key: _manifest_bytes([entry]),
+            instrumental_key: b'authoritative-inst',
+        }
+    )
+    store = _store(s3_client)
+
+    await store.remove_instrumental(group, _UUID_1)
+
+    assert instrumental_key not in s3_client.objects
+    assert s3_client.delete_keys_calls == []
+    rewritten_manifest = json.loads(s3_client.objects[manifest_key].decode('utf-8'))
+    assert rewritten_manifest['data'][0]['has_instrumental'] is False
+    assert rewritten_manifest['data'][0]['has_instrumental_variants'] is True
+    assert rewritten_manifest['data'][0]['uploaded_variants']['instrumental_variants'] == [
+        {'speed': 1.1, 'reverb': 0.2}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_remove_uploaded_mode_uses_uploaded_family_counts_for_cleanup() -> None:
+    group = _track_group()
+    manifest_key = _manifest_key(universe=group.universe, year=group.year, season=group.season)
+    entry = _entry(
+        id=_UUID_1,
+        has_variants=True,
+        has_instrumental=False,
+        has_instrumental_variants=True,
+        uploaded_variants=UploadedVariantMetadata(
+            variants=(
+                VariantSpec(speed=0.8, reverb=0.1),
+                VariantSpec(speed=1.2, reverb=0.2),
+            ),
+            instrumental_variants=(VariantSpec(speed=1.1, reverb=0.3),),
+        ),
+    )
+    s3_client = _FakeS3Client(
+        objects={
+            _presets_key(): _presets_bytes(),
+            manifest_key: _manifest_bytes([entry]),
+            _track_key(universe=group.universe, year=group.year, season=group.season, track_id=_UUID_1): b'track',
+            _cover_key(universe=group.universe, year=group.year, season=group.season, track_id=_UUID_1): b'cover',
+        }
+    )
+    store = _store(s3_client)
+    group_prefix = _track_group_prefix(universe=group.universe, year=group.year, season=group.season)
+    normal_keys = (
+        store._variant_key(group_prefix, _UUID_1, index=1),
+        store._variant_key(group_prefix, _UUID_1, index=2),
+    )
+    instrumental_keys = (store._instrumental_variant_key(group_prefix, _UUID_1, index=1),)
+    for index, key in enumerate(normal_keys, start=1):
+        s3_client.objects[key] = f'normal-{index}'.encode()
+    s3_client.objects[instrumental_keys[0]] = b'inst-1'
+
+    await store.remove(group, _UUID_1)
+
+    assert normal_keys in s3_client.delete_keys_calls
+    assert instrumental_keys in s3_client.delete_keys_calls
+
+
+@pytest.mark.asyncio
+async def test_reconcile_uploaded_mode_uses_asymmetric_uploaded_family_counts_for_cleanup() -> None:
+    group = _track_group()
+    manifest_key = _manifest_key(universe=group.universe, year=group.year, season=group.season)
+    uploaded_entry = _entry(
+        id=_UUID_1,
+        preset=AppliedPreset(id=1, version=3, variant_count=5),
+        has_variants=True,
+        has_instrumental=False,
+        has_instrumental_variants=True,
+        uploaded_variants=UploadedVariantMetadata(
+            variants=(
+                VariantSpec(speed=0.8, reverb=0.1),
+                VariantSpec(speed=1.0, reverb=0.2),
+                VariantSpec(speed=1.2, reverb=0.3),
+            ),
+            instrumental_variants=(VariantSpec(speed=1.1, reverb=0.4),),
+        ),
+    )
+    kept_entry = _entry(id=_UUID_2, sub_season=SubSeason.A, order=2)
+    s3_client = _FakeS3Client(
+        objects={
+            _presets_key(): _presets_bytes(),
+            manifest_key: _manifest_bytes([uploaded_entry, kept_entry]),
+            _track_key(universe=group.universe, year=group.year, season=group.season, track_id=_UUID_1): b'track',
+            _cover_key(universe=group.universe, year=group.year, season=group.season, track_id=_UUID_1): b'cover',
+        }
+    )
+    store = _store(s3_client)
+    group_prefix = _track_group_prefix(universe=group.universe, year=group.year, season=group.season)
+    normal_keys = tuple(store._variant_key(group_prefix, _UUID_1, index=index) for index in range(1, 4))
+    instrumental_keys = (store._instrumental_variant_key(group_prefix, _UUID_1, index=1),)
+    for index, key in enumerate(normal_keys, start=1):
+        s3_client.objects[key] = f'normal-{index}'.encode()
+    s3_client.objects[instrumental_keys[0]] = b'inst-1'
+
+    result = await store.reconcile(group, SubSeason.A, track_ids=[_UUID_2])
+
+    assert result == ReconcileResult(updated=1, removed=1)
+    assert normal_keys in s3_client.delete_keys_calls
+    assert instrumental_keys in s3_client.delete_keys_calls
+    assert all(key not in s3_client.objects for key in (*normal_keys, *instrumental_keys))
+
+
 def _track_group(
     *, universe: TrackUniverse = TrackUniverse.WEST, year: int = 2026, season: Season = Season.S1
 ) -> TrackGroup:
@@ -4365,6 +5064,117 @@ def _patch_probe_audio_sample_rate(
 
     monkeypatch.setattr(track_store_module, 'probe_audio_sample_rate', _fake_probe_audio_sample_rate)
     return calls
+
+
+@pytest.mark.asyncio
+async def test_fetch_uploaded_mode_returns_uploaded_variants_without_generation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    generation_calls = _patch_create_audio_variant(monkeypatch)
+    group = _track_group()
+    manifest_key = _manifest_key(universe=group.universe, year=group.year, season=group.season)
+    cover_key = _cover_key(universe=group.universe, year=group.year, season=group.season, track_id=_UUID_1)
+    entry = _entry(
+        id=_UUID_1,
+        has_variants=True,
+        has_instrumental=False,
+        has_instrumental_variants=True,
+        uploaded_variants=UploadedVariantMetadata(
+            variants=(
+                VariantSpec(speed=0.8, reverb=0.1),
+                VariantSpec(speed=1.2, reverb=0.2),
+            ),
+            instrumental_variants=(VariantSpec(speed=1.1, reverb=0.3),),
+        ),
+    )
+    s3_client = _FakeS3Client(
+        objects={
+            manifest_key: _manifest_bytes([entry]),
+            cover_key: b'cover',
+        }
+    )
+    store = _store(s3_client)
+    group_prefix = _track_group_prefix(universe=group.universe, year=group.year, season=group.season)
+    s3_client.objects[store._variant_key(group_prefix, _UUID_1, index=1)] = b'v1'
+    s3_client.objects[store._variant_key(group_prefix, _UUID_1, index=2)] = b'v2'
+    s3_client.objects[store._instrumental_variant_key(group_prefix, _UUID_1, index=1)] = b'i1'
+
+    result = await store.fetch(group, _UUID_1)
+
+    assert [variant.audio.data for variant in result.variants] == [b'v1', b'v2']
+    assert [variant.speed for variant in result.variants] == [0.8, 1.2]
+    assert result.instrumental_variants is not None
+    assert [variant.audio.data for variant in result.instrumental_variants] == [b'i1']
+    assert generation_calls == []
+    assert s3_client.put_calls == []
+    assert s3_client.delete_keys_calls == []
+
+
+@pytest.mark.asyncio
+async def test_fetch_uploaded_mode_rejects_explicit_preset_id() -> None:
+    group = _track_group()
+    manifest_key = _manifest_key(universe=group.universe, year=group.year, season=group.season)
+    cover_key = _cover_key(universe=group.universe, year=group.year, season=group.season, track_id=_UUID_1)
+    entry = _entry(
+        id=_UUID_1,
+        has_variants=True,
+        uploaded_variants=UploadedVariantMetadata(
+            variants=(VariantSpec(speed=0.9, reverb=0.1),),
+            instrumental_variants=None,
+        ),
+    )
+    s3_client = _FakeS3Client(
+        objects={
+            manifest_key: _manifest_bytes([entry]),
+            cover_key: b'cover',
+            _presets_key(): _presets_bytes(),
+        }
+    )
+    store = _store(s3_client)
+
+    with pytest.raises(ValueError, match='does not accept `preset_id` while uploaded variants are active'):
+        await store.fetch(group, _UUID_1, preset_id=1)
+
+    assert s3_client.get_calls == [manifest_key]
+
+
+@pytest.mark.asyncio
+async def test_fetch_uploaded_mode_handles_different_normal_and_instrumental_counts() -> None:
+    group = _track_group()
+    manifest_key = _manifest_key(universe=group.universe, year=group.year, season=group.season)
+    cover_key = _cover_key(universe=group.universe, year=group.year, season=group.season, track_id=_UUID_1)
+    entry = _entry(
+        id=_UUID_1,
+        has_variants=True,
+        has_instrumental=False,
+        has_instrumental_variants=True,
+        uploaded_variants=UploadedVariantMetadata(
+            variants=(
+                VariantSpec(speed=0.8, reverb=0.1),
+                VariantSpec(speed=1.0, reverb=0.2),
+                VariantSpec(speed=1.2, reverb=0.3),
+            ),
+            instrumental_variants=(VariantSpec(speed=1.1, reverb=0.4),),
+        ),
+    )
+    s3_client = _FakeS3Client(
+        objects={
+            manifest_key: _manifest_bytes([entry]),
+            cover_key: b'cover',
+        }
+    )
+    store = _store(s3_client)
+    group_prefix = _track_group_prefix(universe=group.universe, year=group.year, season=group.season)
+    s3_client.objects[store._variant_key(group_prefix, _UUID_1, index=1)] = b'v1'
+    s3_client.objects[store._variant_key(group_prefix, _UUID_1, index=2)] = b'v2'
+    s3_client.objects[store._variant_key(group_prefix, _UUID_1, index=3)] = b'v3'
+    s3_client.objects[store._instrumental_variant_key(group_prefix, _UUID_1, index=1)] = b'i1'
+
+    result = await store.fetch(group, _UUID_1)
+
+    assert [variant.audio.data for variant in result.variants] == [b'v1', b'v2', b'v3']
+    assert result.instrumental_variants is not None
+    assert [variant.audio.data for variant in result.instrumental_variants] == [b'i1']
 
 
 @pytest.mark.asyncio

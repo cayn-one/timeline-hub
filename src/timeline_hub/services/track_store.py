@@ -150,7 +150,7 @@ class TrackInfo:
 
 @dataclass(frozen=True, slots=True)
 class FetchedVariant:
-    """One generated playable track variant returned by `fetch()` as MP3 `FileBytes`."""
+    """One playable track variant returned by `fetch()` as MP3 `FileBytes`."""
 
     speed: float
     reverb: float
@@ -158,8 +158,84 @@ class FetchedVariant:
 
 
 @dataclass(frozen=True, slots=True)
+class VariantSpec:
+    """One variant descriptor with stable ordering semantics."""
+
+    speed: float
+    reverb: float
+
+    def __post_init__(self) -> None:
+        """Validate variant spec invariants for all construction paths."""
+        if isinstance(self.speed, bool) or not isinstance(self.speed, int | float):
+            raise ValueError('VariantSpec.speed must be numeric')
+        if not math.isfinite(float(self.speed)):
+            raise ValueError('VariantSpec.speed must be finite')
+        if float(self.speed) <= 0.0:
+            raise ValueError('VariantSpec.speed must be > 0')
+
+        if isinstance(self.reverb, bool) or not isinstance(self.reverb, int | float):
+            raise ValueError('VariantSpec.reverb must be numeric')
+        if not math.isfinite(float(self.reverb)):
+            raise ValueError('VariantSpec.reverb must be finite')
+        if float(self.reverb) < 0.0:
+            raise ValueError('VariantSpec.reverb must be >= 0')
+
+
+@dataclass(frozen=True, slots=True)
+class UploadedVariantMetadata:
+    """Uploaded-mode metadata for active finished variant families."""
+
+    variants: tuple[VariantSpec, ...]
+    instrumental_variants: tuple[VariantSpec, ...] | None
+
+    def __post_init__(self) -> None:
+        """Validate uploaded variant family invariants for all construction paths."""
+        self._validate_variant_family(self.variants, field='variants')
+        if self.instrumental_variants is not None:
+            self._validate_variant_family(self.instrumental_variants, field='instrumental_variants')
+
+    @staticmethod
+    def _validate_variant_family(family: tuple[VariantSpec, ...], *, field: str) -> None:
+        if not isinstance(family, tuple):
+            raise ValueError(f'UploadedVariantMetadata.{field} must be a tuple')
+        if not family:
+            raise ValueError(f'UploadedVariantMetadata.{field} must not be empty')
+        if len(family) > 10:
+            raise ValueError(f'UploadedVariantMetadata.{field} must contain at most 10 items')
+        if any(not isinstance(spec, VariantSpec) for spec in family):
+            raise ValueError(f'UploadedVariantMetadata.{field} entries must be VariantSpec')
+
+        previous_speed: float | None = None
+        for spec in family:
+            speed = float(spec.speed)
+            if previous_speed is not None and speed <= previous_speed:
+                raise ValueError(
+                    f'UploadedVariantMetadata.{field} speeds must be strictly sorted ascending without duplicates'
+                )
+            previous_speed = speed
+
+
+@dataclass(frozen=True, slots=True)
+class UploadedVariant:
+    """Public uploaded finished variant input."""
+
+    speed: float
+    reverb: float
+    audio: FileBytes
+
+    def __post_init__(self) -> None:
+        """Validate uploaded variant input invariants for all construction paths."""
+        VariantSpec(speed=self.speed, reverb=self.reverb)
+        if not isinstance(self.audio, FileBytes):
+            raise ValueError('UploadedVariant.audio must be FileBytes')
+        # Uploaded variant validation is intentionally extension-based only.
+        # TrackStore does not probe or deeply decode uploaded MP3 bytes here.
+        _require_extension(self.audio, Extension.MP3, 'UploadedVariant.audio')
+
+
+@dataclass(frozen=True, slots=True)
 class FetchedVariants:
-    """Immutable UI read model whose returned `FileBytes` use fixed Opus/JPG extensions."""
+    """Immutable UI read model with MP3 variant audio and JPG cover `FileBytes`."""
 
     track_id: TrackId
     artists: tuple[str, ...]
@@ -425,23 +501,33 @@ class ManifestEntry:
     manifest entry.
 
     `preset` stores the selected `AppliedPreset` metadata for this track family.
-    It describes which preset identity/version applies and how many ordered
-    variants that preset currently resolves to. It is not a source of truth for
-    preset values.
+    It describes which generated preset identity/version applies and how many
+    ordered generated variants that preset currently resolves to. It remains
+    stored even when uploaded finished variants override the active families.
+    It is not a source of truth for preset values.
 
-    `has_variants` tracks whether the original-track variants are currently
-    materialized in storage.
+    `uploaded_variants` is the uploaded-mode metadata overlay. When present,
+    fetch uses only the indexed uploaded MP3 families described here and does
+    not resolve presets or regenerate anything.
+
+    `has_variants` tracks whether the active normal variant family is currently
+    materialized in storage, regardless of whether that family is generated or
+    uploaded.
 
     `has_instrumental` tracks whether an authoritative original instrumental
-    object exists.
+    object exists. It is independent from uploaded finished instrumental
+    variants.
 
-    `has_instrumental_variants` is tracked separately because instrumental
-    storage can happen later than the original `store()` flow and can therefore
-    diverge from original variant completeness. Instrumental variants only make
-    sense when an instrumental exists.
+    `has_instrumental_variants` tracks whether the active instrumental variant
+    family is currently materialized in storage, regardless of whether that
+    family is generated or uploaded.
 
     Cover art is mandatory by convention and is therefore not represented by a
     separate manifest flag.
+
+    Uploaded mode is intentionally user-owned/risky: authoritative source audio
+    updates do not automatically invalidate uploaded finished variants. Callers
+    must explicitly clear uploaded variants to return a track to generated mode.
     """
 
     id: TrackId
@@ -454,12 +540,38 @@ class ManifestEntry:
     has_variants: bool
     has_instrumental: bool
     has_instrumental_variants: bool
+    uploaded_variants: UploadedVariantMetadata | None = None
 
+    def __post_init__(self) -> None:
+        """Validate manifest entry mode invariants for all construction paths."""
+        if self.uploaded_variants is None:
+            if self.has_instrumental_variants and not self.has_instrumental:
+                raise ValueError('ManifestEntry generated mode requires `has_instrumental` for instrumental variants')
+            return
 
-@dataclass(frozen=True, slots=True)
-class _ResolvedVariantSpec:
-    speed: float
-    reverb: float
+        if not self.has_variants:
+            raise ValueError('ManifestEntry uploaded mode requires `has_variants`')
+        if self.has_instrumental_variants != (self.uploaded_variants.instrumental_variants is not None):
+            raise ValueError(
+                'ManifestEntry uploaded mode requires `has_instrumental_variants` to match uploaded metadata'
+            )
+
+    @property
+    def is_uploaded_mode(self) -> bool:
+        return self.uploaded_variants is not None
+
+    @property
+    def active_variant_count(self) -> int:
+        if self.uploaded_variants is None:
+            return self.preset.variant_count
+        return len(self.uploaded_variants.variants)
+
+    @property
+    def active_instrumental_variant_count(self) -> int:
+        if self.uploaded_variants is None:
+            return self.preset.variant_count
+        instrumental_variants = self.uploaded_variants.instrumental_variants
+        return 0 if instrumental_variants is None else len(instrumental_variants)
 
 
 class Manifest:
@@ -511,6 +623,7 @@ class Manifest:
                     'has_variants': entry.has_variants,
                     'has_instrumental': entry.has_instrumental,
                     'has_instrumental_variants': entry.has_instrumental_variants,
+                    'uploaded_variants': _uploaded_variant_metadata_to_dict(entry.uploaded_variants),
                 }
                 for entry in self._entries
             ]
@@ -553,6 +666,7 @@ class Manifest:
                 'has_variants',
                 'has_instrumental',
                 'has_instrumental_variants',
+                'uploaded_variants',
             }:
                 raise ValueError('manifest track entry has unexpected fields')
 
@@ -578,9 +692,10 @@ class Manifest:
                 field='has_instrumental_variants',
                 context='manifest',
             )
-
-            if has_instrumental_variants and not has_instrumental:
-                raise ValueError('manifest `has_instrumental_variants` requires `has_instrumental`')
+            uploaded_variants = _parse_uploaded_variant_metadata(
+                raw_entry['uploaded_variants'],
+                context='manifest',
+            )
 
             if track_id in seen_ids:
                 raise ValueError(f'duplicate manifest track id: {track_id}')
@@ -605,6 +720,7 @@ class Manifest:
                     has_variants=has_variants,
                     has_instrumental=has_instrumental,
                     has_instrumental_variants=has_instrumental_variants,
+                    uploaded_variants=uploaded_variants,
                 )
             )
 
@@ -1026,7 +1142,7 @@ class TrackStore:
         - `update()` mutates authoritative components of existing tracks in place.
         - No hashing or deduplication is performed.
         - Concurrent writes to the same `TrackGroup` are unsupported.
-        - `fetch()` returns generated variants only and may lazily regenerate stale caches.
+        - `fetch()` returns active variant families and may lazily regenerate only in generated mode.
     """
 
     def __init__(
@@ -1100,37 +1216,40 @@ class TrackStore:
         *,
         preset_id: PresetId | None = None,
     ) -> FetchedVariants:
-        """Fetch one track's generated variants, materializing stale caches lazily.
+        """Fetch one track's active variants, materializing stale generated caches lazily.
 
         The selected track is identified by `(group, track_id)`. The returned
-        payload contains only generated variants plus shared UI metadata:
-        cover `FileBytes`. The authoritative original track and optional
-        authoritative instrumental objects are read only when regeneration is
-        required. Authoritative source audio objects use `.opus` S3 keys,
-        generated cached variants use `.mp3` S3 keys, and per-track covers use
-        `.jpg` S3 keys. Returned generated variant audio uses `Extension.MP3`,
-        and returned covers always use `Extension.JPG`.
+        payload contains only active variants plus shared UI metadata: cover
+        `FileBytes`. In generated mode the authoritative original track and
+        optional authoritative instrumental objects are read only when
+        regeneration is required. In uploaded mode the indexed uploaded MP3
+        objects are read directly and no preset resolution or regeneration is
+        attempted. Authoritative source audio objects use `.opus` S3 keys,
+        variant cache/override objects use `.mp3` S3 keys, and per-track
+        covers use `.jpg` S3 keys. Returned variant audio uses
+        `Extension.MP3`, and returned covers always use `Extension.JPG`.
 
-        Preset resolution is delegated to `PresetStore`. An explicit
-        caller-supplied preset id is strict, while the manifest snapshot id is
-        tolerant of stale or deleted presets and falls back to the current
-        default preset.
+        In generated mode, preset resolution is delegated to `PresetStore`. An
+        explicit caller-supplied preset id is strict, while the manifest
+        snapshot id is tolerant of stale or deleted presets and falls back to
+        the current default preset. Uploaded mode rejects explicit preset ids.
 
-        Staleness is determined only by the manifest's cached `AppliedPreset`
-        metadata, the resolved source-of-truth `PresetRecord`, the
-        `has_variants` flag, and the `has_instrumental_variants` flag. No S3
-        listing is used. Variants are returned in strictly ascending speed
-        order across all slowed and sped-up modes, and that same ordering
-        determines their stable indexed storage keys.
+        Generated-mode staleness is determined only by the manifest's cached
+        `AppliedPreset` metadata, the resolved source-of-truth `PresetRecord`,
+        the `has_variants` flag, and the `has_instrumental_variants` flag. No
+        S3 listing is used. Variants are returned in strictly ascending speed
+        order, and that same ordering determines their stable indexed storage
+        keys in both generated and uploaded mode.
 
-        Variant generation is intentionally not atomic. If uploads succeed but
-        manifest persistence fails, orphaned variant objects may remain in
-        storage for manual cleanup, matching the store path's existing staged
-        write semantics.
+        Generated-mode variant generation is intentionally not atomic. If
+        uploads succeed but manifest persistence fails, orphaned variant
+        objects may remain in storage for manual cleanup, matching the store
+        path's existing staged write semantics.
 
-        This method may perform object and manifest writes during variant
-        generation. It is not a pure read operation. Concurrent operations on
-        the same `TrackGroup` are not supported and may lead to lost updates.
+        In generated mode this method may perform object and manifest writes
+        during variant generation. It is not a pure read operation there.
+        Concurrent operations on the same `TrackGroup` are not supported and
+        may lead to lost updates.
 
         Cover reads intentionally stay per-track. Album linkage is not used as
         a fetch-time indirection because each track stores its own physical
@@ -1151,6 +1270,40 @@ class TrackStore:
         manifest = await self._require_group_manifest(group, sub_season=None)
         entry = self._require_manifest_entry(manifest, group=group, track_id=track_id)
 
+        if entry.is_uploaded_mode:
+            if preset_id is not None:
+                raise ValueError('fetch() does not accept `preset_id` while uploaded variants are active')
+            cover_key = self._cover_key(track_group_prefix, track_id)
+            cover_bytes = await self._s3_client.get_bytes(cover_key)
+            uploaded_variants = entry.uploaded_variants
+            if uploaded_variants is None:
+                raise AssertionError('uploaded mode requires uploaded variant metadata')
+            variants = await self._load_variants(
+                track_group_prefix=track_group_prefix,
+                track_id=track_id,
+                variant_specs=uploaded_variants.variants,
+                instrumental=False,
+            )
+            instrumental_variants = None
+            if uploaded_variants.instrumental_variants is not None:
+                instrumental_variants = await self._load_variants(
+                    track_group_prefix=track_group_prefix,
+                    track_id=track_id,
+                    variant_specs=uploaded_variants.instrumental_variants,
+                    instrumental=True,
+                )
+            return FetchedVariants(
+                track_id=entry.id,
+                artists=entry.artists,
+                title=entry.title,
+                cover=FileBytes(data=cover_bytes, extension=Extension.JPG),
+                variants=variants,
+                instrumental_variants=instrumental_variants,
+            )
+
+        cover_key = self._cover_key(track_group_prefix, track_id)
+        cover_bytes = await self._s3_client.get_bytes(cover_key)
+
         if preset_id is not None:
             resolved_stored_preset = await self._preset_store.require(preset_id)
         else:
@@ -1158,9 +1311,6 @@ class TrackStore:
                 resolved_stored_preset = await self._preset_store.require(entry.preset.id)
             except ValueError:
                 resolved_stored_preset = await self._preset_store.default()
-
-        cover_key = self._cover_key(track_group_prefix, track_id)
-        cover_bytes = await self._s3_client.get_bytes(cover_key)
 
         variant_specs = self._resolve_variant_specs(resolved_stored_preset.preset)
         variant_count = len(variant_specs)
@@ -1195,14 +1345,14 @@ class TrackStore:
                 original_variant_keys = self._variant_storage_keys(
                     track_group_prefix=track_group_prefix,
                     track_id=track_id,
-                    variant_count=entry.preset.variant_count,
+                    variant_count=entry.active_variant_count,
                     instrumental=False,
                 )
                 try:
                     await self._delete_variants(
                         track_group_prefix=track_group_prefix,
                         track_id=track_id,
-                        variant_count=entry.preset.variant_count,
+                        variant_count=entry.active_variant_count,
                         instrumental=False,
                     )
                 except Exception as error:
@@ -1279,14 +1429,14 @@ class TrackStore:
                 instrumental_variant_keys = self._variant_storage_keys(
                     track_group_prefix=track_group_prefix,
                     track_id=track_id,
-                    variant_count=entry.preset.variant_count,
+                    variant_count=entry.active_instrumental_variant_count,
                     instrumental=True,
                 )
                 try:
                     await self._delete_variants(
                         track_group_prefix=track_group_prefix,
                         track_id=track_id,
-                        variant_count=entry.preset.variant_count,
+                        variant_count=entry.active_instrumental_variant_count,
                         instrumental=True,
                     )
                 except Exception as error:
@@ -1507,6 +1657,7 @@ class TrackStore:
                 has_variants=False,
                 has_instrumental=False,
                 has_instrumental_variants=False,
+                uploaded_variants=None,
             )
         )
 
@@ -1558,6 +1709,312 @@ class TrackStore:
             has_instrumental=False,
         )
 
+    async def upload_variants(
+        self,
+        group: TrackGroup,
+        track_id: TrackId,
+        *,
+        variants: Sequence[UploadedVariant] | None = None,
+        instrumental_variants: Sequence[UploadedVariant] | None = None,
+    ) -> None:
+        """Upload finished active MP3 variant families for one stored track.
+
+        Uploaded mode is intentionally user-owned/risky: replacing
+        authoritative source audio later does not automatically invalidate the
+        uploaded finished variants written by this method.
+        """
+        if variants is None and instrumental_variants is None:
+            raise ValueError('upload_variants() requires at least one uploaded variant family')
+
+        track_group_prefix = self._track_group_prefix(
+            universe=group.universe,
+            year=group.year,
+            season=group.season,
+        )
+        manifest = (await self._require_group_manifest(group, sub_season=None)).copy()
+        entry = self._require_manifest_entry(manifest, group=group, track_id=track_id)
+        manifest_key = self._manifest_key(track_group_prefix)
+        touched_keys: list[Key] = []
+
+        parsed_variants = None if variants is None else self._normalize_uploaded_variants(variants, field='variants')
+        parsed_instrumental_variants = (
+            None
+            if instrumental_variants is None
+            else self._normalize_uploaded_variants(instrumental_variants, field='instrumental_variants')
+        )
+
+        existing_uploaded = entry.uploaded_variants
+        existing_uploaded_normal = None if existing_uploaded is None else existing_uploaded.variants
+        existing_uploaded_instrumental = None if existing_uploaded is None else existing_uploaded.instrumental_variants
+
+        if parsed_instrumental_variants is not None and parsed_variants is None and existing_uploaded_normal is None:
+            raise ValueError(
+                'upload_variants() cannot upload instrumental variants before an uploaded normal family exists'
+            )
+
+        final_variants = (
+            existing_uploaded_normal
+            if parsed_variants is None
+            else tuple(VariantSpec(speed=variant.speed, reverb=variant.reverb) for variant in parsed_variants)
+        )
+        if final_variants is None:
+            raise AssertionError('upload_variants() requires a final uploaded normal family')
+        final_instrumental_variants = (
+            existing_uploaded_instrumental
+            if parsed_instrumental_variants is None
+            else tuple(
+                VariantSpec(speed=variant.speed, reverb=variant.reverb) for variant in parsed_instrumental_variants
+            )
+        )
+
+        # Replace current active normal family before writing the uploaded one.
+        if entry.has_variants and (not entry.is_uploaded_mode or parsed_variants is not None):
+            original_variant_keys = self._variant_storage_keys(
+                track_group_prefix=track_group_prefix,
+                track_id=track_id,
+                variant_count=entry.active_variant_count,
+                instrumental=False,
+            )
+            try:
+                await self._delete_variants(
+                    track_group_prefix=track_group_prefix,
+                    track_id=track_id,
+                    variant_count=entry.active_variant_count,
+                    instrumental=False,
+                )
+            except Exception as error:
+                if (
+                    sync_error := self._build_update_sync_error(
+                        error,
+                        stage='original_variant_delete',
+                        track_id=track_id,
+                        touched_keys=touched_keys,
+                        assume_touched_keys=original_variant_keys,
+                        manifest_key=manifest_key,
+                        note_prefix='Uploaded original variant delete error',
+                    )
+                ) is None:
+                    raise
+                raise sync_error from error
+            touched_keys.extend(original_variant_keys)
+
+        # Preserve uploaded instrumental family when omitted; otherwise replace it.
+        delete_active_instrumental = entry.has_instrumental_variants and (
+            parsed_instrumental_variants is not None or final_instrumental_variants is None
+        )
+        if delete_active_instrumental:
+            instrumental_variant_keys = self._variant_storage_keys(
+                track_group_prefix=track_group_prefix,
+                track_id=track_id,
+                variant_count=entry.active_instrumental_variant_count,
+                instrumental=True,
+            )
+            try:
+                await self._delete_variants(
+                    track_group_prefix=track_group_prefix,
+                    track_id=track_id,
+                    variant_count=entry.active_instrumental_variant_count,
+                    instrumental=True,
+                )
+            except Exception as error:
+                if (
+                    sync_error := self._build_update_sync_error(
+                        error,
+                        stage='instrumental_variant_delete',
+                        track_id=track_id,
+                        touched_keys=touched_keys,
+                        assume_touched_keys=instrumental_variant_keys,
+                        manifest_key=manifest_key,
+                        note_prefix='Uploaded instrumental variant delete error',
+                    )
+                ) is None:
+                    raise
+                raise sync_error from error
+            touched_keys.extend(instrumental_variant_keys)
+
+        uploaded_variant_keys: list[Key] = []
+        try:
+            for index, variant in enumerate(parsed_variants or (), start=1):
+                key = self._variant_storage_key(
+                    track_group_prefix=track_group_prefix,
+                    track_id=track_id,
+                    index=index,
+                    instrumental=False,
+                )
+                await self._s3_client.put_bytes(
+                    key,
+                    variant.audio.data,
+                    content_type=S3ContentType.MP3,
+                )
+                uploaded_variant_keys.append(key)
+            for index, variant in enumerate(parsed_instrumental_variants or (), start=1):
+                key = self._variant_storage_key(
+                    track_group_prefix=track_group_prefix,
+                    track_id=track_id,
+                    index=index,
+                    instrumental=True,
+                )
+                await self._s3_client.put_bytes(
+                    key,
+                    variant.audio.data,
+                    content_type=S3ContentType.MP3,
+                )
+                uploaded_variant_keys.append(key)
+        except Exception as error:
+            if (
+                sync_error := self._build_update_sync_error(
+                    error,
+                    stage='uploaded_variant_upload',
+                    track_id=track_id,
+                    touched_keys=touched_keys,
+                    assume_touched_keys=uploaded_variant_keys,
+                    manifest_key=manifest_key,
+                    note_prefix='Uploaded variant upload error',
+                )
+            ) is None:
+                raise
+            raise sync_error from error
+        touched_keys.extend(uploaded_variant_keys)
+
+        updated_entry = dataclass_replace(
+            entry,
+            has_variants=True,
+            has_instrumental_variants=final_instrumental_variants is not None,
+            uploaded_variants=UploadedVariantMetadata(
+                variants=final_variants,
+                instrumental_variants=final_instrumental_variants,
+            ),
+        )
+        rewritten_manifest = self._replace_manifest_entry(
+            manifest,
+            updated_entry=updated_entry,
+        )
+        try:
+            await self._write_manifest_and_update_cache(
+                track_group_prefix=track_group_prefix,
+                manifest=rewritten_manifest,
+            )
+        except Exception as error:
+            if (
+                sync_error := self._build_update_sync_error(
+                    error,
+                    stage='manifest_write',
+                    track_id=track_id,
+                    touched_keys=touched_keys,
+                    manifest_key=manifest_key,
+                    note_prefix='Upload variants manifest write error',
+                )
+            ) is None:
+                raise
+            raise sync_error from error
+
+    async def clear_uploaded_variants(
+        self,
+        group: TrackGroup,
+        track_id: TrackId,
+    ) -> None:
+        """Clear uploaded finished variants and return the track to generated mode."""
+        track_group_prefix = self._track_group_prefix(
+            universe=group.universe,
+            year=group.year,
+            season=group.season,
+        )
+        manifest = (await self._require_group_manifest(group, sub_season=None)).copy()
+        entry = self._require_manifest_entry(manifest, group=group, track_id=track_id)
+        if not entry.is_uploaded_mode:
+            return
+
+        manifest_key = self._manifest_key(track_group_prefix)
+        touched_keys: list[Key] = []
+
+        if entry.has_variants:
+            original_variant_keys = self._variant_storage_keys(
+                track_group_prefix=track_group_prefix,
+                track_id=track_id,
+                variant_count=entry.active_variant_count,
+                instrumental=False,
+            )
+            try:
+                await self._delete_variants(
+                    track_group_prefix=track_group_prefix,
+                    track_id=track_id,
+                    variant_count=entry.active_variant_count,
+                    instrumental=False,
+                )
+            except Exception as error:
+                if (
+                    sync_error := self._build_update_sync_error(
+                        error,
+                        stage='original_variant_delete',
+                        track_id=track_id,
+                        touched_keys=touched_keys,
+                        assume_touched_keys=original_variant_keys,
+                        manifest_key=manifest_key,
+                        note_prefix='Clear uploaded original variant delete error',
+                    )
+                ) is None:
+                    raise
+                raise sync_error from error
+            touched_keys.extend(original_variant_keys)
+
+        if entry.has_instrumental_variants:
+            instrumental_variant_keys = self._variant_storage_keys(
+                track_group_prefix=track_group_prefix,
+                track_id=track_id,
+                variant_count=entry.active_instrumental_variant_count,
+                instrumental=True,
+            )
+            try:
+                await self._delete_variants(
+                    track_group_prefix=track_group_prefix,
+                    track_id=track_id,
+                    variant_count=entry.active_instrumental_variant_count,
+                    instrumental=True,
+                )
+            except Exception as error:
+                if (
+                    sync_error := self._build_update_sync_error(
+                        error,
+                        stage='instrumental_variant_delete',
+                        track_id=track_id,
+                        touched_keys=touched_keys,
+                        assume_touched_keys=instrumental_variant_keys,
+                        manifest_key=manifest_key,
+                        note_prefix='Clear uploaded instrumental variant delete error',
+                    )
+                ) is None:
+                    raise
+                raise sync_error from error
+            touched_keys.extend(instrumental_variant_keys)
+
+        rewritten_manifest = self._replace_manifest_entry(
+            manifest,
+            updated_entry=dataclass_replace(
+                entry,
+                has_variants=False,
+                has_instrumental_variants=False,
+                uploaded_variants=None,
+            ),
+        )
+        try:
+            await self._write_manifest_and_update_cache(
+                track_group_prefix=track_group_prefix,
+                manifest=rewritten_manifest,
+            )
+        except Exception as error:
+            if (
+                sync_error := self._build_update_sync_error(
+                    error,
+                    stage='manifest_write',
+                    track_id=track_id,
+                    touched_keys=touched_keys,
+                    manifest_key=manifest_key,
+                    note_prefix='Clear uploaded variants manifest write error',
+                )
+            ) is None:
+                raise
+            raise sync_error from error
+
     async def update(
         self,
         group: TrackGroup,
@@ -1586,6 +2043,10 @@ class TrackStore:
 
         Validation is strict and performed before any S3 writes. No resampling
         is performed.
+
+        Uploaded mode is intentionally user-owned/risky. Authoritative source
+        updates do not automatically invalidate uploaded finished variants; use
+        `clear_uploaded_variants()` explicitly to return to generated mode.
 
         Raises:
             TrackPresetsCorruptedError: If `tracks/presets.json` exists but is malformed.
@@ -1646,12 +2107,12 @@ class TrackStore:
         if validated_title is not None:
             updated_entry = dataclass_replace(updated_entry, title=validated_title)
 
-        # Original track updates invalidate only the original variant family.
-        if validated_track_bytes is not None and entry.has_variants:
+        # Generated-mode source updates invalidate only the generated original variant family.
+        if validated_track_bytes is not None and entry.has_variants and not entry.is_uploaded_mode:
             original_variant_keys = self._variant_storage_keys(
                 track_group_prefix=track_group_prefix,
                 track_id=track_id,
-                variant_count=entry.preset.variant_count,
+                variant_count=entry.active_variant_count,
                 instrumental=False,
             )
             try:
@@ -1693,14 +2154,15 @@ class TrackStore:
                     raise
                 raise sync_error from error
             touched_keys.append(track_key)
-            updated_entry = dataclass_replace(updated_entry, has_variants=False)
+            if not entry.is_uploaded_mode:
+                updated_entry = dataclass_replace(updated_entry, has_variants=False)
 
-        # Instrumental updates invalidate only the instrumental variant family.
-        if validated_instrumental_bytes is not None and entry.has_instrumental_variants:
+        # Generated-mode source updates invalidate only the generated instrumental variant family.
+        if validated_instrumental_bytes is not None and entry.has_instrumental_variants and not entry.is_uploaded_mode:
             instrumental_variant_keys = self._variant_storage_keys(
                 track_group_prefix=track_group_prefix,
                 track_id=track_id,
-                variant_count=entry.preset.variant_count,
+                variant_count=entry.active_instrumental_variant_count,
                 instrumental=True,
             )
             try:
@@ -1745,7 +2207,7 @@ class TrackStore:
             updated_entry = dataclass_replace(
                 updated_entry,
                 has_instrumental=True,
-                has_instrumental_variants=False,
+                has_instrumental_variants=(entry.has_instrumental_variants if entry.is_uploaded_mode else False),
             )
 
         # Cover updates do not affect variant state. Album linkage is used only
@@ -2083,7 +2545,7 @@ class TrackStore:
                     self._variant_storage_keys(
                         track_group_prefix=track_group_prefix,
                         track_id=removed_entry.id,
-                        variant_count=removed_entry.preset.variant_count,
+                        variant_count=removed_entry.active_variant_count,
                         instrumental=False,
                     )
                 )
@@ -2092,7 +2554,7 @@ class TrackStore:
                     self._variant_storage_keys(
                         track_group_prefix=track_group_prefix,
                         track_id=removed_entry.id,
-                        variant_count=removed_entry.preset.variant_count,
+                        variant_count=removed_entry.active_instrumental_variant_count,
                         instrumental=True,
                     )
                 )
@@ -2195,7 +2657,7 @@ class TrackStore:
                 self._variant_storage_keys(
                     track_group_prefix=track_group_prefix,
                     track_id=track_id,
-                    variant_count=entry.preset.variant_count,
+                    variant_count=entry.active_variant_count,
                     instrumental=False,
                 )
             )
@@ -2204,7 +2666,7 @@ class TrackStore:
                 self._variant_storage_keys(
                     track_group_prefix=track_group_prefix,
                     track_id=track_id,
-                    variant_count=entry.preset.variant_count,
+                    variant_count=entry.active_instrumental_variant_count,
                     instrumental=True,
                 )
             )
@@ -2225,10 +2687,13 @@ class TrackStore:
         """Remove one track's authoritative instrumental subtree.
 
         Removal is driven strictly by the authoritative manifest entry for the
-        provided `(group, track_id)`. This method deletes only the
-        instrumental objects and variants implied by that entry and does not
-        act as a recovery path for orphaned instrumental objects or variants
-        left behind by earlier sync failures.
+        provided `(group, track_id)`. In generated mode this deletes the
+        authoritative instrumental object and any generated instrumental
+        variants implied by that entry. In uploaded mode it deletes only the
+        authoritative instrumental source object; uploaded finished
+        instrumental variants remain active until explicitly replaced or
+        cleared. This method does not act as a recovery path for orphaned
+        objects left behind by earlier sync failures.
 
         Raises:
             TrackManifestCorruptedError: If the target group's manifest exists but is malformed.
@@ -2248,13 +2713,14 @@ class TrackStore:
         if not entry.has_instrumental:
             raise ValueError(f'Track id {track_id} does not have an instrumental in the provided group')
 
+        updated_entry = dataclass_replace(
+            entry,
+            has_instrumental=False,
+            has_instrumental_variants=(entry.has_instrumental_variants if entry.is_uploaded_mode else False),
+        )
         rewritten_manifest = self._replace_manifest_entry(
             manifest,
-            updated_entry=dataclass_replace(
-                entry,
-                has_instrumental=False,
-                has_instrumental_variants=False,
-            ),
+            updated_entry=updated_entry,
         )
 
         manifest_key = self._manifest_key(track_group_prefix)
@@ -2280,12 +2746,12 @@ class TrackStore:
         touched_keys: list[Key] = []
         instrumental_key = self._instrumental_key(track_group_prefix, track_id)
         all_keys = [instrumental_key]
-        if entry.has_instrumental_variants:
+        if entry.has_instrumental_variants and not entry.is_uploaded_mode:
             all_keys.extend(
                 self._variant_storage_keys(
                     track_group_prefix=track_group_prefix,
                     track_id=track_id,
-                    variant_count=entry.preset.variant_count,
+                    variant_count=entry.active_instrumental_variant_count,
                     instrumental=True,
                 )
             )
@@ -2299,11 +2765,11 @@ class TrackStore:
             manifest_key=manifest_key,
             logical_state='Manifest was already updated, and instrumental is already removed logically.',
         )
-        if entry.has_instrumental_variants:
+        if entry.has_instrumental_variants and not entry.is_uploaded_mode:
             instrumental_variant_keys = self._variant_storage_keys(
                 track_group_prefix=track_group_prefix,
                 track_id=track_id,
-                variant_count=entry.preset.variant_count,
+                variant_count=entry.active_instrumental_variant_count,
                 instrumental=True,
             )
             await self._delete_keys_for_cleanup(
@@ -2543,16 +3009,16 @@ class TrackStore:
         """Return the manifest version for the current variant-index schema."""
         return preset.version + (_VARIANT_INDEX_SCHEMA_VERSION - 1)
 
-    def _resolve_variant_specs(self, preset: Preset) -> tuple[_ResolvedVariantSpec, ...]:
+    def _resolve_variant_specs(self, preset: Preset) -> tuple[VariantSpec, ...]:
         # This final ascending-speed order is a storage invariant: variant
         # index N maps to the Nth sorted spec in persistent S3 keys. Changing
         # the ordering logic without explicit migration/invalidation can make
         # existing indexed variant objects point to different semantics.
-        variant_specs: list[_ResolvedVariantSpec] = []
+        variant_specs: list[VariantSpec] = []
         if preset.slowed is not None:
             for level in range(1, preset.slowed.levels + 1):
                 variant_specs.append(
-                    _ResolvedVariantSpec(
+                    VariantSpec(
                         speed=1.0 - level * preset.slowed.step,
                         reverb=0.0,
                     )
@@ -2560,7 +3026,7 @@ class TrackStore:
         if preset.sped_up is not None:
             for level in range(1, preset.sped_up.levels + 1):
                 variant_specs.append(
-                    _ResolvedVariantSpec(
+                    VariantSpec(
                         speed=1.0 + level * preset.sped_up.step,
                         reverb=0.0,
                     )
@@ -2580,7 +3046,7 @@ class TrackStore:
         *,
         track_group_prefix: Prefix,
         track_id: TrackId,
-        variant_specs: tuple[_ResolvedVariantSpec, ...],
+        variant_specs: tuple[VariantSpec, ...],
         instrumental: bool,
     ) -> tuple[FetchedVariant, ...]:
         variant_keys = [
@@ -2608,7 +3074,7 @@ class TrackStore:
         source_bytes: bytes,
         track_group_prefix: Prefix,
         track_id: TrackId,
-        variant_specs: tuple[_ResolvedVariantSpec, ...],
+        variant_specs: tuple[VariantSpec, ...],
         instrumental: bool,
         uploaded_keys: list[Key] | None = None,
     ) -> tuple[FetchedVariant, ...]:
@@ -2650,6 +3116,30 @@ class TrackStore:
             )
 
         return tuple(variants)
+
+    def _normalize_uploaded_variants(
+        self,
+        variants: Sequence[UploadedVariant],
+        *,
+        field: str,
+    ) -> tuple[UploadedVariant, ...]:
+        if not isinstance(variants, Sequence):
+            raise ValueError(f'{field} must be a sequence')
+        if not variants:
+            raise ValueError(f'{field} must not be empty')
+        if len(variants) > 10:
+            raise ValueError(f'{field} must contain at most 10 items')
+        if any(not isinstance(variant, UploadedVariant) for variant in variants):
+            raise ValueError(f'{field} entries must be UploadedVariant')
+
+        normalized = tuple(sorted(variants, key=lambda variant: float(variant.speed)))
+        previous_speed: float | None = None
+        for variant in normalized:
+            speed = float(variant.speed)
+            if previous_speed is not None and speed <= previous_speed:
+                raise ValueError(f'{field} speeds must be unique')
+            previous_speed = speed
+        return normalized
 
     async def _delete_variants(
         self,
@@ -2933,7 +3423,7 @@ class TrackStore:
             original_variant_keys = self._variant_storage_keys(
                 track_group_prefix=track_group_prefix,
                 track_id=track_id,
-                variant_count=entry.preset.variant_count,
+                variant_count=entry.active_variant_count,
                 instrumental=False,
             )
             await self._delete_keys_for_cleanup(
@@ -2951,7 +3441,7 @@ class TrackStore:
             instrumental_variant_keys = self._variant_storage_keys(
                 track_group_prefix=track_group_prefix,
                 track_id=track_id,
-                variant_count=entry.preset.variant_count,
+                variant_count=entry.active_instrumental_variant_count,
                 instrumental=True,
             )
             await self._delete_keys_for_cleanup(
@@ -3088,6 +3578,28 @@ def _applied_preset_to_dict(preset: AppliedPreset) -> dict[str, object]:
     }
 
 
+def _variant_spec_to_dict(spec: VariantSpec) -> dict[str, object]:
+    return {
+        'speed': spec.speed,
+        'reverb': spec.reverb,
+    }
+
+
+def _uploaded_variant_metadata_to_dict(
+    metadata: UploadedVariantMetadata | None,
+) -> dict[str, object] | None:
+    if metadata is None:
+        return None
+    return {
+        'variants': [_variant_spec_to_dict(spec) for spec in metadata.variants],
+        'instrumental_variants': (
+            None
+            if metadata.instrumental_variants is None
+            else [_variant_spec_to_dict(spec) for spec in metadata.instrumental_variants]
+        ),
+    }
+
+
 def _parse_preset(value: object, *, context: str) -> Preset:
     if not isinstance(value, dict):
         raise ValueError(f'{context} `preset` must be an object')
@@ -3145,6 +3657,48 @@ def _parse_applied_preset(value: object, *, context: str) -> AppliedPreset:
             value['variant_count'], field='variant_count', context=f'{context} `preset`'
         ),
     )
+
+
+def _parse_variant_spec(value: object, *, context: str) -> VariantSpec:
+    if not isinstance(value, dict):
+        raise ValueError(f'{context} must be an object')
+    if set(value) != {'speed', 'reverb'}:
+        raise ValueError(f'{context} has unexpected fields')
+
+    return VariantSpec(
+        speed=_expect_number(value['speed'], field='speed', context=context, min_value=None),
+        reverb=_expect_number(value['reverb'], field='reverb', context=context, min_value=0.0),
+    )
+
+
+def _parse_uploaded_variant_metadata(value: object, *, context: str) -> UploadedVariantMetadata | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError(f'{context} `uploaded_variants` must be an object or null')
+    if set(value) != {'variants', 'instrumental_variants'}:
+        raise ValueError(f'{context} `uploaded_variants` has unexpected fields')
+
+    variants = _parse_variant_spec_list(value['variants'], context=f'{context} `uploaded_variants.variants`')
+    instrumental_variants_value = value['instrumental_variants']
+    instrumental_variants = (
+        None
+        if instrumental_variants_value is None
+        else _parse_variant_spec_list(
+            instrumental_variants_value,
+            context=f'{context} `uploaded_variants.instrumental_variants`',
+        )
+    )
+    return UploadedVariantMetadata(
+        variants=variants,
+        instrumental_variants=instrumental_variants,
+    )
+
+
+def _parse_variant_spec_list(value: object, *, context: str) -> tuple[VariantSpec, ...]:
+    if not isinstance(value, list):
+        raise ValueError(f'{context} must be a list')
+    return tuple(_parse_variant_spec(item, context=f'{context}[]') for item in value)
 
 
 def _parse_track_artists(value: object, *, context: str) -> tuple[str, ...]:
