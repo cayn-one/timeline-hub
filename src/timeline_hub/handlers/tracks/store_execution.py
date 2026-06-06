@@ -1,16 +1,25 @@
+import math
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import timedelta
+from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from aiogram import Bot
 from aiogram.types import Message
 
-from timeline_hub.infra.ffmpeg import to_opus
+from timeline_hub.infra.ffmpeg import probe_audio_sample_rate, to_opus
 from timeline_hub.infra.images import normalize_cover_to_jpg
 from timeline_hub.infra.ytdlp import TrackMetadata, YtDlpMetadataError, download_audio_as_opus
-from timeline_hub.services.track_store import Track, TrackGroup, TrackId, TrackStore
-from timeline_hub.types import Extension, FileBytes
+from timeline_hub.services.track_store import (
+    Track,
+    TrackGroup,
+    TrackId,
+    TrackInvalidAudioFormatError,
+    TrackStore,
+    UploadedVariant,
+)
+from timeline_hub.types import Extension, FileBytes, InvalidExtensionError
 
 
 class TrackInputError(ValueError):
@@ -56,6 +65,19 @@ class TrackAudioAttachment:
     file_name: str | None
 
 
+@dataclass(frozen=True, slots=True)
+class UploadedMp3Attachment:
+    file_id: str
+    file_name: str
+
+
+@dataclass(frozen=True, slots=True)
+class ParsedUploadedVariant:
+    attachment: UploadedMp3Attachment
+    speed: float
+    reverb: float
+
+
 _SUPPORTED_DOCUMENT_AUDIO_EXTENSIONS = frozenset({'.wav', '.flac', '.opus'})
 
 
@@ -82,6 +104,43 @@ def _is_supported_document_audio_filename(file_name: str | None) -> bool:
     return any(file_name.lower().endswith(suffix) for suffix in _SUPPORTED_DOCUMENT_AUDIO_EXTENSIONS)
 
 
+def extract_uploaded_mp3_attachment(message: Message) -> UploadedMp3Attachment | None:
+    audio = message.audio
+    if audio is not None:
+        file_name = getattr(audio, 'file_name', None)
+        file_id = getattr(audio, 'file_id', None)
+        if isinstance(file_name, str) and _is_uploaded_mp3_filename(file_name) and isinstance(file_id, str) and file_id:
+            return UploadedMp3Attachment(file_id=file_id, file_name=file_name)
+
+    document = getattr(message, 'document', None)
+    if document is None:
+        return None
+    file_name = getattr(document, 'file_name', None)
+    file_id = getattr(document, 'file_id', None)
+    if not isinstance(file_name, str) or not _is_uploaded_mp3_filename(file_name):
+        return None
+    if not isinstance(file_id, str) or not file_id:
+        return None
+    return UploadedMp3Attachment(file_id=file_id, file_name=file_name)
+
+
+def _is_uploaded_mp3_filename(file_name: str | None) -> bool:
+    if not isinstance(file_name, str):
+        return False
+    if not file_name.lower().endswith(Extension.MP3.suffix):
+        return False
+
+    stem_parts = Path(file_name).stem.split('_')
+    if len(stem_parts) != 2:
+        return False
+    try:
+        int(stem_parts[0])
+        int(stem_parts[1])
+    except ValueError:
+        return False
+    return True
+
+
 def extract_single_photo_audio_messages(messages: Sequence[Message]) -> tuple[Message, Message]:
     """Return exactly one photo message and one audio message, order-independent."""
     if len(messages) != 2:
@@ -101,6 +160,75 @@ def extract_photo_messages_for_remove(messages: Sequence[Message]) -> tuple[Mess
     if any(message.photo is None for message in messages):
         raise TrackInputError('Invalid input')
     return tuple(messages)
+
+
+def _validate_and_order_uploaded_variant_messages(
+    uploaded_messages: Sequence[Message],
+) -> tuple[ParsedUploadedVariant, ...]:
+    """Validate uploaded variant messages fully before any file download."""
+    parsed_variants: list[ParsedUploadedVariant] = []
+    for uploaded_message in uploaded_messages:
+        attachment = extract_uploaded_mp3_attachment(uploaded_message)
+        if attachment is None:
+            raise TrackInputError('Invalid input')
+        speed, reverb = parse_uploaded_variant_filename(attachment.file_name)
+        if not math.isfinite(speed) or speed <= 0.0:
+            raise TrackInputError('Invalid input')
+        if not math.isfinite(reverb) or reverb < 0.0:
+            raise TrackInputError('Invalid input')
+        parsed_variants.append(
+            ParsedUploadedVariant(
+                attachment=attachment,
+                speed=speed,
+                reverb=reverb,
+            )
+        )
+
+    if not parsed_variants or len(parsed_variants) > 10:
+        raise TrackInputError('Invalid input')
+
+    ordered_variants = sorted(parsed_variants, key=lambda variant: variant.speed)
+    previous_speed: float | None = None
+    for variant in ordered_variants:
+        if previous_speed is not None and variant.speed <= previous_speed:
+            raise TrackInputError('Invalid input')
+        previous_speed = variant.speed
+
+    return tuple(ordered_variants)
+
+
+def validate_uploaded_source_variant_batch(
+    messages: Sequence[Message],
+) -> tuple[Message, Message, tuple[ParsedUploadedVariant, ...]]:
+    """Validate one ordered uploaded action batch before any file download.
+
+    Expected shape:
+        1. identity-bearing cover photo
+        2. authoritative source Telegram audio
+        3..N uploaded MP3 variants
+    """
+    if len(messages) < 3:
+        raise TrackInputError('Invalid input')
+    if any(message.text is not None for message in messages):
+        raise TrackInputError('Invalid input')
+    if any(message.video is not None or getattr(message, 'animation', None) is not None for message in messages):
+        raise TrackInputError('Invalid input')
+
+    photo_message = messages[0]
+    if photo_message.photo is None:
+        raise TrackInputError('Invalid input')
+    if any(message.photo is not None for message in messages[1:]):
+        raise TrackInputError('Invalid input')
+
+    source_audio_message = messages[1]
+    if source_audio_message.audio is None:
+        raise TrackInputError('Invalid input')
+
+    uploaded_messages = tuple(messages[2:])
+    if any(extract_uploaded_mp3_attachment(message) is None for message in uploaded_messages):
+        raise TrackInputError('Invalid input')
+
+    return photo_message, source_audio_message, _validate_and_order_uploaded_variant_messages(uploaded_messages)
 
 
 def extract_track_identity_from_photo_message(photo_message: Message) -> tuple[TrackGroup, TrackId]:
@@ -151,13 +279,49 @@ async def prepare_audio_from_message(*, bot: Bot, audio_message: Message) -> Fil
     try:
         audio_extension = Extension.try_from_filename(attachment.file_name)
         if audio_extension is Extension.OPUS:
-            audio_opus = audio_bytes
+            audio_opus = await _validate_raw_opus_audio_bytes(audio_bytes)
         else:
             audio_opus = await to_opus(audio_bytes)
+    except TrackInvalidAudioFormatError:
+        raise
     except Exception as error:
         raise TrackInputError("Can't process audio") from error
 
     return FileBytes(data=audio_opus, extension=Extension.OPUS)
+
+
+def parse_uploaded_variant_filename(file_name: str) -> tuple[float, float]:
+    """Parse exact `<int>_<int>.mp3` metadata from an uploaded variant filename."""
+    if not _is_uploaded_mp3_filename(file_name):
+        raise TrackInputError('Invalid input')
+
+    stem_parts = Path(file_name).stem.split('_')
+    if len(stem_parts) != 2:
+        raise TrackInputError('Invalid input')
+
+    try:
+        speed_part = int(stem_parts[0])
+        reverb_part = int(stem_parts[1])
+    except ValueError as error:
+        raise TrackInputError('Invalid input') from error
+    return speed_part / 100, reverb_part / 10
+
+
+async def prepare_uploaded_variant_from_parsed(
+    *,
+    bot: Bot,
+    parsed_variant: ParsedUploadedVariant,
+) -> UploadedVariant:
+    """Download one validated uploaded MP3 message without transcoding it."""
+    raw_bytes = await _download_file_bytes(bot=bot, file_id=parsed_variant.attachment.file_id)
+    try:
+        return UploadedVariant(
+            speed=parsed_variant.speed,
+            reverb=parsed_variant.reverb,
+            audio=FileBytes(data=raw_bytes, extension=Extension.MP3),
+        )
+    except (InvalidExtensionError, ValueError) as error:
+        raise TrackInputError('Invalid input') from error
 
 
 def extract_store_messages(messages: Sequence[Message]) -> list[Message]:
@@ -412,9 +576,11 @@ async def prepare_tracks_from_buffer(*, bot: Bot, messages: Sequence[Message]) -
             audio_extension = Extension.try_from_filename(attachment.file_name)
             if audio_extension is Extension.OPUS:
                 # Fast-path: avoid re-encoding already-Opus input.
-                audio_opus = audio_bytes
+                audio_opus = await _validate_raw_opus_audio_bytes(audio_bytes)
             else:
                 audio_opus = await to_opus(audio_bytes)
+        except TrackInvalidAudioFormatError:
+            raise
         except Exception as error:
             raise TrackInputError("Can't process audio") from error
 
@@ -428,6 +594,14 @@ async def prepare_tracks_from_buffer(*, bot: Bot, messages: Sequence[Message]) -
         )
 
     return prepared_tracks
+
+
+async def _validate_raw_opus_audio_bytes(audio_bytes: bytes) -> bytes:
+    """Validate raw Opus source sample rate without re-encoding valid input."""
+    sample_rate = await probe_audio_sample_rate(audio_bytes)
+    if sample_rate != 48_000:
+        raise TrackInvalidAudioFormatError(f'Audio sample rate must be 48000 Hz, got {sample_rate}')
+    return audio_bytes
 
 
 async def prepare_audio_only_track_from_buffer(

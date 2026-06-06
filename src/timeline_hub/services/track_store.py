@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from dataclasses import replace as dataclass_replace
 from datetime import timedelta
 from enum import IntEnum, StrEnum
-from typing import Self, TypeVar
+from typing import Literal, Self, TypeVar
 
 from timeline_hub.infra.ffmpeg import clip_mp3, create_audio_variant, probe_audio_sample_rate
 from timeline_hub.infra.s3 import Key, Prefix, S3BatchDeleteError, S3Client, S3ContentType, S3ObjectNotFoundError
@@ -21,6 +21,7 @@ _INSTRUMENTAL_SUFFIX = '-instrumental'
 
 type TrackId = str
 type PresetId = int
+type TrackVariantMode = Literal['generated', 'uploaded']
 
 
 def _require_extension(file: FileBytes, expected: Extension, field: str) -> None:
@@ -146,6 +147,7 @@ class TrackInfo:
     artists: tuple[str, ...]
     title: str
     has_instrumental: bool
+    variant_mode: TrackVariantMode
 
 
 @dataclass(frozen=True, slots=True)
@@ -1203,6 +1205,7 @@ class TrackStore:
                     artists=entry.artists,
                     title=entry.title,
                     has_instrumental=entry.has_instrumental,
+                    variant_mode='uploaded' if entry.uploaded_variants is not None else 'generated',
                 )
                 for entry in sorted(grouped_entries[sub_season], key=lambda entry: entry.order)
             ]
@@ -1707,6 +1710,7 @@ class TrackStore:
             artists=track.artists,
             title=track.title,
             has_instrumental=False,
+            variant_mode='generated',
         )
 
     async def upload_variants(

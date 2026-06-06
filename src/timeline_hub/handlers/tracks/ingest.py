@@ -43,10 +43,12 @@ from timeline_hub.handlers.tracks.store_execution import (
     prepare_audio_only_track_from_buffer,
     prepare_link_only_track_from_buffer,
     prepare_tracks_from_buffer,
+    prepare_uploaded_variant_from_parsed,
     validate_audio_link_store_input,
     validate_audio_only_store_input,
     validate_link_only_store_input,
     validate_track_batch,
+    validate_uploaded_source_variant_batch,
 )
 from timeline_hub.infra.images import normalize_cover_to_jpg
 from timeline_hub.infra.ytdlp import YtDlpMetadataError, download_audio_as_opus, fetch_track_info
@@ -65,12 +67,14 @@ from timeline_hub.services.track_store import (
     TrackRemoveManifestSyncError,
     TrackUniverse,
     TrackUpdateManifestSyncError,
+    UploadedVariant,
 )
 from timeline_hub.settings import Settings
 from timeline_hub.types import Extension, FileBytes, InvalidExtensionError
 
 router = Router()
 _TRACK_STORE_MODE = 'track_store'
+_TRACK_UPLOADED_MODE = 'track_uploaded'
 _TRACK_BACK_VALUE = 'back'
 _TRACK_COVER_SOURCE_AUTO = 'auto'
 _TRACK_COVER_SOURCE_ALBUM = 'album'
@@ -94,10 +98,14 @@ class TrackIntakeAction(StrEnum):
     STORE = auto()
     REPLACE = auto()
     REMOVE = auto()
+    UPLOADED = auto()
     TRACK = auto()
     INSTRUMENTAL = auto()
     REMOVE_TRACK = auto()
     REMOVE_INSTRUMENTAL = auto()
+    UPLOADED_MAIN = auto()
+    UPLOADED_INSTRUMENTAL = auto()
+    UPLOADED_CLEAR = auto()
     BACK = auto()
     CANCEL = auto()
 
@@ -133,6 +141,21 @@ class TrackStoreCallbackData(CallbackData, prefix='track_store'):
     value: str
 
 
+class TrackUploadedAction(StrEnum):
+    SELECT = auto()
+    BACK = auto()
+
+
+class TrackUploadedFamily(StrEnum):
+    MAIN = auto()
+    INSTRUMENTAL = auto()
+
+
+class TrackUploadedFinalCallbackData(CallbackData, prefix='track_uploaded'):
+    action: TrackUploadedAction
+    value: str
+
+
 def _is_expected_track_metadata_unavailable(error: YtDlpMetadataError) -> bool:
     return str(error) in _EXPECTED_TRACK_METADATA_UNAVAILABLE_ERRORS
 
@@ -151,6 +174,10 @@ class TrackStoreFlow(StatesGroup):
     sub_season = State()
     cover_source = State()
     album = State()
+    final = State()
+
+
+class TrackUploadedFlow(StatesGroup):
     final = State()
 
 
@@ -203,6 +230,15 @@ async def on_track_intake_action(
         )
         return
 
+    if callback_data.action is TrackIntakeAction.UPLOADED:
+        await message.edit_text(
+            **_track_uploaded_menu_kwargs(
+                message_width=settings.message_width,
+                buffer_version=callback_data.buffer_version,
+            )
+        )
+        return
+
     if callback_data.action is TrackIntakeAction.BACK:
         await message.edit_text(
             **_track_intake_menu_kwargs(
@@ -234,6 +270,26 @@ async def on_track_intake_action(
             state=state,
             services=services,
             action=callback_data.action,
+            expected_buffer_version=callback_data.buffer_version,
+        )
+        return
+
+    if callback_data.action in (TrackIntakeAction.UPLOADED_MAIN, TrackIntakeAction.UPLOADED_INSTRUMENTAL):
+        await _enter_uploaded_track_final_menu(
+            message=message,
+            state=state,
+            services=services,
+            action=callback_data.action,
+            expected_buffer_version=callback_data.buffer_version,
+            settings=settings,
+        )
+        return
+
+    if callback_data.action is TrackIntakeAction.UPLOADED_CLEAR:
+        await _execute_uploaded_clear_action(
+            message=message,
+            state=state,
+            services=services,
             expected_buffer_version=callback_data.buffer_version,
         )
         return
@@ -457,6 +513,61 @@ async def on_track_store_menu(
             )
 
 
+@router.callback_query(
+    TrackUploadedFinalCallbackData.filter(),
+    F.message.chat.type == ChatType.PRIVATE,
+)
+async def on_track_uploaded_final_menu(
+    callback: CallbackQuery,
+    callback_data: TrackUploadedFinalCallbackData,
+    state: FSMContext,
+    services: Services,
+    settings: Settings,
+    bot: Bot,
+) -> None:
+    await callback.answer()
+    message = callback_message(callback)
+    if message is None:
+        await state.clear()
+        return
+
+    if not await _validate_track_uploaded_callback(message=message, state=state, services=services):
+        return
+
+    data = await state.get_data()
+    if callback_data.action is TrackUploadedAction.BACK:
+        await _show_uploaded_submenu_from_state(
+            message=message,
+            state=state,
+            settings=settings,
+            buffer_version=_buffer_version_from_state(data),
+        )
+        return
+
+    completion_mode = _parse_track_store_completion_mode(callback_data.value)
+    if completion_mode is None:
+        await handle_stale_selection(message=message, state=state)
+        return
+
+    uploaded_context = _uploaded_final_context(data)
+    if uploaded_context is None:
+        await handle_stale_selection(message=message, state=state)
+        return
+    group, track_id, sub_season, family = uploaded_context
+    await _execute_uploaded_track_final_selection(
+        message=message,
+        state=state,
+        services=services,
+        settings=settings,
+        bot=bot,
+        group=group,
+        track_id=track_id,
+        sub_season=sub_season,
+        family=family,
+        completion_mode=completion_mode,
+    )
+
+
 async def try_dispatch_track_intake(
     *,
     message: Message,
@@ -506,6 +617,13 @@ def _track_intake_menu_kwargs(
                     text='Remove',
                     callback_data=TrackIntakeActionCallbackData(
                         action=TrackIntakeAction.REMOVE,
+                        buffer_version=buffer_version,
+                    ).pack(),
+                ),
+                InlineKeyboardButton(
+                    text='Uploaded',
+                    callback_data=TrackIntakeActionCallbackData(
+                        action=TrackIntakeAction.UPLOADED,
                         buffer_version=buffer_version,
                     ).pack(),
                 ),
@@ -602,6 +720,53 @@ def _track_remove_menu_kwargs(
     }
 
 
+def _track_uploaded_menu_kwargs(
+    *,
+    message_width: int,
+    buffer_version: int,
+) -> dict[str, Any]:
+    return {
+        **Text(
+            create_padding_line(message_width),
+            '\n',
+            'Selected: ',
+            Bold('Uploaded'),
+        ).as_kwargs(),
+        'reply_markup': selection_keyboard(
+            buttons=[
+                InlineKeyboardButton(
+                    text='Main',
+                    callback_data=TrackIntakeActionCallbackData(
+                        action=TrackIntakeAction.UPLOADED_MAIN,
+                        buffer_version=buffer_version,
+                    ).pack(),
+                ),
+                InlineKeyboardButton(
+                    text='Instrumental',
+                    callback_data=TrackIntakeActionCallbackData(
+                        action=TrackIntakeAction.UPLOADED_INSTRUMENTAL,
+                        buffer_version=buffer_version,
+                    ).pack(),
+                ),
+                InlineKeyboardButton(
+                    text='Clear',
+                    callback_data=TrackIntakeActionCallbackData(
+                        action=TrackIntakeAction.UPLOADED_CLEAR,
+                        buffer_version=buffer_version,
+                    ).pack(),
+                ),
+            ],
+            back_button=InlineKeyboardButton(
+                text='Back',
+                callback_data=TrackIntakeActionCallbackData(
+                    action=TrackIntakeAction.BACK,
+                    buffer_version=buffer_version,
+                ).pack(),
+            ),
+        ),
+    }
+
+
 async def _show_track_intake_action_menu(
     *,
     message: Message,
@@ -615,6 +780,22 @@ async def _show_track_intake_action_menu(
             message_width=settings.message_width,
             buffer_version=services.chat_message_buffer.version(message.chat.id),
             message_count=len(services.chat_message_buffer.peek_flat(message.chat.id)),
+        )
+    )
+
+
+async def _show_uploaded_submenu_from_state(
+    *,
+    message: Message,
+    state: FSMContext,
+    settings: Settings,
+    buffer_version: int,
+) -> None:
+    await state.clear()
+    await message.edit_text(
+        **_track_uploaded_menu_kwargs(
+            message_width=settings.message_width,
+            buffer_version=buffer_version,
         )
     )
 
@@ -1250,7 +1431,7 @@ async def _execute_track_store(
             bot=bot,
             messages=buffered_messages,
         )
-    except TrackInputError as error:
+    except (TrackInputError, TrackInvalidAudioFormatError) as error:
         await state.clear()
         services.chat_message_buffer.flush(message.chat.id)
         await message.edit_text(str(error), reply_markup=None)
@@ -1499,7 +1680,7 @@ async def _on_store_sub_season_selected_with_mode(
             )
             return
         raise TrackInputError('Invalid input')
-    except TrackInputError, TrackGroupNotFoundError:
+    except TrackInputError, TrackGroupNotFoundError, TrackInvalidAudioFormatError:
         await _invalidate_track_intake_buffer(
             message=message,
             state=state,
@@ -1595,7 +1776,7 @@ async def _execute_track_store_with_uploaded_audio_link_info(
                 album_id=None,
             ),
         )
-    except TrackInputError, TrackGroupNotFoundError:
+    except TrackInputError, TrackGroupNotFoundError, TrackInvalidAudioFormatError:
         await _invalidate_track_intake_buffer(
             message=message,
             state=state,
@@ -2186,6 +2367,290 @@ async def _execute_track_remove(
     await message.answer('Done')
 
 
+async def _enter_uploaded_track_final_menu(
+    *,
+    message: Message,
+    state: FSMContext,
+    services: Services,
+    action: TrackIntakeAction,
+    expected_buffer_version: int,
+    settings: Settings,
+) -> None:
+    chat_id = message.chat.id
+    buffered_messages = services.chat_message_buffer.peek_flat(chat_id)
+    try:
+        photo_message, _source_audio_message, _parsed_variants = validate_uploaded_source_variant_batch(
+            buffered_messages
+        )
+        group, track_id = extract_track_identity_from_photo_message(photo_message)
+        tracks_by_sub_season = await services.track_store.list_tracks(group)
+        matched_sub_season = _resolve_track_sub_season(tracks_by_sub_season, track_id)
+        if matched_sub_season is None:
+            raise TrackInputError('Invalid input')
+        matched_track_info = _resolve_track_info(tracks_by_sub_season, track_id)
+        if matched_track_info is None:
+            raise TrackInputError('Invalid input')
+        if action is TrackIntakeAction.UPLOADED_INSTRUMENTAL and matched_track_info.variant_mode != 'uploaded':
+            await _invalidate_track_intake_buffer(
+                message=message,
+                state=state,
+                services=services,
+                text='Missing main variants',
+            )
+            return
+        if services.chat_message_buffer.version(chat_id) != expected_buffer_version:
+            await handle_stale_selection(message=message, state=state)
+            return
+    except (
+        TrackInputError,
+        InvalidTrackIdentityError,
+        TrackGroupNotFoundError,
+    ):
+        await _invalidate_track_intake_buffer(
+            message=message,
+            state=state,
+            services=services,
+            text='Invalid input',
+        )
+        return
+    except ValueError as error:
+        if _is_missing_track_error(error):
+            await _invalidate_track_intake_buffer(
+                message=message,
+                state=state,
+                services=services,
+                text='Invalid input',
+            )
+            return
+        raise
+
+    family = TrackUploadedFamily.MAIN if action is TrackIntakeAction.UPLOADED_MAIN else TrackUploadedFamily.INSTRUMENTAL
+    await _set_track_uploaded_context(
+        state=state,
+        menu_message_id=message.message_id,
+        buffer_version=expected_buffer_version,
+        group=group,
+        track_id=track_id,
+        sub_season=matched_sub_season,
+        family=family,
+    )
+    await message.edit_text(
+        **selection_text(
+            selected=_selected_uploaded_path(group=group, sub_season=matched_sub_season, family=family),
+            prompt='Select finish mode:',
+            message_width=settings.message_width,
+        ),
+        reply_markup=_track_uploaded_final_keyboard(),
+    )
+
+
+async def _execute_uploaded_clear_action(
+    *,
+    message: Message,
+    state: FSMContext,
+    services: Services,
+    expected_buffer_version: int,
+) -> None:
+    chat_id = message.chat.id
+    buffered_messages = services.chat_message_buffer.peek_flat(chat_id)
+    owns_buffer = False
+    try:
+        photo_messages = extract_photo_messages_for_remove(buffered_messages)
+        if len(photo_messages) != 1:
+            raise TrackInputError('Invalid input')
+        group, track_id = extract_track_identity_from_photo_message(photo_messages[0])
+        tracks_by_sub_season = await services.track_store.list_tracks(group)
+        matched_sub_season = _resolve_track_sub_season(tracks_by_sub_season, track_id)
+        if matched_sub_season is None:
+            raise TrackInputError('Invalid input')
+        if services.chat_message_buffer.version(chat_id) != expected_buffer_version:
+            await handle_stale_selection(message=message, state=state)
+            return
+
+        services.chat_message_buffer.flush(chat_id)
+        await state.clear()
+        owns_buffer = True
+        await message.edit_text(
+            **selected_text(
+                selected=_selected_uploaded_path(
+                    group=group,
+                    sub_season=matched_sub_season,
+                    family=None,
+                    terminal_label='Clear',
+                ),
+            ),
+            reply_markup=None,
+        )
+        await services.track_store.clear_uploaded_variants(group, track_id)
+    except (
+        TrackInputError,
+        InvalidTrackIdentityError,
+        TrackGroupNotFoundError,
+    ):
+        await _invalidate_track_intake_buffer(
+            message=message,
+            state=state,
+            services=services,
+            text='Invalid input',
+            flush_buffer=not owns_buffer,
+        )
+        return
+    except ValueError as error:
+        if _is_missing_track_error(error):
+            await _invalidate_track_intake_buffer(
+                message=message,
+                state=state,
+                services=services,
+                text='Invalid input',
+                flush_buffer=not owns_buffer,
+            )
+            return
+        raise
+    except (
+        TrackUpdateManifestSyncError,
+        TrackManifestCorruptedError,
+        TrackPresetsCorruptedError,
+    ):
+        raise
+
+    await message.answer('Done')
+
+
+async def _execute_uploaded_track_final_selection(
+    *,
+    message: Message,
+    state: FSMContext,
+    services: Services,
+    settings: Settings,
+    bot: Bot,
+    group: TrackGroup,
+    track_id: str,
+    sub_season: SubSeason,
+    family: TrackUploadedFamily,
+    completion_mode: TrackStoreCompletionMode,
+) -> None:
+    chat_id = message.chat.id
+    buffered_messages = services.chat_message_buffer.peek_flat(chat_id)
+    await message.edit_text(
+        **selected_text(selected=_selected_uploaded_path(group=group, sub_season=sub_season, family=family)),
+        reply_markup=None,
+    )
+
+    try:
+        _photo_message, source_audio_message, parsed_variants = validate_uploaded_source_variant_batch(
+            buffered_messages
+        )
+        prepared_source = await prepare_audio_from_message(bot=bot, audio_message=source_audio_message)
+        uploaded_variants = [
+            await prepare_uploaded_variant_from_parsed(bot=bot, parsed_variant=parsed_variant)
+            for parsed_variant in parsed_variants
+        ]
+    except (
+        TrackInputError,
+        TrackInvalidAudioFormatError,
+        InvalidExtensionError,
+    ):
+        await _invalidate_track_intake_buffer(
+            message=message,
+            state=state,
+            services=services,
+            text='Invalid input',
+        )
+        return
+    except ValueError as error:
+        if _is_missing_track_error(error):
+            await _invalidate_track_intake_buffer(
+                message=message,
+                state=state,
+                services=services,
+                text='Invalid input',
+            )
+            return
+        raise
+
+    await _apply_uploaded_track_mutation(
+        services=services,
+        group=group,
+        track_id=track_id,
+        family=family,
+        prepared_source=prepared_source,
+        uploaded_variants=uploaded_variants,
+    )
+
+    await state.clear()
+    services.chat_message_buffer.flush(chat_id)
+    if completion_mode is TrackStoreCompletionMode.SKIP:
+        await message.answer('Done')
+        return
+    await send_fetched_tracks_by_ids(
+        bot=bot,
+        chat_id=chat_id,
+        group=group,
+        track_ids=[track_id],
+        services=services,
+        settings=settings,
+    )
+
+
+async def _apply_uploaded_track_mutation(
+    *,
+    services: Services,
+    group: TrackGroup,
+    track_id: str,
+    family: TrackUploadedFamily,
+    prepared_source: FileBytes,
+    uploaded_variants: list[UploadedVariant],
+) -> None:
+    variant_specs = [(variant.speed, variant.reverb) for variant in uploaded_variants]
+    if family is TrackUploadedFamily.MAIN:
+        await services.track_store.upload_variants(group, track_id, variants=uploaded_variants)
+        try:
+            await services.track_store.update(group, track_id, track=prepared_source)
+        except Exception as error:
+            error.add_note('Uploaded Main action replaced uploaded variants before authoritative source update failed')
+            logger.exception(
+                'uploaded main source update failed after variant replacement '
+                '(family={}, universe={}, year={}, season={}, track_id={}, '
+                'variant_count={}, variant_specs={}, uploaded_variants_replaced={})',
+                'main',
+                group.universe,
+                group.year,
+                int(group.season),
+                track_id,
+                len(uploaded_variants),
+                variant_specs,
+                True,
+            )
+            raise
+        return
+
+    await services.track_store.upload_variants(
+        group,
+        track_id,
+        instrumental_variants=uploaded_variants,
+    )
+    try:
+        await services.track_store.update(group, track_id, instrumental=prepared_source)
+    except Exception as error:
+        error.add_note(
+            'Uploaded Instrumental action replaced uploaded variants before authoritative source update failed'
+        )
+        logger.exception(
+            'uploaded instrumental source update failed after variant replacement '
+            '(family={}, universe={}, year={}, season={}, track_id={}, '
+            'variant_count={}, variant_specs={}, uploaded_variants_replaced={})',
+            'instrumental',
+            group.universe,
+            group.year,
+            int(group.season),
+            track_id,
+            len(uploaded_variants),
+            variant_specs,
+            True,
+        )
+        raise
+
+
 async def _invalidate_track_intake_buffer(
     *,
     message: Message,
@@ -2236,6 +2701,28 @@ async def _set_track_store_context(
     )
 
 
+async def _set_track_uploaded_context(
+    *,
+    state: FSMContext,
+    menu_message_id: int,
+    buffer_version: int,
+    group: TrackGroup,
+    track_id: str,
+    sub_season: SubSeason,
+    family: TrackUploadedFamily,
+) -> None:
+    await state.set_state(TrackUploadedFlow.final)
+    await state.update_data(
+        mode=_TRACK_UPLOADED_MODE,
+        menu_message_id=menu_message_id,
+        buffer_version=buffer_version,
+        uploaded_group=group,
+        uploaded_track_id=track_id,
+        uploaded_sub_season=sub_season,
+        uploaded_family=family.value,
+    )
+
+
 async def _validate_track_store_callback(
     *,
     message: Message,
@@ -2248,6 +2735,27 @@ async def _validate_track_store_callback(
         state=state,
         expected_mode=_TRACK_STORE_MODE,
         expected_state=_state_for_step(step),
+    ):
+        return False
+
+    data = await state.get_data()
+    if _buffer_version_from_state(data) != services.chat_message_buffer.version(message.chat.id):
+        await handle_stale_selection(message=message, state=state)
+        return False
+    return True
+
+
+async def _validate_track_uploaded_callback(
+    *,
+    message: Message,
+    state: FSMContext,
+    services: Services,
+) -> bool:
+    if not await validate_flow_state(
+        message=message,
+        state=state,
+        expected_mode=_TRACK_UPLOADED_MODE,
+        expected_state=TrackUploadedFlow.final,
     ):
         return False
 
@@ -2376,6 +2884,103 @@ def _is_missing_album_error(error: ValueError) -> bool:
     return str(error).startswith('Album id ') and ' does not exist in group ' in str(error)
 
 
+def _uploaded_action_label(action: TrackIntakeAction) -> str:
+    if action is TrackIntakeAction.UPLOADED_MAIN:
+        return 'Main'
+    if action is TrackIntakeAction.UPLOADED_INSTRUMENTAL:
+        return 'Instrumental'
+    if action is TrackIntakeAction.UPLOADED_CLEAR:
+        return 'Clear'
+    raise ValueError(f'Unsupported uploaded action: {action}')
+
+
+def _uploaded_family_label(family: TrackUploadedFamily) -> str:
+    if family is TrackUploadedFamily.MAIN:
+        return 'Main'
+    if family is TrackUploadedFamily.INSTRUMENTAL:
+        return 'Instrumental'
+    raise ValueError(f'Unsupported uploaded family: {family}')
+
+
+def _track_uploaded_final_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text='Skip',
+                    callback_data=TrackUploadedFinalCallbackData(
+                        action=TrackUploadedAction.SELECT,
+                        value=_TRACK_STORE_FINAL_SKIP,
+                    ).pack(),
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text='Fetch',
+                    callback_data=TrackUploadedFinalCallbackData(
+                        action=TrackUploadedAction.SELECT,
+                        value=_TRACK_STORE_FINAL_FETCH,
+                    ).pack(),
+                )
+            ],
+            [
+                back_button(
+                    callback_data=TrackUploadedFinalCallbackData(
+                        action=TrackUploadedAction.BACK,
+                        value=_TRACK_BACK_VALUE,
+                    ).pack(),
+                )
+            ],
+        ]
+    )
+
+
+def _selected_uploaded_path(
+    *,
+    group: TrackGroup,
+    sub_season: SubSeason,
+    family: TrackUploadedFamily | None,
+    terminal_label: str | None = None,
+) -> list[str]:
+    selected = ['Uploaded']
+    if family is not None:
+        selected.append(_uploaded_family_label(family))
+    elif terminal_label is not None:
+        selected.append(terminal_label)
+    selected.extend(
+        [
+            _format_universe(group.universe),
+            str(group.year),
+            str(int(group.season)),
+        ]
+    )
+    if sub_season.exists:
+        selected.append(sub_season.value)
+    return selected
+
+
+def _uploaded_final_context(
+    data: dict[str, object],
+) -> tuple[TrackGroup, str, SubSeason, TrackUploadedFamily] | None:
+    group = data.get('uploaded_group')
+    track_id = data.get('uploaded_track_id')
+    sub_season = data.get('uploaded_sub_season')
+    family_value = data.get('uploaded_family')
+    if not isinstance(group, TrackGroup):
+        return None
+    if not isinstance(track_id, str) or not track_id:
+        return None
+    if not isinstance(sub_season, SubSeason):
+        return None
+    if not isinstance(family_value, str):
+        return None
+    try:
+        family = TrackUploadedFamily(family_value)
+    except ValueError:
+        return None
+    return group, track_id, sub_season, family
+
+
 def _resolve_track_link_metadata(
     *,
     parsed_link_input: LinkOnlyTrackInput,
@@ -2480,6 +3085,17 @@ def _resolve_track_sub_season(
     for sub_season, tracks in tracks_by_sub_season.items():
         if any(track.id == track_id for track in tracks):
             return sub_season
+    return None
+
+
+def _resolve_track_info(
+    tracks_by_sub_season: dict[SubSeason, list[TrackInfo]],
+    track_id: str,
+) -> TrackInfo | None:
+    for tracks in tracks_by_sub_season.values():
+        for track in tracks:
+            if track.id == track_id:
+                return track
     return None
 
 

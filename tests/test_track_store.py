@@ -1743,6 +1743,7 @@ async def test_list_tracks_groups_by_sub_season_with_none_first() -> None:
                 artists=('artist',),
                 title='title',
                 has_instrumental=True,
+                variant_mode='generated',
             )
         ],
         SubSeason.B: [
@@ -1752,6 +1753,7 @@ async def test_list_tracks_groups_by_sub_season_with_none_first() -> None:
                 artists=('artist',),
                 title='title',
                 has_instrumental=False,
+                variant_mode='generated',
             ),
             TrackInfo(
                 id=_UUID_3,
@@ -1759,6 +1761,7 @@ async def test_list_tracks_groups_by_sub_season_with_none_first() -> None:
                 artists=('artist',),
                 title='title',
                 has_instrumental=False,
+                variant_mode='generated',
             ),
         ],
     }
@@ -1846,6 +1849,7 @@ async def test_list_tracks_groups_by_sub_season_and_sorts_by_manifest_order() ->
                 artists=('artist a', 'artist b'),
                 title='second in manifest, first in order',
                 has_instrumental=True,
+                variant_mode='generated',
             ),
             TrackInfo(
                 id=_UUID_1,
@@ -1853,6 +1857,7 @@ async def test_list_tracks_groups_by_sub_season_and_sorts_by_manifest_order() ->
                 artists=('artist c',),
                 title='third in manifest, second in order',
                 has_instrumental=False,
+                variant_mode='generated',
             ),
         ],
         SubSeason.B: [
@@ -1862,6 +1867,7 @@ async def test_list_tracks_groups_by_sub_season_and_sorts_by_manifest_order() ->
                 artists=('artist other',),
                 title='other sub-season',
                 has_instrumental=True,
+                variant_mode='generated',
             )
         ],
     }
@@ -1896,10 +1902,24 @@ async def test_list_tracks_returns_track_info_with_only_public_discovery_fields(
 
     assert result == {
         SubSeason.NONE: [
-            TrackInfo(id=_UUID_1, album_id=_UUID_1, artists=('artist',), title='title', has_instrumental=True)
+            TrackInfo(
+                id=_UUID_1,
+                album_id=_UUID_1,
+                artists=('artist',),
+                title='title',
+                has_instrumental=True,
+                variant_mode='generated',
+            )
         ]
     }
-    assert tuple(result[SubSeason.NONE][0].__slots__) == ('id', 'album_id', 'artists', 'title', 'has_instrumental')
+    assert tuple(result[SubSeason.NONE][0].__slots__) == (
+        'id',
+        'album_id',
+        'artists',
+        'title',
+        'has_instrumental',
+        'variant_mode',
+    )
 
 
 @pytest.mark.asyncio
@@ -1935,6 +1955,7 @@ async def test_list_tracks_omits_missing_sub_season_for_existing_group() -> None
                 artists=('artist',),
                 title='title',
                 has_instrumental=False,
+                variant_mode='generated',
             )
         ]
     }
@@ -1985,6 +2006,7 @@ async def test_list_tracks_exposes_shared_persisted_album_id_across_distinct_tra
                 artists=('artist a',),
                 title='track A',
                 has_instrumental=False,
+                variant_mode='generated',
             ),
             TrackInfo(
                 id=_UUID_2,
@@ -1992,6 +2014,7 @@ async def test_list_tracks_exposes_shared_persisted_album_id_across_distinct_tra
                 artists=('artist b',),
                 title='track B',
                 has_instrumental=False,
+                variant_mode='generated',
             ),
         ]
     }
@@ -2020,6 +2043,7 @@ async def test_store_creates_new_group_and_manifest_entry(monkeypatch: pytest.Mo
         artists=('artist one', 'artist two'),
         title='Track Title',
         has_instrumental=False,
+        variant_mode='generated',
     )
     assert s3_client.objects[track_key] == b'track'
     assert s3_client.objects[cover_key] == b'cover'
@@ -4591,6 +4615,20 @@ async def test_upload_variants_sorts_normal_family_before_storage_and_manifest_w
     }
     assert rewritten_manifest['data'][0]['has_variants'] is True
     assert rewritten_manifest['data'][0]['has_instrumental_variants'] is False
+
+    listed_tracks = await store.list_tracks(group)
+    assert listed_tracks == {
+        SubSeason.A: [
+            TrackInfo(
+                id=_UUID_1,
+                album_id=_UUID_1,
+                artists=('artist',),
+                title='title',
+                has_instrumental=False,
+                variant_mode='uploaded',
+            )
+        ]
+    }
 
 
 @pytest.mark.asyncio
