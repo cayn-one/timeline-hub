@@ -890,6 +890,7 @@ class ClipStore:
         sub_group: ClipSubGroup,
         *,
         batch_size: int,
+        require_exists: bool = True,
     ) -> None:
         """Compact one clip sub-group by rewriting manifest batch metadata only.
 
@@ -901,7 +902,8 @@ class ClipStore:
 
         Raises:
             ValueError: If `batch_size` is less than `1`.
-            ClipGroupNotFoundError: If the requested clip group or sub-group has no clips.
+            ClipGroupNotFoundError: If `require_exists` is `True` and the requested
+                clip group or sub-group has no clips.
             ManifestCorruptedError: If the clip-group manifest exists but is malformed.
         """
         if batch_size < 1:
@@ -915,6 +917,8 @@ class ClipStore:
         try:
             manifest = await self._load_manifest_for_read(clip_group_prefix)
         except S3ObjectNotFoundError as error:
+            if not require_exists:
+                return
             raise ClipGroupNotFoundError(
                 universe=group.universe,
                 year=group.year,
@@ -925,6 +929,8 @@ class ClipStore:
 
         target_entries = self._sorted_sub_group_entries(manifest, sub_group)
         if not target_entries:
+            if not require_exists:
+                return
             raise ClipGroupNotFoundError(
                 universe=group.universe,
                 year=group.year,
@@ -1265,7 +1271,7 @@ class ClipStore:
         group: ClipGroup,
         *,
         clip_ids: Sequence[ClipId],
-    ) -> None:
+    ) -> tuple[ClipSubGroup, ...]:
         """Remove many clips plus their authoritative stored objects."""
         if not clip_ids:
             raise ValueError('remove() requires at least one clip id')
@@ -1364,6 +1370,16 @@ class ClipStore:
                     ),
                     failure_detail=repr(error),
                 ) from error
+
+        return tuple(
+            sorted(
+                affected_sub_groups,
+                key=lambda sub_group: (
+                    sub_group.sub_season.order(),
+                    sub_group.scope.value,
+                ),
+            )
+        )
 
     @staticmethod
     def clip_identity_to_string(

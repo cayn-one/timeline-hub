@@ -2633,11 +2633,15 @@ async def test_remove_deletes_authoritative_objects_and_compacts_affected_sub_gr
     )
     store = ClipStore(s3_client)
 
-    await store.remove(
+    affected_sub_groups = await store.remove(
         ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1),
         clip_ids=[_UUID_1, _UUID_3],
     )
 
+    assert set(affected_sub_groups) == {
+        ClipSubGroup(sub_season=SubSeason.A, scope=Scope.COLLECTION),
+        ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.EXTRA),
+    }
     assert clip_key_1 not in s3_client.objects
     assert normalized_key_1 not in s3_client.objects
     assert clip_key_3 not in s3_client.objects
@@ -2853,6 +2857,13 @@ async def test_remove_deletes_manifest_instead_of_writing_empty_manifest_for_las
     await store.remove(
         clip_group,
         clip_ids=[_UUID_1],
+    )
+
+    await store.compact(
+        clip_group,
+        ClipSubGroup(sub_season=SubSeason.A, scope=Scope.COLLECTION),
+        batch_size=2,
+        require_exists=False,
     )
 
     assert clip_key_1 not in s3_client.objects
@@ -3393,6 +3404,7 @@ async def test_compact_fails_with_empty_sub_group_fields_when_group_is_missing()
             ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1),
             ClipSubGroup(sub_season=SubSeason.A, scope=Scope.COLLECTION),
             batch_size=2,
+            require_exists=True,
         )
 
     assert excinfo.value.year == 2024
@@ -3429,6 +3441,7 @@ async def test_compact_fails_with_requested_sub_group_fields_when_sub_group_is_m
             ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1),
             ClipSubGroup(sub_season=SubSeason.A, scope=Scope.COLLECTION),
             batch_size=2,
+            require_exists=True,
         )
 
     assert excinfo.value.year == 2024
@@ -3436,6 +3449,37 @@ async def test_compact_fails_with_requested_sub_group_fields_when_sub_group_is_m
     assert excinfo.value.universe is Universe.WEST
     assert excinfo.value.sub_season is SubSeason.A
     assert excinfo.value.scope is Scope.COLLECTION
+
+
+@pytest.mark.asyncio
+async def test_compact_ignores_missing_sub_group_when_require_exists_is_false() -> None:
+    manifest_key = _manifest_key(year=2024, season=Season.S1, universe=Universe.WEST)
+    s3_client = _FakeS3Client(
+        {
+            manifest_key: _manifest_bytes(
+                [
+                    ManifestEntry(
+                        id=_UUID_1,
+                        video_hash=_HASH_A,
+                        sub_season=SubSeason.B,
+                        scope=Scope.EXTRA,
+                        batch=1,
+                        order=1,
+                    )
+                ]
+            )
+        }
+    )
+    store = ClipStore(s3_client)
+
+    await store.compact(
+        ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1),
+        ClipSubGroup(sub_season=SubSeason.A, scope=Scope.COLLECTION),
+        batch_size=2,
+        require_exists=False,
+    )
+
+    assert s3_client.put_calls == []
 
 
 @pytest.mark.asyncio

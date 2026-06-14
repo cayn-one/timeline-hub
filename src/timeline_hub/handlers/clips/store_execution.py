@@ -44,7 +44,7 @@ async def execute_store_or_produce(
 
     await message.answer(**store_summary_kwargs(result))
 
-    if result.stored_count > 0 and _should_compact_after_store(clip_sub_group.scope):
+    if result.stored_count > 0 and _uses_dense_layout(clip_sub_group.scope):
         try:
             await services.clip_store.compact(
                 clip_group,
@@ -121,15 +121,17 @@ async def _message_group_to_clip_files(
     return clips
 
 
-def _should_compact_after_store(scope: Scope) -> bool:
-    """Return the handler-level post-store compaction policy for intake flows.
+_DENSE_LAYOUT_SCOPES = frozenset({Scope.EXTRA, Scope.SOURCE})
 
-    Intake decides whether to compact after storing. `Scope.COLLECTION` keeps
-    its original stored grouping, while `Scope.EXTRA` and `Scope.SOURCE`
-    compact after store. `Produce` must follow the same post-store compaction
-    policy as `Store`.
+
+def _uses_dense_layout(scope: Scope) -> bool:
+    """Return whether the handler should compact a stored clip subgroup.
+
+    `Scope.COLLECTION` keeps its original stored grouping, while
+    `Scope.EXTRA` and `Scope.SOURCE` compact after store-like mutations.
+    `Produce` must follow the same post-store compaction policy as `Store`.
 
     `ClipStore.fetch()` only reflects the current manifest layout; it does not
     decide whether compaction should happen.
     """
-    return scope in {Scope.EXTRA, Scope.SOURCE}
+    return scope in _DENSE_LAYOUT_SCOPES

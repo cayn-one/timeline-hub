@@ -7,6 +7,16 @@ _MIXED_GROUPS = 'mixed_groups'
 _INVALID_IDENTITY = 'invalid_identity'
 
 
+def parse_clip_identity_filename(filename: str) -> tuple[ClipGroup, ClipId]:
+    """Parse one clip filename into its logical group and clip id.
+
+    The filename stem must already be the canonical logical clip identity
+    string produced by `ClipStore.clip_identity_to_string()`.
+    """
+    identity_str = filename.rsplit('.', 1)[0] if '.' in filename else filename
+    return ClipStore.string_to_clip_identity(identity_str)
+
+
 def prepare_reconcile_clip_id_batches(
     message_groups: Sequence[MessageGroup],
 ) -> tuple[ClipGroup, list[list[ClipId]]]:
@@ -42,8 +52,7 @@ def _parse_reconcile_filename_batches(
     for batch in filename_batches:
         clip_id_batch: list[ClipId] = []
         for filename in batch:
-            identity_str = filename.rsplit('.', 1)[0] if '.' in filename else filename
-            parsed_group, clip_id = ClipStore.string_to_clip_identity(identity_str)
+            parsed_group, clip_id = parse_clip_identity_filename(filename)
             if clip_group is None:
                 clip_group = parsed_group
             elif parsed_group != clip_group:

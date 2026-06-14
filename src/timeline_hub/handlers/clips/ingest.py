@@ -9,7 +9,7 @@ from aiogram import Bot, F, Router
 from aiogram.enums import ChatType
 from aiogram.filters.callback_data import CallbackData
 from aiogram.fsm.context import FSMContext
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaVideo, Message
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InputMediaVideo, Message
 from aiogram.utils.formatting import Bold, Text
 from loguru import logger
 
@@ -44,7 +44,11 @@ from timeline_hub.handlers.clips.flow import (
     validate_menu_flow_state,
     year_option_universe,
 )
-from timeline_hub.handlers.clips.reconcile_input import clip_id_batch_count, prepare_reconcile_clip_id_batches
+from timeline_hub.handlers.clips.reconcile_input import (
+    clip_id_batch_count,
+    parse_clip_identity_filename,
+    prepare_reconcile_clip_id_batches,
+)
 from timeline_hub.handlers.clips.reorder_flow import (
     REORDER_FLOW_MODE,
     REORDER_RESET_CALLBACK_VALUE,
@@ -61,22 +65,23 @@ from timeline_hub.handlers.clips.reorder_flow import (
     show_reorder_selection_menu,
 )
 from timeline_hub.handlers.clips.route_planning import RouteBatch, plan_route_batches
-from timeline_hub.handlers.clips.store_execution import execute_store_or_produce
+from timeline_hub.handlers.clips.store_execution import _uses_dense_layout, execute_store_or_produce
 from timeline_hub.handlers.menu import (
     callback_message,
     create_padding_line,
-    ensure_three_rows,
     handle_stale_selection,
     selected_text,
+    selection_keyboard,
     selection_text,
-    three_row_keyboard,
     validate_flow_state,
 )
 from timeline_hub.services.clip_store import (
     ClipGroup,
+    ClipGroupNotFoundError,
     ClipId,
     ClipSubGroup,
     DuplicateClipIdsError,
+    InvalidClipIdentityError,
     ReconcileResult,
     Scope,
     Season,
@@ -103,14 +108,16 @@ class IntakeAction(StrEnum):
     CANCEL = auto()
     REORDER = auto()
     COMPACT = auto()
-    RECONCILE = auto()
     ROUTE = auto()
     STORE = auto()
     PRODUCE = auto()
+    REMOVE = auto()
+    RECONCILE = auto()
 
 
 class IntakeActionCallbackData(CallbackData, prefix='clip_action'):
     action: IntakeAction
+    buffer_version: int
 
 
 class IntakeCallbackData(CallbackData, prefix='clip_intake'):
@@ -169,6 +176,15 @@ async def on_intake_action(
     message = callback_message(callback)
     if message is None:
         await state.clear()
+        return
+
+    callback_buffer_version = getattr(
+        callback_data,
+        'buffer_version',
+        services.chat_message_buffer.version(message.chat.id),
+    )
+    if callback_buffer_version != services.chat_message_buffer.version(message.chat.id):
+        await handle_stale_selection(message=message, state=state)
         return
 
     match callback_data.action:
@@ -314,6 +330,83 @@ async def on_intake_action(
                 settings=settings,
                 flow=_PRODUCE_FLOW,
             )
+
+        case IntakeAction.REMOVE:
+            chat_id = message.chat.id
+            buffered_video_messages = _buffered_video_messages(services.chat_message_buffer.peek_grouped(chat_id))
+            if not buffered_video_messages:
+                await handle_stale_selection(message=message, state=state)
+                return
+
+            clip_group: ClipGroup | None = None
+            clip_ids: list[ClipId] = []
+            clip_id_set: set[ClipId] = set()
+            try:
+                for buffered_message in buffered_video_messages:
+                    if buffered_message.video is None or not buffered_message.video.file_name:
+                        raise InvalidClipIdentityError('clip filename is required')
+                    parsed_group, clip_id = parse_clip_identity_filename(buffered_message.video.file_name)
+                    if clip_group is None:
+                        clip_group = parsed_group
+                    elif parsed_group != clip_group:
+                        raise ValueError(_MIXED_GROUPS)
+                    if clip_id in clip_id_set:
+                        raise DuplicateClipIdsError(clip_ids=[*clip_ids, clip_id])
+                    clip_ids.append(clip_id)
+                    clip_id_set.add(clip_id)
+            except DuplicateClipIdsError, InvalidClipIdentityError, ValueError:
+                await _invalidate_intake_buffer(
+                    message=message,
+                    state=state,
+                    services=services,
+                    text='Invalid input',
+                )
+                return
+
+            if clip_group is None:
+                await handle_stale_selection(message=message, state=state)
+                return
+
+            services.chat_message_buffer.flush(chat_id)
+            await state.clear()
+            await message.edit_text(
+                **selected_text(selected='Remove'),
+                reply_markup=None,
+            )
+
+            try:
+                affected_sub_groups = await services.clip_store.remove(
+                    clip_group,
+                    clip_ids=clip_ids,
+                )
+            except ClipGroupNotFoundError, UnknownClipsError:
+                await _invalidate_intake_buffer(
+                    message=message,
+                    state=state,
+                    services=services,
+                    text='Invalid input',
+                )
+                return
+
+            for sub_group in affected_sub_groups:
+                if not _uses_dense_layout(sub_group.scope):
+                    continue
+                try:
+                    await services.clip_store.compact(
+                        clip_group,
+                        sub_group,
+                        batch_size=_TELEGRAM_MEDIA_GROUP_LIMIT,
+                        require_exists=False,
+                    )
+                except Exception:
+                    logger.exception(
+                        'post-remove clip compaction failed for {} {}',
+                        clip_group,
+                        sub_group,
+                    )
+                    raise
+
+            await message.answer('Done')
 
         case IntakeAction.ROUTE:
             await state.clear()
@@ -1184,6 +1277,7 @@ def _intake_action_menu_kwargs(
         )
     if clip_count == 0:
         return None
+    buffer_version = services.chat_message_buffer.version(chat_id)
     return {
         **Text(
             create_padding_line(message_width),
@@ -1191,16 +1285,24 @@ def _intake_action_menu_kwargs(
             Text('Messages: ', Bold(str(message_count))),
             '. Select action:',
         ).as_kwargs(),
-        'reply_markup': _column_right_to_left_two_row_keyboard(
+        # Root clip actions are versioned because these are destructive,
+        # state-coupled callbacks that must not survive buffer changes.
+        'reply_markup': selection_keyboard(
+            # `Store` stays available through existing callbacks/flow handling,
+            # but the root Clips menu hides it for now because Route is the
+            # primary storage path and the 7-button layout is too wide.
             buttons=[
-                _create_intake_action_button(IntakeAction.REORDER),
-                _create_intake_action_button(IntakeAction.COMPACT),
-                _create_intake_action_button(IntakeAction.STORE),
-                _create_intake_action_button(IntakeAction.PRODUCE),
-                _create_intake_action_button(IntakeAction.ROUTE),
-                _create_intake_action_button(IntakeAction.RECONCILE),
+                _create_intake_action_button(IntakeAction.REORDER, buffer_version=buffer_version),
+                _create_intake_action_button(IntakeAction.COMPACT, buffer_version=buffer_version),
+                _create_intake_action_button(IntakeAction.ROUTE, buffer_version=buffer_version),
+                _create_intake_action_button(IntakeAction.REMOVE, buffer_version=buffer_version),
+                _create_intake_action_button(IntakeAction.PRODUCE, buffer_version=buffer_version),
+                _create_intake_action_button(IntakeAction.RECONCILE, buffer_version=buffer_version),
             ],
-            back_button=_create_intake_action_button(IntakeAction.CANCEL),
+            back_button=_create_intake_action_button(
+                IntakeAction.CANCEL,
+                buffer_version=buffer_version,
+            ),
         ),
     }
 
@@ -1263,36 +1365,10 @@ def _route_progress_line(values: Sequence[str]) -> Text:
     return Text(*parts)
 
 
-def _create_intake_action_button(action: IntakeAction) -> InlineKeyboardButton:
+def _create_intake_action_button(action: IntakeAction, *, buffer_version: int) -> InlineKeyboardButton:
     return InlineKeyboardButton(
         text=action.title(),
-        callback_data=IntakeActionCallbackData(action=action).pack(),
-    )
-
-
-def _column_right_to_left_two_row_keyboard(
-    *,
-    buttons: Sequence[InlineKeyboardButton],
-    back_button: InlineKeyboardButton,
-) -> InlineKeyboardMarkup:
-    """Render intake options in right-to-left column order.
-
-    Buttons are grouped in input-order pairs as top/bottom columns, then
-    columns are rendered from right to left.
-    """
-    columns = [list(buttons[index : index + 2]) for index in range(0, len(buttons), 2)]
-    ordered_columns = list(reversed(columns))
-    top_row = [column[0] for column in ordered_columns]
-    middle_row = [column[1] for column in ordered_columns if len(column) > 1]
-    top_row, middle_row, bottom_row = ensure_three_rows(
-        top_row=top_row,
-        middle_row=middle_row,
-        bottom_row=[back_button],
-    )
-    return three_row_keyboard(
-        top_row=top_row,
-        middle_row=middle_row,
-        bottom_row=bottom_row,
+        callback_data=IntakeActionCallbackData(action=action, buffer_version=buffer_version).pack(),
     )
 
 

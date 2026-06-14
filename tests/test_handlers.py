@@ -35,8 +35,8 @@ from timeline_hub.handlers.clips.common import (
 from timeline_hub.handlers.clips.delivery import send_fetched_clip_batch
 from timeline_hub.handlers.clips.ingest import (
     IntakeAction,
+    IntakeActionCallbackData,
     IntakeCallbackData,
-    _column_right_to_left_two_row_keyboard,
     _reconcile_summary_kwargs,
     _show_store_scope_menu,
     _show_store_season_menu,
@@ -48,6 +48,7 @@ from timeline_hub.handlers.clips.ingest import (
     on_reorder_menu,
     try_dispatch_clip_intake,
 )
+from timeline_hub.handlers.clips.reconcile_input import parse_clip_identity_filename
 from timeline_hub.handlers.clips.reorder_flow import ReorderCallbackData, ReorderClipFlow
 from timeline_hub.handlers.clips.retrieve import (
     RetrieveCallbackData,
@@ -72,6 +73,7 @@ from timeline_hub.handlers.menu import (
     DUMMY_BUTTON_TEXT,
     create_padding_line,
     selected_text,
+    selection_keyboard,
 )
 from timeline_hub.handlers.router import on_dummy_button, on_start_send_menu
 from timeline_hub.handlers.tracks.ingest import (
@@ -112,6 +114,7 @@ from timeline_hub.services.clip_store import (
     AudioNormalization,
     ClipGroup,
     ClipInfo,
+    ClipRemoveManifestSyncError,
     ClipStore,
     ClipSubGroup,
     FetchedClip,
@@ -1827,13 +1830,490 @@ async def test_video_and_text_dispatch_to_clip_action_menu() -> None:
         expected,
     )
     reply_markup = message.answer.await_args.kwargs['reply_markup']
-    _assert_three_rows(reply_markup)
-    assert _keyboard_rows(reply_markup) == [
-        ['Route', 'Store', 'Reorder'],
-        ['Reconcile', 'Produce', 'Compact'],
-        ['Cancel'],
-    ]
+    expected_reply_markup = selection_keyboard(
+        buttons=[
+            InlineKeyboardButton(
+                text=action.title(),
+                callback_data=IntakeActionCallbackData(
+                    action=action,
+                    buffer_version=services.chat_message_buffer.version(42),
+                ).pack(),
+            )
+            for action in [
+                IntakeAction.REORDER,
+                IntakeAction.COMPACT,
+                IntakeAction.ROUTE,
+                IntakeAction.REMOVE,
+                IntakeAction.PRODUCE,
+                IntakeAction.RECONCILE,
+            ]
+        ],
+        back_button=InlineKeyboardButton(
+            text=IntakeAction.CANCEL.title(),
+            callback_data=IntakeActionCallbackData(
+                action=IntakeAction.CANCEL,
+                buffer_version=services.chat_message_buffer.version(42),
+            ).pack(),
+        ),
+    )
+    assert reply_markup == expected_reply_markup
     assert [buffered_message.message_id for buffered_message in services.chat_message_buffer.peek_raw(42)] == [1, 2]
+
+
+def test_parse_clip_identity_filename_decodes_filename_stem() -> None:
+    group = ClipGroup(universe=Universe.WEST, year=2025, season=Season.S4)
+    filename = f'{ClipStore.clip_identity_to_string(group, _CLIP_ID_1)}.mp4'
+
+    assert parse_clip_identity_filename(filename) == (group, _CLIP_ID_1)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('scope', [Scope.EXTRA, Scope.SOURCE])
+async def test_remove_action_compacts_dense_sub_groups_after_success(scope: Scope) -> None:
+    clip_group = ClipGroup(universe=Universe.WEST, year=2025, season=Season.S4)
+    clip_sub_group = ClipSubGroup(sub_season=SubSeason.NONE, scope=scope)
+    buffer = ChatMessageBuffer()
+    buffer.append(
+        _fake_message(
+            chat_id=42,
+            message_id=1,
+            video=_fake_video(
+                file_id='video-1',
+                file_name=_stored_filename(clip_group, clip_sub_group, _CLIP_ID_1),
+            ),
+            media_group_id='group-1',
+        ),
+        chat_id=42,
+    )
+    buffer.append(
+        _fake_message(chat_id=42, message_id=2, text='ignore me'),
+        chat_id=42,
+    )
+    buffer.append(
+        _fake_message(
+            chat_id=42,
+            message_id=3,
+            video=_fake_video(
+                file_id='video-2',
+                file_name=_stored_filename(clip_group, clip_sub_group, _CLIP_ID_2),
+            ),
+            media_group_id='group-2',
+        ),
+        chat_id=42,
+    )
+    buffer.append(
+        _fake_message(
+            chat_id=42,
+            message_id=4,
+            video=_fake_video(
+                file_id='video-3',
+                file_name=_stored_filename(clip_group, clip_sub_group, _CLIP_ID_3),
+            ),
+            media_group_id='group-2',
+        ),
+        chat_id=42,
+    )
+    clip_store = SimpleNamespace(
+        remove=AsyncMock(return_value=(clip_sub_group,)),
+        compact=AsyncMock(),
+    )
+    services = _services(clip_store=clip_store, buffer=buffer)
+    message = _fake_message(text='Select action:', chat_id=42, message_id=40)
+    state = _FakeState()
+
+    await on_intake_action(
+        _fake_callback(message),
+        SimpleNamespace(action=IntakeAction.REMOVE),
+        AsyncMock(),
+        services,
+        _settings(),
+        state,
+    )
+
+    clip_store.remove.assert_awaited_once_with(
+        clip_group,
+        clip_ids=[_CLIP_ID_1, _CLIP_ID_2, _CLIP_ID_3],
+    )
+    clip_store.compact.assert_awaited_once_with(
+        clip_group,
+        clip_sub_group,
+        batch_size=intake_module._TELEGRAM_MEDIA_GROUP_LIMIT,
+        require_exists=False,
+    )
+    expected_remove_kwargs = {**selected_text(selected='Remove'), 'reply_markup': None}
+    _assert_format_kwargs(message.edit_text.await_args.kwargs, expected_remove_kwargs)
+    message.answer.assert_awaited_once_with('Done')
+    assert services.chat_message_buffer.peek_raw(42) == []
+    assert state.current_state is None
+    assert state.clear_count == 1
+
+
+@pytest.mark.asyncio
+async def test_remove_action_does_not_compact_collection_sub_groups() -> None:
+    clip_group = ClipGroup(universe=Universe.WEST, year=2025, season=Season.S4)
+    clip_sub_group = ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.COLLECTION)
+    buffer = ChatMessageBuffer()
+    buffer.append(
+        _fake_message(
+            chat_id=42,
+            message_id=1,
+            video=_fake_video(
+                file_id='video-1',
+                file_name=_stored_filename(clip_group, clip_sub_group, _CLIP_ID_1),
+            ),
+        ),
+        chat_id=42,
+    )
+    clip_store = SimpleNamespace(
+        remove=AsyncMock(return_value=(clip_sub_group,)),
+        compact=AsyncMock(),
+    )
+    services = _services(clip_store=clip_store, buffer=buffer)
+    message = _fake_message(text='Select action:', chat_id=42, message_id=41)
+    state = _FakeState()
+
+    await on_intake_action(
+        _fake_callback(message),
+        SimpleNamespace(action=IntakeAction.REMOVE),
+        AsyncMock(),
+        services,
+        _settings(),
+        state,
+    )
+
+    clip_store.remove.assert_awaited_once_with(
+        clip_group,
+        clip_ids=[_CLIP_ID_1],
+    )
+    clip_store.compact.assert_not_awaited()
+    message.answer.assert_awaited_once_with('Done')
+    assert services.chat_message_buffer.peek_raw(42) == []
+    assert state.current_state is None
+    assert state.clear_count == 1
+
+
+@pytest.mark.asyncio
+async def test_remove_action_compacts_only_affected_dense_sub_groups() -> None:
+    clip_group = ClipGroup(universe=Universe.WEST, year=2025, season=Season.S4)
+    collection_sub_group = ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.COLLECTION)
+    extra_sub_group = ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.EXTRA)
+    source_sub_group = ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.SOURCE)
+    buffer = ChatMessageBuffer()
+    buffer.append(
+        _fake_message(
+            chat_id=42,
+            message_id=1,
+            video=_fake_video(
+                file_id='video-1',
+                file_name=_stored_filename(clip_group, collection_sub_group, _CLIP_ID_1),
+            ),
+        ),
+        chat_id=42,
+    )
+    clip_store = SimpleNamespace(
+        remove=AsyncMock(return_value=(collection_sub_group, extra_sub_group, source_sub_group)),
+        compact=AsyncMock(),
+    )
+    services = _services(clip_store=clip_store, buffer=buffer)
+    message = _fake_message(text='Select action:', chat_id=42, message_id=42)
+    state = _FakeState()
+
+    await on_intake_action(
+        _fake_callback(message),
+        SimpleNamespace(action=IntakeAction.REMOVE),
+        AsyncMock(),
+        services,
+        _settings(),
+        state,
+    )
+
+    assert clip_store.compact.await_args_list == [
+        call(
+            clip_group,
+            extra_sub_group,
+            batch_size=intake_module._TELEGRAM_MEDIA_GROUP_LIMIT,
+            require_exists=False,
+        ),
+        call(
+            clip_group,
+            source_sub_group,
+            batch_size=intake_module._TELEGRAM_MEDIA_GROUP_LIMIT,
+            require_exists=False,
+        ),
+    ]
+    message.answer.assert_awaited_once_with('Done')
+
+
+@pytest.mark.asyncio
+async def test_remove_action_does_not_compact_when_remove_fails() -> None:
+    clip_group = ClipGroup(universe=Universe.WEST, year=2025, season=Season.S4)
+    clip_sub_group = ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.EXTRA)
+    buffer = ChatMessageBuffer()
+    buffer.append(
+        _fake_message(
+            chat_id=42,
+            message_id=1,
+            video=_fake_video(
+                file_id='video-1',
+                file_name=_stored_filename(clip_group, clip_sub_group, _CLIP_ID_1),
+            ),
+        ),
+        chat_id=42,
+    )
+    clip_store = SimpleNamespace(
+        remove=AsyncMock(
+            side_effect=ClipRemoveManifestSyncError(
+                operation='remove',
+                stage='manifest_write',
+                clip_ids=[_CLIP_ID_1],
+                touched_keys=[],
+                manifest_key='clips/west/2025/4/manifest.json',
+                manifest_committed=False,
+                logical_state='Logical state remains unchanged because cleanup did not start.',
+            )
+        ),
+        compact=AsyncMock(),
+    )
+    services = _services(clip_store=clip_store, buffer=buffer)
+    message = _fake_message(text='Select action:', chat_id=42, message_id=43)
+    state = _FakeState()
+
+    with pytest.raises(ClipRemoveManifestSyncError):
+        await on_intake_action(
+            _fake_callback(message),
+            SimpleNamespace(action=IntakeAction.REMOVE),
+            AsyncMock(),
+            services,
+            _settings(),
+            state,
+        )
+
+    clip_store.compact.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_remove_action_propagates_compact_failure_after_successful_remove() -> None:
+    clip_group = ClipGroup(universe=Universe.WEST, year=2025, season=Season.S4)
+    clip_sub_group = ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.EXTRA)
+    buffer = ChatMessageBuffer()
+    buffer.append(
+        _fake_message(
+            chat_id=42,
+            message_id=1,
+            video=_fake_video(
+                file_id='video-1',
+                file_name=_stored_filename(clip_group, clip_sub_group, _CLIP_ID_1),
+            ),
+        ),
+        chat_id=42,
+    )
+    clip_store = SimpleNamespace(
+        remove=AsyncMock(return_value=(clip_sub_group,)),
+        compact=AsyncMock(side_effect=RuntimeError('boom')),
+    )
+    services = _services(clip_store=clip_store, buffer=buffer)
+    message = _fake_message(text='Select action:', chat_id=42, message_id=44)
+    state = _FakeState()
+
+    with pytest.raises(RuntimeError, match='boom'):
+        await on_intake_action(
+            _fake_callback(message),
+            SimpleNamespace(action=IntakeAction.REMOVE),
+            AsyncMock(),
+            services,
+            _settings(),
+            state,
+        )
+
+    clip_store.remove.assert_awaited_once_with(
+        clip_group,
+        clip_ids=[_CLIP_ID_1],
+    )
+    clip_store.compact.assert_awaited_once_with(
+        clip_group,
+        clip_sub_group,
+        batch_size=intake_module._TELEGRAM_MEDIA_GROUP_LIMIT,
+        require_exists=False,
+    )
+    message.answer.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_remove_action_stale_root_callback_does_not_mutate_buffer() -> None:
+    clip_group = ClipGroup(universe=Universe.WEST, year=2025, season=Season.S4)
+    clip_sub_group = ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.COLLECTION)
+    buffer = ChatMessageBuffer()
+    buffer.append(
+        _fake_message(
+            chat_id=42,
+            message_id=1,
+            video=_fake_video(
+                file_id='video-1',
+                file_name=_stored_filename(clip_group, clip_sub_group, _CLIP_ID_1),
+            ),
+        ),
+        chat_id=42,
+    )
+    stale_version = buffer.version(42)
+    buffer.flush = Mock(wraps=buffer.flush)
+    clip_store = SimpleNamespace(remove=AsyncMock(), compact=AsyncMock())
+    services = _services(clip_store=clip_store, buffer=buffer)
+    message = _fake_message(text='Select action:', chat_id=42, message_id=41)
+    state = _FakeState()
+
+    buffer.append(
+        _fake_message(
+            chat_id=42,
+            message_id=2,
+            video=_fake_video(
+                file_id='video-2',
+                file_name=_stored_filename(clip_group, clip_sub_group, _CLIP_ID_2),
+            ),
+        ),
+        chat_id=42,
+    )
+
+    await on_intake_action(
+        _fake_callback(message),
+        SimpleNamespace(action=IntakeAction.REMOVE, buffer_version=stale_version),
+        AsyncMock(),
+        services,
+        _settings(),
+        state,
+    )
+
+    clip_store.remove.assert_not_awaited()
+    buffer.flush.assert_not_called()
+    message.edit_text.assert_awaited_once_with('Selection is no longer available', reply_markup=None)
+    assert [buffered_message.message_id for buffered_message in services.chat_message_buffer.peek_raw(42)] == [1, 2]
+    assert state.current_state is None
+    assert state.clear_count == 1
+
+
+@pytest.mark.asyncio
+async def test_remove_action_rejects_invalid_clip_identity_filename() -> None:
+    buffer = ChatMessageBuffer()
+    buffer.append(
+        _fake_message(
+            chat_id=42,
+            message_id=1,
+            video=_fake_video(file_id='video-1', file_name='not-a-valid-identity.mp4'),
+        ),
+        chat_id=42,
+    )
+    clip_store = SimpleNamespace(remove=AsyncMock(), compact=AsyncMock())
+    services = _services(clip_store=clip_store, buffer=buffer)
+    message = _fake_message(text='Select action:', chat_id=42, message_id=41)
+    state = _FakeState()
+
+    await on_intake_action(
+        _fake_callback(message),
+        SimpleNamespace(action=IntakeAction.REMOVE),
+        AsyncMock(),
+        services,
+        _settings(),
+        state,
+    )
+
+    clip_store.remove.assert_not_awaited()
+    clip_store.compact.assert_not_awaited()
+    message.edit_text.assert_awaited_once_with('Invalid input', reply_markup=None)
+    assert services.chat_message_buffer.peek_raw(42) == []
+    assert state.current_state is None
+    assert state.clear_count == 1
+
+
+@pytest.mark.asyncio
+async def test_remove_action_rejects_mixed_clip_groups() -> None:
+    first_group = ClipGroup(universe=Universe.WEST, year=2025, season=Season.S4)
+    second_group = ClipGroup(universe=Universe.EAST, year=2025, season=Season.S4)
+    clip_sub_group = ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.COLLECTION)
+    buffer = ChatMessageBuffer()
+    buffer.append(
+        _fake_message(
+            chat_id=42,
+            message_id=1,
+            video=_fake_video(
+                file_id='video-1',
+                file_name=_stored_filename(first_group, clip_sub_group, _CLIP_ID_1),
+            ),
+            media_group_id='group-1',
+        ),
+        chat_id=42,
+    )
+    buffer.append(
+        _fake_message(
+            chat_id=42,
+            message_id=2,
+            video=_fake_video(
+                file_id='video-2',
+                file_name=_stored_filename(second_group, clip_sub_group, _CLIP_ID_2),
+            ),
+            media_group_id='group-2',
+        ),
+        chat_id=42,
+    )
+    clip_store = SimpleNamespace(remove=AsyncMock(), compact=AsyncMock())
+    services = _services(clip_store=clip_store, buffer=buffer)
+    message = _fake_message(text='Select action:', chat_id=42, message_id=42)
+    state = _FakeState()
+
+    await on_intake_action(
+        _fake_callback(message),
+        SimpleNamespace(action=IntakeAction.REMOVE),
+        AsyncMock(),
+        services,
+        _settings(),
+        state,
+    )
+
+    clip_store.remove.assert_not_awaited()
+    clip_store.compact.assert_not_awaited()
+    message.edit_text.assert_awaited_once_with('Invalid input', reply_markup=None)
+    assert services.chat_message_buffer.peek_raw(42) == []
+    assert state.current_state is None
+    assert state.clear_count == 1
+
+
+@pytest.mark.asyncio
+async def test_remove_action_rejects_duplicate_clip_ids() -> None:
+    clip_group = ClipGroup(universe=Universe.WEST, year=2025, season=Season.S4)
+    clip_sub_group = ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.COLLECTION)
+    filename = _stored_filename(clip_group, clip_sub_group, _CLIP_ID_1)
+    buffer = ChatMessageBuffer()
+    buffer.append(
+        _fake_message(chat_id=42, message_id=1, video=_fake_video(file_id='video-1', file_name=filename)),
+        chat_id=42,
+    )
+    buffer.append(
+        _fake_message(
+            chat_id=42,
+            message_id=2,
+            video=_fake_video(file_id='video-2', file_name=filename),
+            media_group_id='group-2',
+        ),
+        chat_id=42,
+    )
+    clip_store = SimpleNamespace(remove=AsyncMock(), compact=AsyncMock())
+    services = _services(clip_store=clip_store, buffer=buffer)
+    message = _fake_message(text='Select action:', chat_id=42, message_id=43)
+    state = _FakeState()
+
+    await on_intake_action(
+        _fake_callback(message),
+        SimpleNamespace(action=IntakeAction.REMOVE),
+        AsyncMock(),
+        services,
+        _settings(),
+        state,
+    )
+
+    clip_store.remove.assert_not_awaited()
+    clip_store.compact.assert_not_awaited()
+    message.edit_text.assert_awaited_once_with('Invalid input', reply_markup=None)
+    assert services.chat_message_buffer.peek_raw(42) == []
+    assert state.current_state is None
+    assert state.clear_count == 1
 
 
 @pytest.mark.asyncio
@@ -11609,20 +12089,6 @@ async def test_track_store_invalid_sub_season_callback_value_becomes_stale() -> 
     )
 
     menu_message.edit_text.assert_awaited_with('Selection is no longer available', reply_markup=None)
-
-
-def test_intake_action_keyboard_uses_right_to_left_columns() -> None:
-    reply_markup = _column_right_to_left_two_row_keyboard(
-        buttons=[InlineKeyboardButton(text=str(index), callback_data=str(index)) for index in range(1, 6)],
-        back_button=InlineKeyboardButton(text='Cancel', callback_data='cancel'),
-    )
-
-    _assert_three_rows(reply_markup)
-    assert _keyboard_rows(reply_markup) == [
-        ['5', '3', '1'],
-        ['4', '2'],
-        ['Cancel'],
-    ]
 
 
 @pytest.mark.asyncio
