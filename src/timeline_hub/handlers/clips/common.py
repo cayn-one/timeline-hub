@@ -5,11 +5,12 @@ from typing import Any
 from aiogram import Bot
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message
 from aiogram.utils.formatting import Bold, Text
 
 from timeline_hub.handlers.menu import ensure_three_rows, three_row_keyboard
 from timeline_hub.services.clip_store import Scope, Season, StoreResult, SubSeason, Universe
+from timeline_hub.types import Extension
 
 FLOW_GET = 'get'
 FLOW_PULL = 'pull'
@@ -83,6 +84,30 @@ async def download_video_bytes(bot: Bot, *, file_id: str) -> bytes:
     if buffer is None:
         raise RuntimeError(f'Telegram file download returned no content for {file_id}')
     return buffer.read()
+
+
+def extract_clip_file_id(message: Message) -> str | None:
+    """Return the downloadable file id for a clip-bearing message.
+
+    Telegram videos are accepted as-is. Telegram documents are accepted only
+    when the filename resolves to `.mp4`.
+    """
+    video = message.video
+    if video is not None:
+        return video.file_id
+
+    document = getattr(message, 'document', None)
+    if document is None:
+        return None
+
+    file_name = getattr(document, 'file_name', None)
+    if Extension.try_from_filename(file_name) is not Extension.MP4:
+        return None
+
+    file_id = getattr(document, 'file_id', None)
+    if not isinstance(file_id, str) or not file_id:
+        return None
+    return file_id
 
 
 def selection_labels(

@@ -2825,8 +2825,8 @@ async def test_video_and_unsupported_document_batch_dispatches_to_clip_menu() ->
     reply_markup = message.answer.await_args.kwargs['reply_markup']
     _assert_three_rows(reply_markup)
     assert _keyboard_rows(reply_markup) == [
-        ['Route', 'Store', 'Reorder'],
-        ['Reconcile', 'Produce', 'Compact'],
+        ['Produce', 'Remove', 'Reorder'],
+        ['Reconcile', 'Route', 'Compact'],
         ['Cancel'],
     ]
 
@@ -2860,10 +2860,69 @@ async def test_video_and_song_mp3_document_batch_dispatches_to_clip_menu() -> No
     reply_markup = message.answer.await_args.kwargs['reply_markup']
     _assert_three_rows(reply_markup)
     assert _keyboard_rows(reply_markup) == [
-        ['Route', 'Store', 'Reorder'],
-        ['Reconcile', 'Produce', 'Compact'],
+        ['Produce', 'Remove', 'Reorder'],
+        ['Reconcile', 'Route', 'Compact'],
         ['Cancel'],
     ]
+
+
+@pytest.mark.asyncio
+async def test_document_mp4_only_batch_dispatches_to_clip_menu() -> None:
+    scheduler = _FakeScheduler()
+    buffer = ChatMessageBuffer()
+    services = _services(clip_store=SimpleNamespace(), scheduler=scheduler, buffer=buffer)
+    settings = _settings()
+    message = _fake_message(
+        chat_id=42,
+        message_id=1,
+        document=_fake_document(file_id='document-1', file_name='clip.mp4'),
+    )
+
+    await on_buffered_relevant_message(message, services, settings)
+    assert scheduler.job is not None
+
+    await scheduler.job()
+
+    expected = Text(
+        create_padding_line(settings.message_width),
+        '\n',
+        Text('Messages: ', Bold('1')),
+        '. Select action:',
+    ).as_kwargs()
+    _assert_format_kwargs(message.answer.await_args.kwargs, expected)
+    reply_markup = message.answer.await_args.kwargs['reply_markup']
+    _assert_three_rows(reply_markup)
+    assert _keyboard_rows(reply_markup) == [
+        ['Produce', 'Remove', 'Reorder'],
+        ['Reconcile', 'Route', 'Compact'],
+        ['Cancel'],
+    ]
+
+
+@pytest.mark.asyncio
+async def test_mp4_document_and_track_document_batch_is_rejected_and_flushed() -> None:
+    scheduler = _FakeScheduler()
+    buffer = ChatMessageBuffer()
+    services = _services(clip_store=SimpleNamespace(), scheduler=scheduler, buffer=buffer)
+    first_message = _fake_message(
+        chat_id=42,
+        message_id=1,
+        document=_fake_document(file_id='document-1', file_name='clip.mp4'),
+    )
+    message = _fake_message(
+        chat_id=42,
+        message_id=2,
+        document=_fake_document(file_id='document-2', file_name='track.flac'),
+    )
+
+    await on_buffered_relevant_message(first_message, services, _settings())
+    await on_buffered_relevant_message(message, services, _settings())
+    assert scheduler.job is not None
+
+    await scheduler.job()
+
+    message.answer.assert_awaited_once_with(text="Can't dispatch")
+    assert services.chat_message_buffer.peek_raw(42) == []
 
 
 @pytest.mark.asyncio
@@ -3123,8 +3182,13 @@ async def test_unsupported_youtube_like_link_only_batch_shows_fallback_menu() ->
 
 
 @pytest.mark.asyncio
-async def test_try_dispatch_clip_intake_returns_false_without_videos() -> None:
-    message = _fake_message(chat_id=42, message_id=1, text='note')
+@pytest.mark.parametrize('file_name', [None, 'clip.txt'])
+async def test_try_dispatch_clip_intake_returns_false_without_clip_media(file_name: str | None) -> None:
+    message = _fake_message(
+        chat_id=42,
+        message_id=1,
+        document=_fake_document(file_id='document-1', file_name=file_name),
+    )
     buffer = ChatMessageBuffer()
     buffer.append(message, chat_id=42)
     services = _services(clip_store=SimpleNamespace(), buffer=buffer)
@@ -12380,8 +12444,8 @@ async def test_reorder_back_from_empty_state_returns_to_intake_action_menu() -> 
     reply_markup = message.edit_text.await_args.kwargs['reply_markup']
     _assert_three_rows(reply_markup)
     assert _keyboard_rows(reply_markup) == [
-        ['Route', 'Store', 'Reorder'],
-        ['Reconcile', 'Produce', 'Compact'],
+        ['Produce', 'Remove', 'Reorder'],
+        ['Reconcile', 'Route', 'Compact'],
         ['Cancel'],
     ]
     _assert_format_kwargs(
@@ -12800,6 +12864,96 @@ async def test_route_action_stores_clips_in_caption_route_order_across_message_g
             chat_id=77,
             message_id=5,
             video=_fake_video(file_id='f3', file_name='three.mp4'),
+            media_group_id='g2',
+        ),
+        chat_id=77,
+    )
+    buffer.flush = Mock(wraps=buffer.flush)
+
+    clip_store = SimpleNamespace(
+        store=AsyncMock(return_value=StoreResult(stored_count=3, duplicate_count=0)),
+        compact=AsyncMock(),
+    )
+    services = _services(clip_store=clip_store, buffer=buffer)
+
+    bot = AsyncMock()
+    bot.get_file.side_effect = [
+        SimpleNamespace(file_path='path-1'),
+        SimpleNamespace(file_path='path-2'),
+        SimpleNamespace(file_path='path-3'),
+    ]
+    bot.download_file.side_effect = [BytesIO(b'one'), BytesIO(b'two'), BytesIO(b'three')]
+
+    await on_intake_action(
+        callback,
+        SimpleNamespace(action=IntakeAction.ROUTE),
+        bot,
+        services,
+        _settings(),
+        state,
+    )
+
+    callback.answer.assert_awaited_once()
+    buffer.flush.assert_called_once_with(77)
+    assert services.chat_message_buffer.peek_raw(77) == []
+    clip_store.store.assert_awaited_once()
+    stored_clips = clip_store.store.await_args.kwargs['clips']
+    assert stored_clips == [_mp4_file(b'one'), _mp4_file(b'two'), _mp4_file(b'three')]
+    assert clip_store.store.await_args.args[0] == ClipGroup(
+        universe=Universe.WEST,
+        year=2025,
+        season=Season.S1,
+    )
+    assert clip_store.store.await_args.args[1] == ClipSubGroup(
+        sub_season=SubSeason.NONE,
+        scope=Scope.SOURCE,
+    )
+    assert message.edit_text.await_args_list[0] == call('Routing...', reply_markup=None)
+    _assert_route_progress_edit(
+        message.edit_text.await_args_list[1],
+        ('West', '2025', '1', 'Source'),
+    )
+    message.answer.assert_awaited_once_with(**Text('Stored: ', Bold('3')).as_kwargs())
+    clip_store.compact.assert_awaited_once_with(
+        ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1),
+        ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.SOURCE),
+        batch_size=intake_module._TELEGRAM_MEDIA_GROUP_LIMIT,
+    )
+    assert state.current_state is None
+    assert state.clear_count == 1
+
+
+@pytest.mark.asyncio
+async def test_route_action_stores_mp4_documents_in_caption_route_order_across_message_groups() -> None:
+    message = _fake_message(text='Select action:', chat_id=77, message_id=70)
+    callback = _fake_callback(message)
+    state = _FakeState()
+    buffer = ChatMessageBuffer()
+    buffer.append(
+        _fake_message(
+            chat_id=77,
+            message_id=1,
+            caption='w251',
+            document=_fake_document(file_id='f1', file_name='one.mp4'),
+            media_group_id='g1',
+        ),
+        chat_id=77,
+    )
+    buffer.append(_fake_message(chat_id=77, message_id=2, text='ignore me'), chat_id=77)
+    buffer.append(
+        _fake_message(
+            chat_id=77,
+            message_id=3,
+            document=_fake_document(file_id='f2', file_name='two.mp4'),
+        ),
+        chat_id=77,
+    )
+    buffer.append(_fake_message(chat_id=77, message_id=4, text='still ignored', media_group_id='g2'), chat_id=77)
+    buffer.append(
+        _fake_message(
+            chat_id=77,
+            message_id=5,
+            document=_fake_document(file_id='f3', file_name='three.mp4'),
             media_group_id='g2',
         ),
         chat_id=77,
@@ -14750,6 +14904,142 @@ async def test_produce_scope_selection_stores_then_fetches_only_new_subset_via_s
             chat_id=77,
             message_id=3,
             video=_fake_video(file_id='f3', file_name='three.mp4'),
+            media_group_id='g1',
+        ),
+        chat_id=77,
+    )
+    await state.update_data(
+        mode='produce',
+        menu_message_id=60,
+        year=2025,
+        season=Season.S1,
+        universe=Universe.WEST,
+        sub_season=SubSeason.NONE,
+        buffer_version=buffer.version(77),
+    )
+
+    store_results = [
+        StoreResult(stored_count=1, duplicate_count=0, clip_ids=(_CLIP_ID_1,)),
+        StoreResult(stored_count=2, duplicate_count=1, clip_ids=(_CLIP_ID_2, _CLIP_ID_3)),
+    ]
+
+    clip_store = _ProduceClipStore(
+        store_results=store_results,
+        fetched_batches=[
+            [FetchedClip(id=_CLIP_ID_1, file=_mp4_file(b'one'))],
+            [FetchedClip(id=_CLIP_ID_2, file=_mp4_file(b'two')), FetchedClip(id=_CLIP_ID_3, file=_mp4_file(b'three'))],
+        ],
+    )
+    original_store = clip_store.store
+
+    async def _store_and_assert_collapsed(*args, **kwargs) -> StoreResult:
+        _assert_format_kwargs(
+            message.edit_text.await_args_list[-1].kwargs,
+            _selected_kwargs('Produce', 'West', '2025', '1', 'Extra'),
+        )
+        assert message.edit_text.await_args_list[-1].kwargs['reply_markup'] is None
+        return await original_store(*args, **kwargs)
+
+    clip_store.store = AsyncMock(side_effect=_store_and_assert_collapsed)
+    services = _services(clip_store=clip_store, buffer=buffer)
+
+    bot = AsyncMock()
+    bot.get_file.side_effect = [
+        SimpleNamespace(file_path='path-1'),
+        SimpleNamespace(file_path='path-2'),
+        SimpleNamespace(file_path='path-3'),
+    ]
+    bot.download_file.side_effect = [BytesIO(b'one'), BytesIO(b'two'), BytesIO(b'three')]
+
+    shared_helper = AsyncMock(side_effect=delivery_module.send_fetched_clip_batches)
+    monkeypatch.setattr(store_execution_module, 'send_fetched_clip_batches', shared_helper)
+
+    await on_intake_menu(
+        callback,
+        IntakeCallbackData(action=MenuAction.SELECT, step=MenuStep.SCOPE, value=Scope.EXTRA.value),
+        bot,
+        services,
+        _settings(),
+        state,
+    )
+
+    _assert_format_kwargs(
+        message.edit_text.await_args.kwargs,
+        _selected_kwargs('Produce', 'West', '2025', '1', 'Extra'),
+    )
+    message.answer.assert_awaited_once_with(
+        **Text(
+            'Stored: ',
+            Bold('3'),
+            '\n',
+            'Deduplicated: ',
+            Bold('1'),
+        ).as_kwargs()
+    )
+    assert [event[0] for event in clip_store.events] == ['store', 'store', 'compact', 'fetch']
+    assert clip_store.fetch_calls == [
+        (
+            ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1),
+            ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.EXTRA),
+            (_CLIP_ID_1, _CLIP_ID_2, _CLIP_ID_3),
+            AudioNormalization(loudness=-14, bitrate=128),
+        )
+    ]
+    shared_helper.assert_awaited_once()
+    assert shared_helper.await_args.kwargs['group'] == ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1)
+    assert shared_helper.await_args.kwargs['sub_group'] == ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.EXTRA)
+    assert bot.send_video.await_args.kwargs['video'].data == b'normalized:one'
+    assert bot.send_video.await_args.kwargs['video'].filename == _stored_filename(
+        ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1),
+        ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.EXTRA),
+        _CLIP_ID_1,
+    )
+    sent_media = bot.send_media_group.await_args.kwargs['media']
+    assert [item.media.filename for item in sent_media] == [
+        _stored_filename(
+            ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1),
+            ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.EXTRA),
+            _CLIP_ID_2,
+        ),
+        _stored_filename(
+            ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1),
+            ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.EXTRA),
+            _CLIP_ID_3,
+        ),
+    ]
+    assert [item.media.data for item in sent_media] == [b'normalized:two', b'normalized:three']
+    bot.send_message.assert_not_awaited()
+    assert state.current_state is None
+    assert state.clear_count == 1
+
+
+@pytest.mark.asyncio
+async def test_produce_scope_selection_accepts_mp4_documents_via_shared_normalize_send_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    message = _fake_message(text='Select scope:', chat_id=77, message_id=60)
+    callback = _fake_callback(message)
+    state = _FakeState()
+    await state.set_state(StoreClipFlow.scope)
+    buffer = ChatMessageBuffer()
+    buffer.append(
+        _fake_message(chat_id=77, message_id=1, document=_fake_document(file_id='f1', file_name='one.mp4')),
+        chat_id=77,
+    )
+    buffer.append(
+        _fake_message(
+            chat_id=77,
+            message_id=2,
+            document=_fake_document(file_id='f2', file_name='two.mp4'),
+            media_group_id='g1',
+        ),
+        chat_id=77,
+    )
+    buffer.append(
+        _fake_message(
+            chat_id=77,
+            message_id=3,
+            document=_fake_document(file_id='f3', file_name='three.mp4'),
             media_group_id='g1',
         ),
         chat_id=77,

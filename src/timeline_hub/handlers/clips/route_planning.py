@@ -4,6 +4,7 @@ from datetime import date
 
 from aiogram.types import Message
 
+from timeline_hub.handlers.clips.common import extract_clip_file_id
 from timeline_hub.handlers.clips.flow import store_allowed_seasons, year_option_universe
 from timeline_hub.services.clip_store import ClipGroup, Season, Universe
 from timeline_hub.services.message_buffer import MessageGroup
@@ -33,7 +34,8 @@ def plan_route_batches(
 
     for message_group in message_groups:
         for message in message_group:
-            if message.video is None:
+            clip_file_id = extract_clip_file_id(message)
+            if clip_file_id is None:
                 if message.text is None:
                     continue
 

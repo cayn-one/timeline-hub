@@ -5,6 +5,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, InlineKeyboardButton, Message
 from aiogram.utils.formatting import Bold, Text
 
+from timeline_hub.handlers.clips.common import extract_clip_file_id
 from timeline_hub.handlers.clips.ingest import try_dispatch_clip_intake
 from timeline_hub.handlers.menu import (
     callback_message,
@@ -51,18 +52,21 @@ async def on_buffered_relevant_message(
             extract_uploaded_mp3_attachment(buffered_message) is not None
             for buffered_message in ordered_buffered_messages
         )
+        has_clip_media = any(
+            extract_clip_file_id(buffered_message) is not None for buffered_message in ordered_buffered_messages
+        )
         has_video = any(
             buffered_message.video is not None or getattr(buffered_message, 'animation', None) is not None
             for buffered_message in ordered_buffered_messages
         )
         text_messages = [buffered_message for buffered_message in ordered_buffered_messages if buffered_message.text]
 
-        if has_video and (has_photo or has_track_audio_candidate or has_uploaded_mp3_candidate):
+        if (has_video or has_clip_media) and (has_photo or has_track_audio_candidate or has_uploaded_mp3_candidate):
             services.chat_message_buffer.flush(chat_id)
             await message.answer(text="Can't dispatch")
             return
 
-        if has_video:
+        if has_clip_media:
             handled = await try_dispatch_clip_intake(
                 message=message,
                 services=services,

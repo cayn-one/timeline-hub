@@ -5,7 +5,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import Message
 from loguru import logger
 
-from timeline_hub.handlers.clips.common import download_video_bytes, store_summary_kwargs
+from timeline_hub.handlers.clips.common import download_video_bytes, extract_clip_file_id, store_summary_kwargs
 from timeline_hub.handlers.clips.delivery import audio_normalization_from_settings, send_fetched_clip_batches
 from timeline_hub.services.clip_store import ClipGroup, ClipSubGroup, Scope, StoreResult
 from timeline_hub.services.container import Services
@@ -109,11 +109,12 @@ async def _message_group_to_clip_files(
     clips: list[FileBytes] = []
 
     for message in message_group:
-        if message.video is None:
+        file_id = extract_clip_file_id(message)
+        if file_id is None:
             continue
         clips.append(
             FileBytes(
-                data=await download_video_bytes(bot, file_id=message.video.file_id),
+                data=await download_video_bytes(bot, file_id=file_id),
                 extension=Extension.MP4,
             )
         )

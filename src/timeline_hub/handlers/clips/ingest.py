@@ -22,6 +22,7 @@ from timeline_hub.handlers.clips.common import (
     MenuAction,
     MenuStep,
     download_video_bytes,
+    extract_clip_file_id,
     parse_scope,
     parse_season,
     parse_sub_season,
@@ -1159,7 +1160,7 @@ async def _store_route_batches(
             batch_result = await services.clip_store.store(
                 route_batch.clip_group,
                 clip_sub_group,
-                clips=await _video_messages_to_clip_files(
+                clips=await _clip_messages_to_clip_files(
                     bot=bot,
                     messages=route_batch.messages[start : start + _ROUTE_STORE_CHUNK_SIZE],
                 ),
@@ -1182,16 +1183,17 @@ async def _store_route_batches(
     )
 
 
-async def _video_messages_to_clip_files(
+async def _clip_messages_to_clip_files(
     *,
     bot: Bot,
     messages: Sequence[Message],
 ) -> list[FileBytes]:
     async def to_clip_file(message: Message) -> FileBytes:
-        if message.video is None:
-            raise ValueError('Route batches must contain only video messages')
+        file_id = extract_clip_file_id(message)
+        if file_id is None:
+            raise ValueError('Route batches must contain only clip messages')
         return FileBytes(
-            data=await download_video_bytes(bot, file_id=message.video.file_id),
+            data=await download_video_bytes(bot, file_id=file_id),
             extension=Extension.MP4,
         )
 
@@ -1216,6 +1218,14 @@ def _has_buffered_videos(
     chat_id: ChatId,
 ) -> bool:
     return any(message.video is not None for message in services.chat_message_buffer.peek_raw(chat_id))
+
+
+def _has_buffered_clip_media(
+    *,
+    services: Services,
+    chat_id: ChatId,
+) -> bool:
+    return any(extract_clip_file_id(message) is not None for message in services.chat_message_buffer.peek_raw(chat_id))
 
 
 def _store_year_options(*, current_year: int, min_year: int) -> list[int]:
@@ -1269,11 +1279,22 @@ def _intake_action_menu_kwargs(
     message_width: int,
     clip_count_override: int | None = None,
 ) -> dict[str, Any] | None:
+    """Build the root Clips menu for any buffered clip-bearing batch.
+
+    The root menu is intentionally broader than any single action's runtime
+    validation. It should stay simple and predictable:
+    - menu-time logic only decides whether the buffered batch contains clips
+    - action handlers own final validation for their own media or identity
+    - visible buttons are not a promise that the selected action will succeed
+
+    This keeps menu visibility from duplicating action-specific validation,
+    which would be fragile for mixed clip-media and identity-only workflows.
+    """
     message_count = len(services.chat_message_buffer.peek_flat(chat_id))
     clip_count = clip_count_override
     if clip_count is None:
-        clip_count = len(
-            [message for message in services.chat_message_buffer.peek_raw(chat_id) if message.video is not None]
+        clip_count = sum(
+            1 for message in services.chat_message_buffer.peek_raw(chat_id) if extract_clip_file_id(message) is not None
         )
     if clip_count == 0:
         return None
@@ -1313,9 +1334,15 @@ async def try_dispatch_clip_intake(
     services: Services,
     settings: Settings,
 ) -> bool:
-    """Send the clip intake menu if the current buffered batch belongs to clips."""
+    """Send the root Clips menu for any buffered clip-bearing batch.
+
+    The current buffer only needs to contain clip media for the menu to be
+    shown. Individual actions perform their own authoritative validation, so
+    this dispatcher does not try to predict which buttons will ultimately be
+    valid for the batch.
+    """
     chat_id = message.chat.id
-    if not _has_buffered_videos(
+    if not _has_buffered_clip_media(
         services=services,
         chat_id=chat_id,
     ):
