@@ -1290,15 +1290,40 @@ def _intake_action_menu_kwargs(
     This keeps menu visibility from duplicating action-specific validation,
     which would be fragile for mixed clip-media and identity-only workflows.
     """
-    message_count = len(services.chat_message_buffer.peek_flat(chat_id))
+    raw_messages = services.chat_message_buffer.peek_raw(chat_id)
+    message_count = len(raw_messages)
     clip_count = clip_count_override
+    has_video_clip_messages = False
+    has_document_clip_messages = False
     if clip_count is None:
-        clip_count = sum(
-            1 for message in services.chat_message_buffer.peek_raw(chat_id) if extract_clip_file_id(message) is not None
-        )
+        clip_count = 0
+    for message in raw_messages:
+        if message.video is not None:
+            has_video_clip_messages = True
+        clip_file_id = extract_clip_file_id(message)
+        if clip_file_id is not None:
+            if clip_count_override is None:
+                clip_count += 1
+            if message.document is not None:
+                has_document_clip_messages = True
     if clip_count == 0:
         return None
     buffer_version = services.chat_message_buffer.version(chat_id)
+    document_only_clip_buffer = has_document_clip_messages and not has_video_clip_messages
+    if document_only_clip_buffer:
+        action_buttons = [
+            _create_intake_action_button(IntakeAction.ROUTE, buffer_version=buffer_version),
+            _create_intake_action_button(IntakeAction.PRODUCE, buffer_version=buffer_version),
+        ]
+    else:
+        action_buttons = [
+            _create_intake_action_button(IntakeAction.REORDER, buffer_version=buffer_version),
+            _create_intake_action_button(IntakeAction.COMPACT, buffer_version=buffer_version),
+            _create_intake_action_button(IntakeAction.ROUTE, buffer_version=buffer_version),
+            _create_intake_action_button(IntakeAction.REMOVE, buffer_version=buffer_version),
+            _create_intake_action_button(IntakeAction.PRODUCE, buffer_version=buffer_version),
+            _create_intake_action_button(IntakeAction.RECONCILE, buffer_version=buffer_version),
+        ]
     return {
         **Text(
             create_padding_line(message_width),
@@ -1309,17 +1334,7 @@ def _intake_action_menu_kwargs(
         # Root clip actions are versioned because these are destructive,
         # state-coupled callbacks that must not survive buffer changes.
         'reply_markup': selection_keyboard(
-            # `Store` stays available through existing callbacks/flow handling,
-            # but the root Clips menu hides it for now because Route is the
-            # primary storage path and the 7-button layout is too wide.
-            buttons=[
-                _create_intake_action_button(IntakeAction.REORDER, buffer_version=buffer_version),
-                _create_intake_action_button(IntakeAction.COMPACT, buffer_version=buffer_version),
-                _create_intake_action_button(IntakeAction.ROUTE, buffer_version=buffer_version),
-                _create_intake_action_button(IntakeAction.REMOVE, buffer_version=buffer_version),
-                _create_intake_action_button(IntakeAction.PRODUCE, buffer_version=buffer_version),
-                _create_intake_action_button(IntakeAction.RECONCILE, buffer_version=buffer_version),
-            ],
+            buttons=action_buttons,
             back_button=_create_intake_action_button(
                 IntakeAction.CANCEL,
                 buffer_version=buffer_version,

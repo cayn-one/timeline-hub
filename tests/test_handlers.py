@@ -1801,19 +1801,139 @@ async def test_store_cancel_removes_buttons_and_shows_only_selected_cancel() -> 
 
 
 @pytest.mark.asyncio
-async def test_video_and_text_dispatch_to_clip_action_menu() -> None:
+async def test_video_dispatch_to_clip_action_menu() -> None:
     scheduler = _FakeScheduler()
     buffer = ChatMessageBuffer()
     services = _services(clip_store=SimpleNamespace(), scheduler=scheduler, buffer=buffer)
     settings = _settings()
-    text_message = _fake_message(chat_id=42, message_id=1, text='note')
     message = _fake_message(
         chat_id=42,
-        message_id=2,
+        message_id=1,
         video=_fake_video(file_id='file-1', file_name='clip.mp4'),
     )
 
-    await on_buffered_relevant_message(text_message, services, settings)
+    await on_buffered_relevant_message(message, services, settings)
+    assert scheduler.job is not None
+
+    await scheduler.job()
+
+    expected = Text(
+        create_padding_line(settings.message_width),
+        '\n',
+        Text('Messages: ', Bold('1')),
+        '. Select action:',
+    ).as_kwargs()
+    _assert_format_kwargs(
+        message.answer.await_args.kwargs,
+        expected,
+    )
+    reply_markup = message.answer.await_args.kwargs['reply_markup']
+    expected_reply_markup = selection_keyboard(
+        buttons=[
+            InlineKeyboardButton(
+                text=action.title(),
+                callback_data=IntakeActionCallbackData(
+                    action=action,
+                    buffer_version=services.chat_message_buffer.version(42),
+                ).pack(),
+            )
+            for action in [
+                IntakeAction.REORDER,
+                IntakeAction.COMPACT,
+                IntakeAction.ROUTE,
+                IntakeAction.REMOVE,
+                IntakeAction.PRODUCE,
+                IntakeAction.RECONCILE,
+            ]
+        ],
+        back_button=InlineKeyboardButton(
+            text=IntakeAction.CANCEL.title(),
+            callback_data=IntakeActionCallbackData(
+                action=IntakeAction.CANCEL,
+                buffer_version=services.chat_message_buffer.version(42),
+            ).pack(),
+        ),
+    )
+    assert reply_markup == expected_reply_markup
+    assert [buffered_message.message_id for buffered_message in services.chat_message_buffer.peek_raw(42)] == [1]
+
+
+@pytest.mark.asyncio
+async def test_document_only_mp4_dispatch_to_restricted_clip_action_menu() -> None:
+    scheduler = _FakeScheduler()
+    buffer = ChatMessageBuffer()
+    services = _services(clip_store=SimpleNamespace(), scheduler=scheduler, buffer=buffer)
+    settings = _settings()
+    message = _fake_message(
+        chat_id=42,
+        message_id=1,
+        document=_fake_document(file_id='file-1', file_name='clip.mp4'),
+    )
+
+    await on_buffered_relevant_message(message, services, settings)
+    assert scheduler.job is not None
+
+    await scheduler.job()
+
+    expected = Text(
+        create_padding_line(settings.message_width),
+        '\n',
+        Text('Messages: ', Bold('1')),
+        '. Select action:',
+    ).as_kwargs()
+    _assert_format_kwargs(
+        message.answer.await_args.kwargs,
+        expected,
+    )
+    reply_markup = message.answer.await_args.kwargs['reply_markup']
+    expected_reply_markup = selection_keyboard(
+        buttons=[
+            InlineKeyboardButton(
+                text=action.title(),
+                callback_data=IntakeActionCallbackData(
+                    action=action,
+                    buffer_version=services.chat_message_buffer.version(42),
+                ).pack(),
+            )
+            for action in [
+                IntakeAction.ROUTE,
+                IntakeAction.PRODUCE,
+            ]
+        ],
+        back_button=InlineKeyboardButton(
+            text=IntakeAction.CANCEL.title(),
+            callback_data=IntakeActionCallbackData(
+                action=IntakeAction.CANCEL,
+                buffer_version=services.chat_message_buffer.version(42),
+            ).pack(),
+        ),
+    )
+    assert reply_markup == expected_reply_markup
+    assert _keyboard_rows(reply_markup) == [['Route'], ['Produce'], ['Cancel']]
+    assert [buffered_message.message_id for buffered_message in services.chat_message_buffer.peek_raw(42)] == [1]
+
+
+@pytest.mark.asyncio
+async def test_mixed_video_and_mp4_document_dispatch_to_full_clip_action_menu() -> None:
+    scheduler = _FakeScheduler()
+    buffer = ChatMessageBuffer()
+    services = _services(clip_store=SimpleNamespace(), scheduler=scheduler, buffer=buffer)
+    settings = _settings()
+    message = _fake_message(
+        chat_id=42,
+        message_id=2,
+        document=_fake_document(file_id='file-2', file_name='clip.mp4'),
+    )
+
+    await on_buffered_relevant_message(
+        _fake_message(
+            chat_id=42,
+            message_id=1,
+            video=_fake_video(file_id='file-1', file_name='clip.mp4'),
+        ),
+        services,
+        settings,
+    )
     await on_buffered_relevant_message(message, services, settings)
     assert scheduler.job is not None
 
@@ -1857,6 +1977,11 @@ async def test_video_and_text_dispatch_to_clip_action_menu() -> None:
         ),
     )
     assert reply_markup == expected_reply_markup
+    assert _keyboard_rows(reply_markup) == [
+        ['Produce', 'Remove', 'Reorder'],
+        ['Reconcile', 'Route', 'Compact'],
+        ['Cancel'],
+    ]
     assert [buffered_message.message_id for buffered_message in services.chat_message_buffer.peek_raw(42)] == [1, 2]
 
 
