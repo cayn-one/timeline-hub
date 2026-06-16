@@ -1,0 +1,25 @@
+[interface]
+# Width used for the fixed padding line in menu messages
+message_width = 80
+# Delay before the bot answers after a burst of forwarded messages
+forward_batch_timeout_ms = 250
+
+[stores]
+# Lowest year shown when choosing clip and track destinations
+min_year = 2022
+
+[clips]
+# Audio normalization target in LUFS
+normalization_loudness = -14
+# Audio bitrate for normalized output
+normalization_bitrate = 128
+
+[tracks]
+# Maximum clip duration for track variants, in minutes
+variant_max_duration_minutes = 30
+# Slowest allowed variant speed
+slowest_variant_speed = 0.5
+
+[telegram]
+# Maximum media-group payload size observed to be accepted by Telegram, in MiB
+media_group_max_size = 47

@@ -963,7 +963,7 @@ async def _show_store_year_menu(
     year: int | None = None,
     flow: FlowMenuDefinition = _STORE_FLOW,
 ) -> bool:
-    years = _store_year_options(current_year=date.today().year, min_year=settings.min_clip_year)
+    years = _store_year_options(current_year=date.today().year, min_year=settings.min_year)
     if not years:
         return False
     if year is not None and year not in years:
@@ -994,7 +994,7 @@ async def _show_store_season_menu(
     year: int,
     flow: FlowMenuDefinition = _STORE_FLOW,
 ) -> bool:
-    if year not in _store_year_options(current_year=date.today().year, min_year=settings.min_clip_year):
+    if year not in _store_year_options(current_year=date.today().year, min_year=settings.min_year):
         return False
     seasons = _store_season_options(year=year, today=date.today())
 

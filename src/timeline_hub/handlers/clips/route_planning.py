@@ -28,7 +28,7 @@ def plan_route_batches(
     allowed_years = set(
         year_option_universe(
             current_year=today.year,
-            min_year=settings.min_clip_year,
+            min_year=settings.min_year,
         )
     )
 

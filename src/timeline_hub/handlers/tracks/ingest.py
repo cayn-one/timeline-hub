@@ -849,7 +849,7 @@ async def _show_store_year_menu(
     buffer_version: int,
     universe: TrackUniverse,
 ) -> None:
-    year_options = list(range(date.today().year, settings.min_clip_year - 1, -1))
+    year_options = list(range(date.today().year, settings.min_year - 1, -1))
     await _set_track_store_context(
         state=state,
         fsm_state=TrackStoreFlow.year,

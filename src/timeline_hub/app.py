@@ -1,3 +1,4 @@
+import argparse
 import asyncio
 import logging
 import sys
@@ -20,7 +21,8 @@ from timeline_hub.types import UserId
 
 def main() -> None:
     _configure_logging()
-    settings = Settings.load()
+    args = _parse_args()
+    settings = Settings.load(is_dev=args.dev)
     asyncio.run(_main(settings))
 
 
@@ -103,6 +105,16 @@ def _configure_logging() -> None:
     )
     # Hide normal 'SIGINT` signal logs when shutting bot down
     logging.getLogger('aiogram').setLevel(logging.ERROR)
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(prog='timeline-hub')
+    parser.add_argument(
+        '--dev',
+        action='store_true',
+        help='load development overrides from config.toml',
+    )
+    return parser.parse_args()
 
 
 def _default_track_preset() -> Preset:

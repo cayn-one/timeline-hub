@@ -1,8 +1,41 @@
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
+import timeline_hub.app as app_module
 from timeline_hub.app import _notify_superusers_and_stop_polling
+
+
+def test_main_loads_production_settings_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    settings = object()
+    load = Mock(return_value=settings)
+    main = AsyncMock(return_value=None)
+
+    monkeypatch.setattr(app_module, '_configure_logging', Mock())
+    monkeypatch.setattr(app_module.Settings, 'load', load)
+    monkeypatch.setattr(app_module, '_main', main)
+    monkeypatch.setattr(app_module.sys, 'argv', ['timeline-hub'])
+
+    app_module.main()
+
+    load.assert_called_once_with(is_dev=False)
+    main.assert_awaited_once_with(settings)
+
+
+def test_main_loads_dev_overrides_when_flag_is_present(monkeypatch: pytest.MonkeyPatch) -> None:
+    settings = object()
+    load = Mock(return_value=settings)
+    main = AsyncMock(return_value=None)
+
+    monkeypatch.setattr(app_module, '_configure_logging', Mock())
+    monkeypatch.setattr(app_module.Settings, 'load', load)
+    monkeypatch.setattr(app_module, '_main', main)
+    monkeypatch.setattr(app_module.sys, 'argv', ['timeline-hub', '--dev'])
+
+    app_module.main()
+
+    load.assert_called_once_with(is_dev=True)
+    main.assert_awaited_once_with(settings)
 
 
 @pytest.mark.asyncio

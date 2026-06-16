@@ -1,10 +1,14 @@
+import tomllib
 from datetime import timedelta
-from typing import Any, Self
+from pathlib import Path
+from typing import Any, Self, TypeVar, cast
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from timeline_hub.types import UserId
+
+CONFIG_PATH = Path('config.toml')
 
 
 class S3Settings(BaseModel):
@@ -13,6 +17,129 @@ class S3Settings(BaseModel):
     bucket: str
     access_key_id: str
     secret_access_key: SecretStr
+
+
+class _FileInterfaceConfig(BaseModel):
+    forward_batch_timeout_ms: int = Field(gt=0)
+    message_width: int = Field(gt=0)
+
+    model_config = ConfigDict(
+        frozen=True,
+        extra='forbid',
+    )
+
+
+class _FileInterfaceOverrides(BaseModel):
+    forward_batch_timeout_ms: int | None = Field(default=None, gt=0)
+    message_width: int | None = Field(default=None, gt=0)
+
+    model_config = ConfigDict(
+        frozen=True,
+        extra='forbid',
+    )
+
+
+class _FileTelegramConfig(BaseModel):
+    media_group_max_size: int = Field(gt=0)
+
+    model_config = ConfigDict(
+        frozen=True,
+        extra='forbid',
+    )
+
+
+class _FileTelegramOverrides(BaseModel):
+    media_group_max_size: int | None = Field(default=None, gt=0)
+
+    model_config = ConfigDict(
+        frozen=True,
+        extra='forbid',
+    )
+
+
+class _FileStoresConfig(BaseModel):
+    min_year: int = Field(gt=0)
+
+    model_config = ConfigDict(
+        frozen=True,
+        extra='forbid',
+    )
+
+
+class _FileStoresOverrides(BaseModel):
+    min_year: int | None = Field(default=None, gt=0)
+
+    model_config = ConfigDict(
+        frozen=True,
+        extra='forbid',
+    )
+
+
+class _FileClipsConfig(BaseModel):
+    normalization_loudness: float
+    normalization_bitrate: int = Field(gt=0)
+
+    model_config = ConfigDict(
+        frozen=True,
+        extra='forbid',
+    )
+
+
+class _FileClipsOverrides(BaseModel):
+    normalization_loudness: float | None = None
+    normalization_bitrate: int | None = Field(default=None, gt=0)
+
+    model_config = ConfigDict(
+        frozen=True,
+        extra='forbid',
+    )
+
+
+class _FileTracksConfig(BaseModel):
+    variant_max_duration_minutes: int = Field(gt=0)
+    slowest_variant_speed: float = Field(gt=0, le=1)
+
+    model_config = ConfigDict(
+        frozen=True,
+        extra='forbid',
+    )
+
+
+class _FileTracksOverrides(BaseModel):
+    variant_max_duration_minutes: int | None = Field(default=None, gt=0)
+    slowest_variant_speed: float | None = Field(default=None, gt=0, le=1)
+
+    model_config = ConfigDict(
+        frozen=True,
+        extra='forbid',
+    )
+
+
+class _FileDevConfig(BaseModel):
+    interface: _FileInterfaceOverrides | None = None
+    telegram: _FileTelegramOverrides | None = None
+    stores: _FileStoresOverrides | None = None
+    clips: _FileClipsOverrides | None = None
+    tracks: _FileTracksOverrides | None = None
+
+    model_config = ConfigDict(
+        frozen=True,
+        extra='forbid',
+    )
+
+
+class _FileConfig(BaseModel):
+    interface: _FileInterfaceConfig
+    telegram: _FileTelegramConfig
+    stores: _FileStoresConfig
+    clips: _FileClipsConfig
+    tracks: _FileTracksConfig
+    dev: _FileDevConfig | None = None
+
+    model_config = ConfigDict(
+        frozen=True,
+        extra='forbid',
+    )
 
 
 class Settings(BaseModel):
@@ -24,37 +151,40 @@ class Settings(BaseModel):
     # S3-compatible storage
     s3: S3Settings
 
-    # Delay used to batch forwarded messages before responding
-    forward_batch_timeout: timedelta = timedelta(seconds=0.25)
-    # Padding line width in space units (1 unit ≈ width of one NBSP character)
-    message_width: int = 80
+    forward_batch_timeout: timedelta
+    message_width: int
 
-    # Lowest year offered for clip store destinations
-    min_clip_year: int = 2022
-    # Audio normalization (LUFS target and bitrate)
-    normalization_loudness: float = -14
-    normalization_bitrate: int = 128
+    min_year: int
+    normalization_loudness: float
+    normalization_bitrate: int
 
-    # Will be clipped with precision of frames
-    variant_max_duration: timedelta = timedelta(minutes=30)
-    slowest_variant_speed: float = 0.5
-    # Maximum summed variant payload to attempt `send_media_group` (MiB)
-    media_group_max_size: int = 47
+    variant_max_duration: timedelta
+    slowest_variant_speed: float
+    media_group_max_size: int
 
     model_config = ConfigDict(
         frozen=True,
     )
 
     @classmethod
-    def load(cls) -> Self:
+    def load(cls, *, is_dev: bool) -> Self:
         # BaseSettings resolves required fields from environment at runtime.
         env_settings = _EnvSettings()  # pyright: ignore[reportCallIssue]
+        file_settings = _load_file_settings(is_dev=is_dev)
 
         return cls(
             bot_token=env_settings.bot_token,
             superuser_ids=env_settings.superuser_ids,
             user_ids=env_settings.user_ids,
             s3=env_settings.s3,
+            forward_batch_timeout=timedelta(milliseconds=file_settings.interface.forward_batch_timeout_ms),
+            message_width=file_settings.interface.message_width,
+            media_group_max_size=file_settings.telegram.media_group_max_size,
+            min_year=file_settings.stores.min_year,
+            normalization_loudness=file_settings.clips.normalization_loudness,
+            normalization_bitrate=file_settings.clips.normalization_bitrate,
+            variant_max_duration=timedelta(minutes=file_settings.tracks.variant_max_duration_minutes),
+            slowest_variant_speed=file_settings.tracks.slowest_variant_speed,
         )
 
     @model_validator(mode='before')
@@ -85,3 +215,33 @@ class _EnvSettings(BaseSettings):
         extra='ignore',
         env_nested_delimiter='__',
     )
+
+
+_TSection = TypeVar('_TSection', bound=BaseModel)
+
+
+def _load_file_settings(*, is_dev: bool) -> _FileConfig:
+    with CONFIG_PATH.open('rb') as file:
+        raw_config = tomllib.load(file)
+
+    file_config = _FileConfig.model_validate(raw_config)
+    if not is_dev or file_config.dev is None:
+        return file_config
+
+    return _FileConfig(
+        interface=_merge_file_section(file_config.interface, file_config.dev.interface),
+        telegram=_merge_file_section(file_config.telegram, file_config.dev.telegram),
+        stores=_merge_file_section(file_config.stores, file_config.dev.stores),
+        clips=_merge_file_section(file_config.clips, file_config.dev.clips),
+        tracks=_merge_file_section(file_config.tracks, file_config.dev.tracks),
+        dev=file_config.dev,
+    )
+
+
+def _merge_file_section(base: _TSection, override: BaseModel | None) -> _TSection:
+    if override is None:
+        return base
+
+    section_data = base.model_dump()
+    section_data.update(override.model_dump(exclude_unset=True))
+    return cast(_TSection, type(base).model_validate(section_data))

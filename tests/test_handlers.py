@@ -386,7 +386,7 @@ def _services(
 def _settings(**overrides: object) -> SimpleNamespace:
     values = {
         'forward_batch_timeout': timedelta(milliseconds=250),
-        'min_clip_year': 2022,
+        'min_year': 2022,
         'normalization_loudness': -14,
         'normalization_bitrate': 128,
         'message_width': 35,
@@ -3017,11 +3017,7 @@ async def test_document_mp4_only_batch_dispatches_to_clip_menu() -> None:
     _assert_format_kwargs(message.answer.await_args.kwargs, expected)
     reply_markup = message.answer.await_args.kwargs['reply_markup']
     _assert_three_rows(reply_markup)
-    assert _keyboard_rows(reply_markup) == [
-        ['Produce', 'Remove', 'Reorder'],
-        ['Reconcile', 'Route', 'Compact'],
-        ['Cancel'],
-    ]
+    assert _keyboard_rows(reply_markup) == [['Route'], ['Produce'], ['Cancel']]
 
 
 @pytest.mark.asyncio
@@ -12103,7 +12099,7 @@ async def test_track_store_year_menu_shows_most_recent_years_first(monkeypatch: 
             return cls(2026, 1, 1)
 
     monkeypatch.setattr(track_ingest_module, 'date', _FixedDate)
-    settings = _settings(min_clip_year=2022)
+    settings = _settings(min_year=2022)
     buffer = ChatMessageBuffer()
     for buffered_message in [
         _fake_message(chat_id=42, message_id=1, photo=_fake_photo(file_id='photo-1'), caption='Artist\nTitle'),
@@ -13865,7 +13861,7 @@ async def test_route_action_ignores_semantically_invalid_pre_clip_route_text(
 
 
 @pytest.mark.asyncio
-async def test_route_action_rejects_year_below_min_clip_year_before_execution() -> None:
+async def test_route_action_rejects_year_below_min_year_before_execution() -> None:
     message = _fake_message(text='Select action:', chat_id=77, message_id=77)
     callback = _fake_callback(message)
     state = _FakeState()

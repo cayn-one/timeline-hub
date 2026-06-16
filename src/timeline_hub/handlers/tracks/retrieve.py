@@ -502,7 +502,7 @@ async def _show_retrieve_year_menu(
             ),
         )
         return StepOutcome.SHOWN
-    year_options = list(range(date.today().year, settings.min_clip_year - 1, -1))
+    year_options = list(range(date.today().year, settings.min_year - 1, -1))
 
     await _set_track_retrieve_context(
         state=state,

@@ -27,11 +27,11 @@ The runtime itself is small: `aiogram` handles Telegram updates, a compact servi
 
 The project is split into small layers with narrow responsibilities.
 
-- `app` is the composition root. It loads immutable settings, configures logging, opens the Telegram bot and S3 client, installs allowlist middleware, injects the service container into the dispatcher, and wires handler or background-task failures to superuser notification and polling shutdown.
+- `app` is the composition root. It parses the `--dev` flag, loads immutable settings from `.env` and `config.toml`, configures logging, opens the Telegram bot and S3 client, installs allowlist middleware, injects the service container into the dispatcher, and wires handler or background-task failures to superuser notification and polling shutdown.
 - `handlers` own Telegram-facing behavior. `clips_store.py` manages buffered uploads, action selection, normalization, and storage menus. `clips_retrieve.py` drives the Get/Pull flow from entry menu to batched clip delivery. `clips_common.py` holds shared FSM state, menu parsing, text formatting, and fixed-layout keyboard primitives.
 - `services` provide the domain-facing operations used by handlers. `ClipStore` maps logical clip groups to S3 objects and manifests, `ChatMessageBuffer` batches incoming messages per chat and reconstructs media groups, and `Services` is an explicit container rather than implicit global state.
 - `infra` contains reusable plumbing. `S3Client` is a generic async wrapper over S3-compatible storage, and `tasks.py` provides a detached task supervisor plus a per-key debouncing scheduler.
-- `settings` loads configuration from `.env` with `pydantic-settings` and automatically folds `SUPERUSER_IDS` into the main allowlist.
+- `settings` loads secrets and allowlists from `.env`, loads non-secret runtime defaults from `config.toml`, and automatically folds `SUPERUSER_IDS` into the main allowlist.
 - `domain.py` contains media-specific logic that does not belong in Telegram handlers. At the moment this is two-pass audio normalization via `ffmpeg loudnorm`, using temporary files because MP4 output must remain seekable.
 
 At runtime, Telegram updates enter handlers, handlers translate them into domain-level operations, services execute those operations, and infrastructure provides the underlying storage and task primitives. The app layer stays responsible for wiring, lifecycle, and failure policy.
@@ -81,6 +81,44 @@ uv sync --group dev
 
 Create `.env` from `.env.example`. The bot operates only in private chats and requires an allowlist configuration.
 
+The tracked `config.toml` already lives in the repository root and contains the non-secret runtime tuning. Production values live in the normal top-level sections, and optional development overrides can live under `[dev.*]` tables in the same file. Keep `.env` as the user-created local file for secrets.
+
+Example:
+
+```toml
+[interface]
+# Delay before the bot answers after a burst of forwarded messages
+forward_batch_timeout_ms = 250
+# Width used for the fixed padding line in menu messages
+message_width = 80
+
+[telegram]
+# Maximum media-group payload size observed to be accepted by Telegram, in MiB
+media_group_max_size = 47
+
+[stores]
+# Lowest year shown when choosing clip and track destinations
+min_year = 2022
+
+[clips]
+# Audio normalization target in LUFS
+normalization_loudness = -14
+# Audio bitrate for normalized output
+normalization_bitrate = 128
+
+[tracks]
+# Maximum clip duration for track variants, in minutes
+variant_max_duration_minutes = 30
+# Slowest allowed variant speed
+slowest_variant_speed = 0.5
+
+[dev.interface]
+message_width = 72
+
+[dev.telegram]
+media_group_max_size = 10
+```
+
 Required settings:
 
 - BOT_TOKEN
@@ -101,9 +139,11 @@ Optional settings used by the code include:
 
 Run the bot through the package entry point:
 
-uv run python -m timeline_hub
+uv run timeline-hub
 
-The main entry point is `src/timeline_hub/__main__.py`, which delegates to `timeline_hub.app.run()`.
+Pass `--dev` to load development overrides from the same `config.toml` file:
+
+uv run timeline-hub --dev
 
 ## Development
 

@@ -615,7 +615,7 @@ async def _show_retrieve_year_menu(
             flow=flow,
         )
         return StepOutcome.SHOWN
-    year_options = year_option_universe(current_year=date.today().year, min_year=settings.min_clip_year)
+    year_options = year_option_universe(current_year=date.today().year, min_year=settings.min_year)
 
     await show_fixed_option_menu(
         flow=flow,
