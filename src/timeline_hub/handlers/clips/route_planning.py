@@ -6,7 +6,7 @@ from aiogram.types import Message
 
 from timeline_hub.handlers.clips.common import extract_clip_file_id
 from timeline_hub.handlers.clips.flow import store_allowed_seasons, year_option_universe
-from timeline_hub.services.clip_store import ClipGroup, Season, Universe
+from timeline_hub.services.clip_store import ClipGroup, Season, SubSeason, Universe
 from timeline_hub.services.message_buffer import MessageGroup
 from timeline_hub.settings import Settings
 
@@ -14,6 +14,7 @@ from timeline_hub.settings import Settings
 @dataclass(slots=True)
 class RouteBatch:
     clip_group: ClipGroup
+    sub_season: SubSeason
     messages: list[Message]
 
 
@@ -23,7 +24,7 @@ def plan_route_batches(
     settings: Settings,
 ) -> tuple[list[RouteBatch], str | None]:
     batches: list[RouteBatch] = []
-    current_route: ClipGroup | None = None
+    current_route: tuple[ClipGroup, SubSeason] | None = None
     today = date.today()
     allowed_years = set(
         year_option_universe(
@@ -63,8 +64,15 @@ def plan_route_batches(
                 if next_route is None:
                     return [], 'Invalid route text'
 
-            if not batches or batches[-1].clip_group != next_route:
-                batches.append(RouteBatch(clip_group=next_route, messages=[message]))
+            next_group, next_sub_season = next_route
+            if not batches or batches[-1].clip_group != next_group or batches[-1].sub_season != next_sub_season:
+                batches.append(
+                    RouteBatch(
+                        clip_group=next_group,
+                        sub_season=next_sub_season,
+                        messages=[message],
+                    )
+                )
             else:
                 batches[-1].messages.append(message)
             current_route = next_route
@@ -72,14 +80,23 @@ def plan_route_batches(
     return batches, None
 
 
-def parse_route_text(text: str) -> ClipGroup | None:
+def parse_route_text(text: str) -> tuple[ClipGroup, SubSeason] | None:
     normalized = text.strip()
-    if len(normalized) != 4:
+    if len(normalized) < 3:
         return None
 
-    universe_text = normalized[0].lower()
-    year_suffix = normalized[1:3]
-    season_text = normalized[3]
+    universe = Universe.WEST
+    route_text = normalized
+    if normalized[0].lower() in {'w', 'e'}:
+        universe = Universe.WEST if normalized[0].lower() == 'w' else Universe.EAST
+        route_text = normalized[1:]
+
+    if len(route_text) not in {3, 4}:
+        return None
+
+    year_suffix = route_text[0:2]
+    season_text = route_text[2]
+    suffix_text = route_text[3:] if len(route_text) == 4 else ''
 
     if not year_suffix.isdigit() or not season_text.isdigit():
         return None
@@ -89,14 +106,16 @@ def parse_route_text(text: str) -> ClipGroup | None:
     except ValueError:
         return None
 
-    if universe_text == 'w':
-        universe = Universe.WEST
-    elif universe_text == 'e':
-        universe = Universe.EAST
-    else:
-        return None
+    sub_season = SubSeason.NONE
+    if suffix_text:
+        if len(suffix_text) != 1:
+            return None
+        suffix = suffix_text.lower()
+        if suffix not in {'a', 'b', 'c', 'd'}:
+            return None
+        sub_season = SubSeason(suffix.upper())
 
-    return ClipGroup(universe=universe, year=2000 + int(year_suffix), season=season)
+    return ClipGroup(universe=universe, year=2000 + int(year_suffix), season=season), sub_season
 
 
 def _parse_and_validate_route(
@@ -104,12 +123,13 @@ def _parse_and_validate_route(
     *,
     today: date,
     allowed_years: set[int],
-) -> ClipGroup | None:
+) -> tuple[ClipGroup, SubSeason] | None:
     parsed_route = parse_route_text(text)
     if parsed_route is None:
         return None
-    if parsed_route.year not in allowed_years:
+    parsed_group, _sub_season = parsed_route
+    if parsed_group.year not in allowed_years:
         return None
-    if parsed_route.season not in store_allowed_seasons(year=parsed_route.year, today=today):
+    if parsed_group.season not in store_allowed_seasons(year=parsed_group.year, today=today):
         return None
     return parsed_route

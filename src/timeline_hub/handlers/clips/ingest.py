@@ -132,7 +132,7 @@ class IntakeCallbackData(CallbackData, prefix='clip_intake'):
 class _RouteResult:
     selection_groups: list[ClipGroup]
     store_result: StoreResult
-    compact_groups: list[ClipGroup]
+    compact_targets: list[tuple[ClipGroup, SubSeason]]
     error_text: str | None = None
 
 
@@ -427,9 +427,9 @@ async def on_intake_action(
 
             await message.edit_text('Routing...', reply_markup=None)
 
-            async def update_route_progress(selection_groups: Sequence[ClipGroup]) -> None:
+            async def update_route_progress(selection_batches: Sequence[RouteBatch]) -> None:
                 await message.edit_text(
-                    **_route_progress_kwargs(selection_groups),
+                    **_route_progress_kwargs(selection_batches),
                     reply_markup=None,
                 )
 
@@ -445,18 +445,18 @@ async def on_intake_action(
                 return
             await message.answer(**store_summary_kwargs(route_result.store_result))
 
-            for clip_group in route_result.compact_groups:
+            for clip_group, sub_season in route_result.compact_targets:
                 try:
                     await services.clip_store.compact(
                         clip_group,
-                        ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.SOURCE),
+                        ClipSubGroup(sub_season=sub_season, scope=Scope.SOURCE),
                         batch_size=_TELEGRAM_MEDIA_GROUP_LIMIT,
                     )
                 except Exception:
                     logger.exception(
                         'post-store clip compaction failed for {} {}',
                         clip_group,
-                        ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.SOURCE),
+                        ClipSubGroup(sub_season=sub_season, scope=Scope.SOURCE),
                     )
                     raise
 
@@ -1151,13 +1151,13 @@ async def _store_route_batches(
     bot: Bot,
     services: Services,
     route_batches: Sequence[RouteBatch],
-    on_batch_stored: Callable[[Sequence[ClipGroup]], Awaitable[None]] | None = None,
+    on_batch_stored: Callable[[Sequence[RouteBatch]], Awaitable[None]] | None = None,
 ) -> _RouteResult:
     result = StoreResult(stored_count=0, duplicate_count=0)
-    compact_groups: list[ClipGroup] = []
-    compact_group_set: set[ClipGroup] = set()
+    compact_targets: list[tuple[ClipGroup, SubSeason]] = []
+    compact_target_set: set[tuple[ClipGroup, SubSeason]] = set()
+    completed_route_batches: list[RouteBatch] = []
     selection_groups: list[ClipGroup] = []
-    clip_sub_group = ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.SOURCE)
 
     for route_batch in route_batches:
         stored_any = False
@@ -1166,7 +1166,7 @@ async def _store_route_batches(
             try:
                 batch_result = await services.clip_store.store(
                     route_batch.clip_group,
-                    clip_sub_group,
+                    ClipSubGroup(sub_season=route_batch.sub_season, scope=Scope.SOURCE),
                     clips=await _clip_messages_to_clip_files(
                         bot=bot,
                         messages=batch_messages,
@@ -1177,6 +1177,7 @@ async def _store_route_batches(
                     error=error,
                     chat_id=batch_messages[0].chat.id,
                     clip_group=route_batch.clip_group,
+                    sub_season=route_batch.sub_season,
                     messages=batch_messages,
                 )
                 raise
@@ -1184,17 +1185,19 @@ async def _store_route_batches(
             if batch_result.stored_count > 0:
                 stored_any = True
 
+        completed_route_batches.append(route_batch)
         selection_groups.append(route_batch.clip_group)
         if on_batch_stored is not None:
-            await on_batch_stored(selection_groups)
-        if stored_any and route_batch.clip_group not in compact_group_set:
-            compact_groups.append(route_batch.clip_group)
-            compact_group_set.add(route_batch.clip_group)
+            await on_batch_stored(completed_route_batches)
+        compact_target = (route_batch.clip_group, route_batch.sub_season)
+        if stored_any and compact_target not in compact_target_set:
+            compact_targets.append(compact_target)
+            compact_target_set.add(compact_target)
 
     return _RouteResult(
         selection_groups=selection_groups,
         store_result=result,
-        compact_groups=compact_groups,
+        compact_targets=compact_targets,
     )
 
 
@@ -1292,8 +1295,13 @@ def _log_route_unsupported_codec_warning(
     error: UnsupportedVideoCodecError,
     chat_id: ChatId,
     clip_group: ClipGroup,
+    sub_season: SubSeason,
     messages: Sequence[Message],
 ) -> None:
+    route_target = (
+        clip_group,
+        ClipSubGroup(sub_season=sub_season, scope=Scope.SOURCE),
+    )
     logger.warning(
         (
             'unsupported clip codec during route execution '
@@ -1305,7 +1313,7 @@ def _log_route_unsupported_codec_warning(
         [message.message_id for message in messages],
         [file_id for message in messages if (file_id := extract_clip_file_id(message)) is not None],
         [_route_message_filename(message) for message in messages if _route_message_filename(message) is not None],
-        clip_group,
+        route_target,
     )
 
 
@@ -1427,18 +1435,19 @@ async def try_dispatch_clip_intake(
     return True
 
 
-def _route_progress_kwargs(route_groups: Sequence[ClipGroup]) -> dict[str, Any]:
+def _route_progress_kwargs(route_batches: Sequence[RouteBatch]) -> dict[str, Any]:
     parts: list[object] = ['Routing...']
 
-    for clip_group in route_groups:
+    for route_batch in route_batches:
         parts.extend(
             [
                 '\n',
                 _route_progress_line(
                     selection_labels(
-                        universe=clip_group.universe,
-                        year=clip_group.year,
-                        season=clip_group.season,
+                        universe=route_batch.clip_group.universe,
+                        year=route_batch.clip_group.year,
+                        season=route_batch.clip_group.season,
+                        sub_season=route_batch.sub_season,
                         scope=Scope.SOURCE,
                     )
                 ),

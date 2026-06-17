@@ -806,15 +806,75 @@ def test_reconcile_summary_omits_zero_value_lines(
 @pytest.mark.parametrize(
     ('text', 'expected'),
     [
-        ('W242', ClipGroup(universe=Universe.WEST, year=2024, season=Season.S2)),
-        ('e215', ClipGroup(universe=Universe.EAST, year=2021, season=Season.S5)),
+        (
+            'W242',
+            (ClipGroup(universe=Universe.WEST, year=2024, season=Season.S2), SubSeason.NONE),
+        ),
+        (
+            'e215',
+            (ClipGroup(universe=Universe.EAST, year=2021, season=Season.S5), SubSeason.NONE),
+        ),
+        (
+            'w255',
+            (ClipGroup(universe=Universe.WEST, year=2025, season=Season.S5), SubSeason.NONE),
+        ),
+        (
+            'e255',
+            (ClipGroup(universe=Universe.EAST, year=2025, season=Season.S5), SubSeason.NONE),
+        ),
+        (
+            '255',
+            (ClipGroup(universe=Universe.WEST, year=2025, season=Season.S5), SubSeason.NONE),
+        ),
+        (
+            '255a',
+            (ClipGroup(universe=Universe.WEST, year=2025, season=Season.S5), SubSeason.A),
+        ),
+        (
+            '255b',
+            (ClipGroup(universe=Universe.WEST, year=2025, season=Season.S5), SubSeason.B),
+        ),
+        (
+            '255c',
+            (ClipGroup(universe=Universe.WEST, year=2025, season=Season.S5), SubSeason.C),
+        ),
+        (
+            '255d',
+            (ClipGroup(universe=Universe.WEST, year=2025, season=Season.S5), SubSeason.D),
+        ),
+        (
+            'w255a',
+            (ClipGroup(universe=Universe.WEST, year=2025, season=Season.S5), SubSeason.A),
+        ),
+        (
+            'e255a',
+            (ClipGroup(universe=Universe.EAST, year=2025, season=Season.S5), SubSeason.A),
+        ),
     ],
 )
 def test_parse_route_text_accepts_case_insensitive_universe(
     text: str,
-    expected: ClipGroup,
+    expected: tuple[ClipGroup, SubSeason],
 ) -> None:
     assert parse_route_text(text) == expected
+
+
+@pytest.mark.parametrize(
+    'text',
+    [
+        '255e',
+        '255f',
+        '255aa',
+        'w255e',
+        'e2551',
+        'w255-',
+        '255?',
+        'w25',
+        '25510',
+    ],
+)
+def test_parse_route_text_rejects_invalid_suffixes(text: str) -> None:
+    assert parse_route_text(text) is None
 
 
 @pytest.mark.asyncio
@@ -13192,8 +13252,99 @@ async def test_route_action_replaces_progress_message_for_unsupported_codec(
         [1],
         ['f1'],
         ['one.mp4'],
-        ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1),
+        (
+            ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1),
+            ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.SOURCE),
+        ),
     )
+
+
+@pytest.mark.asyncio
+async def test_route_action_batches_bare_and_suffixed_routes_separately() -> None:
+    message = _fake_message(text='Select action:', chat_id=77, message_id=71)
+    callback = _fake_callback(message)
+    state = _FakeState()
+    buffer = ChatMessageBuffer()
+    buffer.append(_fake_message(chat_id=77, message_id=1, text='255'), chat_id=77)
+    buffer.append(
+        _fake_message(chat_id=77, message_id=2, video=_fake_video(file_id='f1', file_name='one.mp4')),
+        chat_id=77,
+    )
+    buffer.append(_fake_message(chat_id=77, message_id=3, text='255a'), chat_id=77)
+    buffer.append(
+        _fake_message(chat_id=77, message_id=4, video=_fake_video(file_id='f2', file_name='two.mp4')),
+        chat_id=77,
+    )
+
+    clip_store = SimpleNamespace(
+        store=AsyncMock(
+            side_effect=[
+                StoreResult(stored_count=1, duplicate_count=0),
+                StoreResult(stored_count=1, duplicate_count=0),
+            ]
+        ),
+        compact=AsyncMock(),
+    )
+    services = _services(clip_store=clip_store, buffer=buffer)
+
+    bot = AsyncMock()
+    bot.get_file.side_effect = [
+        SimpleNamespace(file_path='path-1'),
+        SimpleNamespace(file_path='path-2'),
+    ]
+    bot.download_file.side_effect = [BytesIO(b'one'), BytesIO(b'two')]
+
+    await on_intake_action(
+        callback,
+        SimpleNamespace(action=IntakeAction.ROUTE),
+        bot,
+        services,
+        _settings(),
+        state,
+    )
+
+    assert clip_store.store.await_count == 2
+    assert clip_store.store.await_args_list[0].args[0] == ClipGroup(
+        universe=Universe.WEST,
+        year=2025,
+        season=Season.S5,
+    )
+    assert clip_store.store.await_args_list[0].args[1] == ClipSubGroup(
+        sub_season=SubSeason.NONE,
+        scope=Scope.SOURCE,
+    )
+    assert clip_store.store.await_args_list[1].args[0] == ClipGroup(
+        universe=Universe.WEST,
+        year=2025,
+        season=Season.S5,
+    )
+    assert clip_store.store.await_args_list[1].args[1] == ClipSubGroup(
+        sub_season=SubSeason.A,
+        scope=Scope.SOURCE,
+    )
+    assert message.edit_text.await_args_list[0] == call('Routing...', reply_markup=None)
+    _assert_route_progress_edit(
+        message.edit_text.await_args_list[1],
+        ('West', '2025', '5', 'Source'),
+    )
+    _assert_route_progress_edit(
+        message.edit_text.await_args_list[2],
+        ('West', '2025', '5', 'Source'),
+        ('West', '2025', '5', 'A', 'Source'),
+    )
+    assert clip_store.compact.await_args_list == [
+        call(
+            ClipGroup(universe=Universe.WEST, year=2025, season=Season.S5),
+            ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.SOURCE),
+            batch_size=intake_module._TELEGRAM_MEDIA_GROUP_LIMIT,
+        ),
+        call(
+            ClipGroup(universe=Universe.WEST, year=2025, season=Season.S5),
+            ClipSubGroup(sub_season=SubSeason.A, scope=Scope.SOURCE),
+            batch_size=intake_module._TELEGRAM_MEDIA_GROUP_LIMIT,
+        ),
+    ]
+    assert services.chat_message_buffer.peek_raw(77) == []
 
 
 @pytest.mark.asyncio
