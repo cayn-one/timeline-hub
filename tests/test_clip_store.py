@@ -45,6 +45,7 @@ _HASH_B = 'b' * 64
 _HASH_C = 'c' * 64
 _HASH_D = 'd' * 64
 _HASH_E = 'e' * 64
+_CLIP_NAMESPACE = 'clips'
 
 
 def test_store_result_adds_counts() -> None:
@@ -200,11 +201,11 @@ class _FakeS3Client:
 
 
 def _clip_key(*, year: int, season: Season, universe: Universe, clip_id: str) -> str:
-    return S3Client.join('clips', f'{universe}-{year}-{season}', clip_id + Extension.MP4.suffix)
+    return S3Client.join(_CLIP_NAMESPACE, f'{universe}-{year}-{season}', clip_id + Extension.MP4.suffix)
 
 
 def _manifest_key(*, year: int, season: Season, universe: Universe) -> str:
-    return S3Client.join('clips', f'{universe}-{year}-{season}', 'manifest.json')
+    return S3Client.join(_CLIP_NAMESPACE, f'{universe}-{year}-{season}', 'manifest.json')
 
 
 def _manifest_bytes(entries: list[ManifestEntry]) -> bytes:
@@ -216,7 +217,7 @@ def _manifest_payload(entries: list[ManifestEntry]) -> dict[str, list[dict[str, 
 
 
 def _normalized_clip_key(*, year: int, season: Season, universe: Universe, clip_id: str) -> str:
-    return S3Client.join('clips', f'{universe}-{year}-{season}', clip_id + '-normalized' + Extension.MP4.suffix)
+    return S3Client.join(_CLIP_NAMESPACE, f'{universe}-{year}-{season}', clip_id + '-normalized' + Extension.MP4.suffix)
 
 
 def _patch_hashes(monkeypatch: pytest.MonkeyPatch, hashes: dict[bytes, str]) -> None:
@@ -233,6 +234,10 @@ def _patch_uuid7(monkeypatch: pytest.MonkeyPatch, *clip_ids: str) -> None:
 
 def _mp4_file(data: bytes) -> FileBytes:
     return FileBytes(data=data, extension=Extension.MP4)
+
+
+def _store(s3_client: _FakeS3Client) -> ClipStore:
+    return ClipStore(s3_client, namespace=_CLIP_NAMESPACE)
 
 
 def test_extension_mp4_supports_string_and_filename_parsing() -> None:
@@ -421,7 +426,7 @@ async def test_fetch_returns_grouped_clips_with_portable_filenames(
             clip_key_4: b'batch-2-second',
         }
     )
-    store = ClipStore(s3_client)
+    store = _store(s3_client)
 
     async def _unexpected_normalize(video_bytes: bytes, *, loudness: float, bitrate: int) -> bytes:
         raise AssertionError('raw fetch must not normalize audio')
@@ -467,7 +472,7 @@ async def test_fetch_raw_preserves_manifest_order_with_concurrent_reads() -> Non
             await asyncio.sleep(delay_by_key.get(key, 0.0))
             return await super().get_bytes(key)
 
-    store = ClipStore(
+    store = _store(
         _DelayedGetS3Client(
             {
                 manifest_key: _manifest_bytes(
@@ -581,7 +586,7 @@ async def test_fetch_with_audio_normalization_generates_normalized_twins_and_upd
             clip_key_4: b'batch-2-second',
         }
     )
-    store = ClipStore(s3_client)
+    store = _store(s3_client)
     calls: list[tuple[bytes, float, int]] = []
 
     async def _fake_normalize(video_bytes: bytes, *, loudness: float, bitrate: int) -> bytes:
@@ -710,7 +715,7 @@ async def test_fetch_with_same_audio_normalization_reuses_existing_normalized_tw
             normalized_key_2: b'normalized-second',
         }
     )
-    store = ClipStore(s3_client)
+    store = _store(s3_client)
 
     async def _unexpected_normalize(video_bytes: bytes, *, loudness: float, bitrate: int) -> bytes:
         raise AssertionError('existing normalized twins should be reused')
@@ -777,7 +782,7 @@ async def test_fetch_with_changed_audio_normalization_overwrites_stable_normaliz
             normalized_key_2: b'old-normalized-second',
         }
     )
-    store = ClipStore(s3_client)
+    store = _store(s3_client)
     calls: list[tuple[bytes, float, int]] = []
 
     async def _fake_normalize(video_bytes: bytes, *, loudness: float, bitrate: int) -> bytes:
@@ -872,7 +877,7 @@ async def test_fetch_audio_normalization_runs_sequentially(monkeypatch: pytest.M
             clip_key_3: b'three',
         }
     )
-    store = ClipStore(s3_client)
+    store = _store(s3_client)
     active_calls = 0
     max_active_calls = 0
     call_order: list[bytes] = []
@@ -937,7 +942,7 @@ async def test_fetch_raises_explicit_error_when_manifest_write_fails_after_norma
         },
         put_failures={manifest_key},
     )
-    store = ClipStore(s3_client)
+    store = _store(s3_client)
 
     async def _fake_normalize(video_bytes: bytes, *, loudness: float, bitrate: int) -> bytes:
         return b'n:' + video_bytes
@@ -998,7 +1003,7 @@ async def test_fetch_raises_explicit_error_when_normalized_write_path_fails_befo
         },
         put_failures={normalized_key_2},
     )
-    store = ClipStore(s3_client)
+    store = _store(s3_client)
 
     async def _fake_normalize(video_bytes: bytes, *, loudness: float, bitrate: int) -> bytes:
         return b'n:' + video_bytes
@@ -1049,7 +1054,7 @@ async def test_fetch_regenerates_missing_normalized_twin_when_manifest_says_it_e
             clip_key_1: b'raw-first',
         }
     )
-    store = ClipStore(s3_client)
+    store = _store(s3_client)
     calls: list[tuple[bytes, float, int]] = []
 
     async def _fake_normalize(video_bytes: bytes, *, loudness: float, bitrate: int) -> bytes:
@@ -1092,7 +1097,7 @@ async def test_fetch_with_clip_ids_returns_only_requested_sub_group_subset_in_ma
     clip_key_2 = _clip_key(year=2024, season=Season.S1, universe=Universe.WEST, clip_id=_UUID_2)
     clip_key_3 = _clip_key(year=2024, season=Season.S1, universe=Universe.WEST, clip_id=_UUID_3)
     clip_key_4 = _clip_key(year=2024, season=Season.S1, universe=Universe.WEST, clip_id=_UUID_4)
-    store = ClipStore(
+    store = _store(
         _FakeS3Client(
             {
                 manifest_key: _manifest_bytes(
@@ -1157,7 +1162,7 @@ async def test_fetch_with_clip_ids_returns_only_requested_sub_group_subset_in_ma
 @pytest.mark.asyncio
 async def test_fetch_with_duplicate_clip_ids_raises() -> None:
     manifest_key = _manifest_key(year=2024, season=Season.S1, universe=Universe.WEST)
-    store = ClipStore(
+    store = _store(
         _FakeS3Client(
             {
                 manifest_key: _manifest_bytes(
@@ -1190,7 +1195,7 @@ async def test_fetch_with_duplicate_clip_ids_raises() -> None:
 @pytest.mark.asyncio
 async def test_fetch_with_unknown_clip_ids_raises() -> None:
     manifest_key = _manifest_key(year=2024, season=Season.S1, universe=Universe.WEST)
-    store = ClipStore(
+    store = _store(
         _FakeS3Client(
             {
                 manifest_key: _manifest_bytes(
@@ -1223,7 +1228,7 @@ async def test_fetch_with_unknown_clip_ids_raises() -> None:
 @pytest.mark.asyncio
 async def test_fetch_with_clip_ids_from_other_sub_group_raises() -> None:
     manifest_key = _manifest_key(year=2024, season=Season.S1, universe=Universe.WEST)
-    store = ClipStore(
+    store = _store(
         _FakeS3Client(
             {
                 manifest_key: _manifest_bytes(
@@ -1263,7 +1268,7 @@ async def test_fetch_with_clip_ids_from_other_sub_group_raises() -> None:
 
 @pytest.mark.asyncio
 async def test_fetch_fails_with_empty_sub_group_fields_when_group_is_missing() -> None:
-    store = ClipStore(_FakeS3Client())
+    store = _store(_FakeS3Client())
 
     with pytest.raises(ClipGroupNotFoundError) as excinfo:
         [
@@ -1284,7 +1289,7 @@ async def test_fetch_fails_with_empty_sub_group_fields_when_group_is_missing() -
 @pytest.mark.asyncio
 async def test_fetch_fails_with_requested_sub_group_fields_when_sub_group_is_missing() -> None:
     manifest_key = _manifest_key(year=2024, season=Season.S1, universe=Universe.WEST)
-    store = ClipStore(
+    store = _store(
         _FakeS3Client(
             {
                 manifest_key: _manifest_bytes(
@@ -1321,7 +1326,7 @@ async def test_fetch_fails_with_requested_sub_group_fields_when_sub_group_is_mis
 
 @pytest.mark.asyncio
 async def test_list_groups_returns_parsed_groups() -> None:
-    store = ClipStore(
+    store = _store(
         _FakeS3Client(
             prefixes=[
                 'clips/west-2024-1/',
@@ -1338,7 +1343,7 @@ async def test_list_groups_returns_parsed_groups() -> None:
 
 @pytest.mark.asyncio
 async def test_list_groups_returns_sorted_groups() -> None:
-    store = ClipStore(
+    store = _store(
         _FakeS3Client(
             prefixes=[
                 'clips/west-2025-2',
@@ -1359,7 +1364,7 @@ async def test_list_groups_returns_sorted_groups() -> None:
 
 @pytest.mark.asyncio
 async def test_list_groups_fails_on_malformed_prefix() -> None:
-    store = ClipStore(_FakeS3Client(prefixes=['clips/west-2024-1/extra']))
+    store = _store(_FakeS3Client(prefixes=['clips/west-2024-1/extra']))
 
     with pytest.raises(ValueError, match=r"'clips/west-2024-1/extra'"):
         await store.list_groups()
@@ -1368,7 +1373,7 @@ async def test_list_groups_fails_on_malformed_prefix() -> None:
 @pytest.mark.asyncio
 async def test_list_clips_returns_unique_sub_groups_as_keys() -> None:
     manifest_key = _manifest_key(year=2024, season=Season.S1, universe=Universe.WEST)
-    store = ClipStore(
+    store = _store(
         _FakeS3Client(
             {
                 manifest_key: _manifest_bytes(
@@ -1421,7 +1426,7 @@ async def test_list_clips_returns_unique_sub_groups_as_keys() -> None:
 @pytest.mark.asyncio
 async def test_list_clips_returns_sorted_sub_groups() -> None:
     manifest_key = _manifest_key(year=2024, season=Season.S1, universe=Universe.WEST)
-    store = ClipStore(
+    store = _store(
         _FakeS3Client(
             {
                 manifest_key: _manifest_bytes(
@@ -1468,7 +1473,7 @@ async def test_list_clips_returns_sorted_sub_groups() -> None:
 @pytest.mark.asyncio
 async def test_list_clips_returns_batches_sorted_within_sub_group() -> None:
     manifest_key = _manifest_key(year=2024, season=Season.S1, universe=Universe.WEST)
-    store = ClipStore(
+    store = _store(
         _FakeS3Client(
             {
                 manifest_key: _manifest_bytes(
@@ -1527,7 +1532,7 @@ async def test_list_clips_returns_batches_sorted_within_sub_group() -> None:
 
 @pytest.mark.asyncio
 async def test_list_clips_fails_on_missing_manifest() -> None:
-    store = ClipStore(_FakeS3Client())
+    store = _store(_FakeS3Client())
 
     with pytest.raises(ClipGroupNotFoundError) as excinfo:
         await store.list_clips(ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1))
@@ -1542,7 +1547,7 @@ async def test_list_clips_fails_on_missing_manifest() -> None:
 @pytest.mark.asyncio
 async def test_list_clips_fails_on_corrupted_manifest() -> None:
     manifest_key = _manifest_key(year=2024, season=Season.S1, universe=Universe.WEST)
-    store = ClipStore(_FakeS3Client({manifest_key: b'{"clips": []}'}))
+    store = _store(_FakeS3Client({manifest_key: b'{"clips": []}'}))
 
     with pytest.raises(ManifestCorruptedError):
         await store.list_clips(ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1))
@@ -1568,7 +1573,7 @@ async def test_store_treats_existing_video_hash_as_duplicate(monkeypatch: pytest
             )
         }
     )
-    store = ClipStore(s3_client)
+    store = _store(s3_client)
 
     result = await store.store(
         ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1),
@@ -1583,7 +1588,7 @@ async def test_store_treats_existing_video_hash_as_duplicate(monkeypatch: pytest
 
 @pytest.mark.asyncio
 async def test_store_rejects_non_mp4_filebytes() -> None:
-    store = ClipStore(_FakeS3Client())
+    store = _store(_FakeS3Client())
 
     with pytest.raises(InvalidExtensionError, match='clips entries must use Extension.MP4'):
         await store.store(
@@ -1601,7 +1606,7 @@ async def test_store_generates_new_ids_for_same_call_distinct_hashes(
     _patch_uuid7(monkeypatch, _UUID_4, _UUID_2)
     target_manifest_key = _manifest_key(year=2024, season=Season.S1, universe=Universe.EAST)
     s3_client = _FakeS3Client()
-    store = ClipStore(s3_client)
+    store = _store(s3_client)
 
     result = await store.store(
         ClipGroup(universe=Universe.EAST, year=2024, season=Season.S1),
@@ -1645,7 +1650,7 @@ async def test_store_deduplicates_same_call_by_video_hash_and_keeps_dense_order(
     _patch_uuid7(monkeypatch, _UUID_4, _UUID_5)
     manifest_key = _manifest_key(year=2024, season=Season.S1, universe=Universe.WEST)
     s3_client = _FakeS3Client()
-    store = ClipStore(s3_client)
+    store = _store(s3_client)
 
     result = await store.store(
         ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1),
@@ -1697,7 +1702,7 @@ async def test_store_creates_new_batch_per_call_and_resets_order(monkeypatch: py
     _patch_uuid7(monkeypatch, _UUID_1, _UUID_2, _UUID_3)
     manifest_key = _manifest_key(year=2024, season=Season.S1, universe=Universe.WEST)
     s3_client = _FakeS3Client()
-    store = ClipStore(s3_client)
+    store = _store(s3_client)
     clip_group = ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1)
     clip_sub_group = ClipSubGroup(sub_season=SubSeason.A, scope=Scope.COLLECTION)
 
@@ -1770,7 +1775,7 @@ async def test_store_all_duplicates_do_not_create_new_batch(monkeypatch: pytest.
         )
     ]
     s3_client = _FakeS3Client({manifest_key: _manifest_bytes(original_manifest)})
-    store = ClipStore(s3_client)
+    store = _store(s3_client)
 
     result = await store.store(
         ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1),
@@ -1807,7 +1812,7 @@ async def test_store_propagates_first_clip_upload_failure_without_sync_error(
         {manifest_key: _manifest_bytes(original_manifest)},
         put_failures={clip_key},
     )
-    store = ClipStore(s3_client)
+    store = _store(s3_client)
     clip_group_prefix = store._clip_group_prefix(
         universe=clip_group.universe,
         year=clip_group.year,
@@ -1852,7 +1857,7 @@ async def test_store_raises_sync_error_when_later_clip_upload_fails(
         {manifest_key: _manifest_bytes(original_manifest)},
         put_failures={second_clip_key},
     )
-    store = ClipStore(s3_client)
+    store = _store(s3_client)
     clip_group_prefix = store._clip_group_prefix(
         universe=clip_group.universe,
         year=clip_group.year,
@@ -1898,7 +1903,7 @@ async def test_store_raises_sync_error_with_concurrent_partial_success_in_input_
     second_clip_key = _clip_key(year=2024, season=Season.S1, universe=Universe.WEST, clip_id=_UUID_3)
     third_clip_key = _clip_key(year=2024, season=Season.S1, universe=Universe.WEST, clip_id=_UUID_4)
     s3_client = _FakeS3Client(put_failures={second_clip_key})
-    store = ClipStore(s3_client)
+    store = _store(s3_client)
 
     with pytest.raises(ClipManifestSyncError, match='Staged clip store failed at clip_upload') as excinfo:
         await store.store(
@@ -1944,7 +1949,7 @@ async def test_store_treats_cancelled_upload_result_as_failure(
             await super().put_bytes(key, data, content_type=content_type)
 
     s3_client = _CancelledPutS3Client()
-    store = ClipStore(s3_client)
+    store = _store(s3_client)
 
     with pytest.raises(ClipManifestSyncError, match='Staged clip store failed at clip_upload') as excinfo:
         await store.store(
@@ -1980,7 +1985,7 @@ async def test_store_raises_first_exception_when_all_concurrent_uploads_fail(
     first_clip_key = _clip_key(year=2024, season=Season.S1, universe=Universe.WEST, clip_id=_UUID_2)
     second_clip_key = _clip_key(year=2024, season=Season.S1, universe=Universe.WEST, clip_id=_UUID_3)
     s3_client = _FakeS3Client(put_failures={first_clip_key, second_clip_key})
-    store = ClipStore(s3_client)
+    store = _store(s3_client)
 
     with pytest.raises(RuntimeError, match=f'boom putting {first_clip_key}'):
         await store.store(
@@ -2004,7 +2009,7 @@ async def test_store_uploads_all_clips_successfully_with_concurrent_uploads(
     _patch_uuid7(monkeypatch, _UUID_1, _UUID_2, _UUID_3)
     manifest_key = _manifest_key(year=2024, season=Season.S1, universe=Universe.WEST)
     s3_client = _FakeS3Client()
-    store = ClipStore(s3_client)
+    store = _store(s3_client)
 
     result = await store.store(
         ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1),
@@ -2076,7 +2081,7 @@ async def test_store_raises_sync_error_when_manifest_write_fails(
         {manifest_key: _manifest_bytes(original_manifest)},
         put_failures={manifest_key},
     )
-    store = ClipStore(s3_client)
+    store = _store(s3_client)
     clip_group_prefix = store._clip_group_prefix(
         universe=clip_group.universe,
         year=clip_group.year,
@@ -2148,7 +2153,7 @@ async def test_reorder_rewrites_only_target_sub_group_batches() -> None:
             clip_key_3: b'three',
         }
     )
-    store = ClipStore(s3_client)
+    store = _store(s3_client)
 
     await store.reorder(
         ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1),
@@ -2190,7 +2195,7 @@ async def test_reorder_rewrites_only_target_sub_group_batches() -> None:
 
 @pytest.mark.asyncio
 async def test_reorder_rejects_empty_clip_id_batches() -> None:
-    store = ClipStore(_FakeS3Client())
+    store = _store(_FakeS3Client())
 
     with pytest.raises(ValueError, match='reorder\\(\\) clip_id_batches must not contain empty batches'):
         await store.reorder(
@@ -2202,7 +2207,7 @@ async def test_reorder_rejects_empty_clip_id_batches() -> None:
 
 @pytest.mark.asyncio
 async def test_reorder_rejects_empty_inner_batch_before_duplicates() -> None:
-    store = ClipStore(_FakeS3Client())
+    store = _store(_FakeS3Client())
 
     with pytest.raises(ValueError, match='reorder\\(\\) clip_id_batches must not contain empty batches'):
         await store.reorder(
@@ -2215,7 +2220,7 @@ async def test_reorder_rejects_empty_inner_batch_before_duplicates() -> None:
 @pytest.mark.asyncio
 async def test_reorder_rejects_duplicate_clip_ids() -> None:
     manifest_key = _manifest_key(year=2024, season=Season.S1, universe=Universe.WEST)
-    store = ClipStore(
+    store = _store(
         _FakeS3Client(
             {
                 manifest_key: _manifest_bytes(
@@ -2245,7 +2250,7 @@ async def test_reorder_rejects_duplicate_clip_ids() -> None:
 @pytest.mark.asyncio
 async def test_reorder_rejects_unknown_clip_ids() -> None:
     manifest_key = _manifest_key(year=2024, season=Season.S1, universe=Universe.WEST)
-    store = ClipStore(
+    store = _store(
         _FakeS3Client(
             {
                 manifest_key: _manifest_bytes(
@@ -2275,7 +2280,7 @@ async def test_reorder_rejects_unknown_clip_ids() -> None:
 @pytest.mark.asyncio
 async def test_reorder_rejects_clip_ids_outside_target_sub_group() -> None:
     manifest_key = _manifest_key(year=2024, season=Season.S1, universe=Universe.WEST)
-    store = ClipStore(
+    store = _store(
         _FakeS3Client(
             {
                 manifest_key: _manifest_bytes(
@@ -2313,7 +2318,7 @@ async def test_reorder_rejects_clip_ids_outside_target_sub_group() -> None:
 @pytest.mark.asyncio
 async def test_reorder_rejects_non_exact_target_sub_group_coverage() -> None:
     manifest_key = _manifest_key(year=2024, season=Season.S1, universe=Universe.WEST)
-    store = ClipStore(
+    store = _store(
         _FakeS3Client(
             {
                 manifest_key: _manifest_bytes(
@@ -2412,7 +2417,7 @@ async def test_move_appends_batches_and_compacts_source_sub_groups() -> None:
             clip_key_5: b'five',
         }
     )
-    store = ClipStore(s3_client)
+    store = _store(s3_client)
 
     await store.move(
         ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1),
@@ -2470,7 +2475,7 @@ async def test_move_appends_batches_and_compacts_source_sub_groups() -> None:
 
 @pytest.mark.asyncio
 async def test_move_rejects_empty_clip_id_batches() -> None:
-    store = ClipStore(_FakeS3Client())
+    store = _store(_FakeS3Client())
 
     with pytest.raises(ValueError, match='move\\(\\) clip_id_batches must not contain empty batches'):
         await store.move(
@@ -2482,7 +2487,7 @@ async def test_move_rejects_empty_clip_id_batches() -> None:
 
 @pytest.mark.asyncio
 async def test_move_rejects_empty_inner_batch_before_duplicates() -> None:
-    store = ClipStore(_FakeS3Client())
+    store = _store(_FakeS3Client())
 
     with pytest.raises(ValueError, match='move\\(\\) clip_id_batches must not contain empty batches'):
         await store.move(
@@ -2495,7 +2500,7 @@ async def test_move_rejects_empty_inner_batch_before_duplicates() -> None:
 @pytest.mark.asyncio
 async def test_move_rejects_duplicate_clip_ids() -> None:
     manifest_key = _manifest_key(year=2024, season=Season.S1, universe=Universe.WEST)
-    store = ClipStore(
+    store = _store(
         _FakeS3Client(
             {
                 manifest_key: _manifest_bytes(
@@ -2525,7 +2530,7 @@ async def test_move_rejects_duplicate_clip_ids() -> None:
 @pytest.mark.asyncio
 async def test_move_rejects_unknown_clip_ids() -> None:
     manifest_key = _manifest_key(year=2024, season=Season.S1, universe=Universe.WEST)
-    store = ClipStore(_FakeS3Client({manifest_key: _manifest_bytes([])}))
+    store = _store(_FakeS3Client({manifest_key: _manifest_bytes([])}))
 
     with pytest.raises(UnknownClipsError, match=_UUID_4):
         await store.move(
@@ -2538,7 +2543,7 @@ async def test_move_rejects_unknown_clip_ids() -> None:
 @pytest.mark.asyncio
 async def test_move_rejects_clip_ids_already_in_target_sub_group() -> None:
     manifest_key = _manifest_key(year=2024, season=Season.S1, universe=Universe.WEST)
-    store = ClipStore(
+    store = _store(
         _FakeS3Client(
             {
                 manifest_key: _manifest_bytes(
@@ -2631,7 +2636,7 @@ async def test_remove_deletes_authoritative_objects_and_compacts_affected_sub_gr
             normalized_key_1: b'normalized-one',
         }
     )
-    store = ClipStore(s3_client)
+    store = _store(s3_client)
 
     affected_sub_groups = await store.remove(
         ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1),
@@ -2672,7 +2677,7 @@ async def test_remove_deletes_authoritative_objects_and_compacts_affected_sub_gr
 
 @pytest.mark.asyncio
 async def test_remove_rejects_empty_clip_ids() -> None:
-    store = ClipStore(_FakeS3Client())
+    store = _store(_FakeS3Client())
 
     with pytest.raises(ValueError, match='remove\\(\\) requires at least one clip id'):
         await store.remove(
@@ -2684,7 +2689,7 @@ async def test_remove_rejects_empty_clip_ids() -> None:
 @pytest.mark.asyncio
 async def test_remove_rejects_duplicate_clip_ids() -> None:
     manifest_key = _manifest_key(year=2024, season=Season.S1, universe=Universe.WEST)
-    store = ClipStore(
+    store = _store(
         _FakeS3Client(
             {
                 manifest_key: _manifest_bytes(
@@ -2713,7 +2718,7 @@ async def test_remove_rejects_duplicate_clip_ids() -> None:
 @pytest.mark.asyncio
 async def test_remove_rejects_unknown_clip_ids() -> None:
     manifest_key = _manifest_key(year=2024, season=Season.S1, universe=Universe.WEST)
-    store = ClipStore(_FakeS3Client({manifest_key: _manifest_bytes([])}))
+    store = _store(_FakeS3Client({manifest_key: _manifest_bytes([])}))
 
     with pytest.raises(UnknownClipsError, match=_UUID_4):
         await store.remove(
@@ -2745,7 +2750,7 @@ async def test_remove_raises_cleanup_error_when_raw_delete_fails_after_manifest_
         },
         delete_failures={clip_key_1},
     )
-    store = ClipStore(s3_client)
+    store = _store(s3_client)
 
     clip_group = ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1)
     clip_group_prefix = store._clip_group_prefix(
@@ -2803,7 +2808,7 @@ async def test_remove_raises_cleanup_error_when_normalized_delete_fails_after_ma
         },
         delete_failures={normalized_key_1},
     )
-    store = ClipStore(s3_client)
+    store = _store(s3_client)
 
     with pytest.raises(ClipRemoveManifestSyncError, match='normalized_clip_delete') as excinfo:
         await store.remove(
@@ -2846,7 +2851,7 @@ async def test_remove_deletes_manifest_instead_of_writing_empty_manifest_for_las
             clip_key_1: b'one',
         }
     )
-    store = ClipStore(s3_client)
+    store = _store(s3_client)
     clip_group = ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1)
     clip_group_prefix = store._clip_group_prefix(
         universe=clip_group.universe,
@@ -2896,7 +2901,7 @@ async def test_remove_raises_sync_error_when_manifest_delete_fails_before_cleanu
         },
         delete_failures={manifest_key},
     )
-    store = ClipStore(s3_client)
+    store = _store(s3_client)
     clip_group = ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1)
     clip_group_prefix = store._clip_group_prefix(
         universe=clip_group.universe,
@@ -2960,7 +2965,7 @@ async def test_remove_raises_sync_error_when_manifest_write_fails_before_cleanup
         },
         put_failures={manifest_key},
     )
-    store = ClipStore(s3_client)
+    store = _store(s3_client)
 
     with pytest.raises(ClipRemoveManifestSyncError, match='manifest_write') as excinfo:
         await store.remove(
@@ -3031,7 +3036,7 @@ async def test_reconcile_reorders_and_rebatches_target_sub_group() -> None:
             clip_key_4: b'four',
         }
     )
-    store = ClipStore(s3_client)
+    store = _store(s3_client)
 
     result = await store.reconcile(
         ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1),
@@ -3128,7 +3133,7 @@ async def test_reconcile_moves_from_other_sub_group_and_deletes_omitted_clip() -
             normalized_key_1: b'normalized-one',
         }
     )
-    store = ClipStore(s3_client)
+    store = _store(s3_client)
 
     result = await store.reconcile(
         ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1),
@@ -3167,7 +3172,7 @@ async def test_reconcile_moves_from_other_sub_group_and_deletes_omitted_clip() -
 @pytest.mark.asyncio
 async def test_reconcile_rejects_duplicate_clip_ids() -> None:
     manifest_key = _manifest_key(year=2024, season=Season.S1, universe=Universe.WEST)
-    store = ClipStore(
+    store = _store(
         _FakeS3Client(
             {
                 manifest_key: _manifest_bytes(
@@ -3196,7 +3201,7 @@ async def test_reconcile_rejects_duplicate_clip_ids() -> None:
 
 @pytest.mark.asyncio
 async def test_reconcile_rejects_empty_clip_id_batches() -> None:
-    store = ClipStore(_FakeS3Client())
+    store = _store(_FakeS3Client())
 
     with pytest.raises(ValueError, match='reconcile\\(\\) clip_id_batches must not contain empty batches'):
         await store.reconcile(
@@ -3208,7 +3213,7 @@ async def test_reconcile_rejects_empty_clip_id_batches() -> None:
 
 @pytest.mark.asyncio
 async def test_reconcile_rejects_empty_inner_batch_in_mixed_input() -> None:
-    store = ClipStore(_FakeS3Client())
+    store = _store(_FakeS3Client())
 
     with pytest.raises(ValueError, match='reconcile\\(\\) clip_id_batches must not contain empty batches'):
         await store.reconcile(
@@ -3221,7 +3226,7 @@ async def test_reconcile_rejects_empty_inner_batch_in_mixed_input() -> None:
 @pytest.mark.asyncio
 async def test_reconcile_rejects_unknown_clip_ids() -> None:
     manifest_key = _manifest_key(year=2024, season=Season.S1, universe=Universe.WEST)
-    store = ClipStore(
+    store = _store(
         _FakeS3Client(
             {
                 manifest_key: _manifest_bytes(
@@ -3251,7 +3256,7 @@ async def test_reconcile_rejects_unknown_clip_ids() -> None:
 @pytest.mark.asyncio
 async def test_reconcile_rejects_clip_ids_missing_from_provided_group_manifest() -> None:
     manifest_key = _manifest_key(year=2024, season=Season.S1, universe=Universe.WEST)
-    store = ClipStore(
+    store = _store(
         _FakeS3Client(
             {
                 manifest_key: _manifest_bytes(
@@ -3310,7 +3315,7 @@ async def test_reconcile_raises_cleanup_error_after_manifest_commit_and_updates_
         },
         delete_failures={clip_key_1},
     )
-    store = ClipStore(s3_client)
+    store = _store(s3_client)
 
     with pytest.raises(ReconcileDeleteError, match='raw_clip_delete') as excinfo:
         await store.reconcile(
@@ -3370,7 +3375,7 @@ async def test_remove_stops_before_normalized_cleanup_when_raw_delete_fails() ->
         },
         delete_failures={clip_key_1},
     )
-    store = ClipStore(s3_client)
+    store = _store(s3_client)
 
     with pytest.raises(ClipRemoveManifestSyncError, match='raw_clip_delete') as excinfo:
         await store.remove(
@@ -3385,7 +3390,7 @@ async def test_remove_stops_before_normalized_cleanup_when_raw_delete_fails() ->
 
 @pytest.mark.asyncio
 async def test_compact_rejects_batch_size_below_one() -> None:
-    store = ClipStore(_FakeS3Client())
+    store = _store(_FakeS3Client())
 
     with pytest.raises(ValueError, match='`batch_size` must be >= 1'):
         await store.compact(
@@ -3397,7 +3402,7 @@ async def test_compact_rejects_batch_size_below_one() -> None:
 
 @pytest.mark.asyncio
 async def test_compact_fails_with_empty_sub_group_fields_when_group_is_missing() -> None:
-    store = ClipStore(_FakeS3Client())
+    store = _store(_FakeS3Client())
 
     with pytest.raises(ClipGroupNotFoundError) as excinfo:
         await store.compact(
@@ -3417,7 +3422,7 @@ async def test_compact_fails_with_empty_sub_group_fields_when_group_is_missing()
 @pytest.mark.asyncio
 async def test_compact_fails_with_requested_sub_group_fields_when_sub_group_is_missing() -> None:
     manifest_key = _manifest_key(year=2024, season=Season.S1, universe=Universe.WEST)
-    store = ClipStore(
+    store = _store(
         _FakeS3Client(
             {
                 manifest_key: _manifest_bytes(
@@ -3470,7 +3475,7 @@ async def test_compact_ignores_missing_sub_group_when_require_exists_is_false() 
             )
         }
     )
-    store = ClipStore(s3_client)
+    store = _store(s3_client)
 
     await store.compact(
         ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1),
@@ -3535,7 +3540,7 @@ async def test_compact_preserves_relative_order_while_rewriting_positions() -> N
             )
         }
     )
-    store = ClipStore(s3_client)
+    store = _store(s3_client)
     clip_group = ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1)
     clip_sub_group = ClipSubGroup(sub_season=SubSeason.A, scope=Scope.COLLECTION)
 
@@ -3603,7 +3608,7 @@ async def test_compact_only_affects_specified_sub_group_and_leaves_others_unchan
             )
         }
     )
-    store = ClipStore(s3_client)
+    store = _store(s3_client)
 
     await store.compact(
         ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1),
@@ -3648,7 +3653,7 @@ async def test_compact_does_not_upload_manifest_when_positions_do_not_change() -
             )
         }
     )
-    store = ClipStore(s3_client)
+    store = _store(s3_client)
 
     await store.compact(
         ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1),
@@ -3681,7 +3686,7 @@ async def test_compact_updates_manifest_cache_consistently_after_rewrite() -> No
         ),
     ]
     s3_client = _FakeS3Client({manifest_key: _manifest_bytes(original_manifest)})
-    store = ClipStore(s3_client)
+    store = _store(s3_client)
     clip_group = ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1)
     clip_sub_group = ClipSubGroup(sub_season=SubSeason.A, scope=Scope.COLLECTION)
 
@@ -3743,7 +3748,7 @@ async def test_compact_is_manifest_only_and_does_not_touch_clip_objects() -> Non
             clip_key_2: b'clip-2',
         }
     )
-    store = ClipStore(s3_client)
+    store = _store(s3_client)
 
     await store.compact(
         ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1),
@@ -3766,7 +3771,7 @@ async def test_compact_can_pull_newly_stored_single_clip_into_previous_batch_whe
     _patch_uuid7(monkeypatch, _UUID_1, _UUID_2)
     manifest_key = _manifest_key(year=2024, season=Season.S1, universe=Universe.WEST)
     s3_client = _FakeS3Client()
-    store = ClipStore(s3_client)
+    store = _store(s3_client)
     clip_group = ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1)
     clip_sub_group = ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.EXTRA)
 
@@ -3824,7 +3829,7 @@ async def test_compact_with_batch_size_ten_creates_dense_batches_with_final_part
         for index in range(12)
     ]
     s3_client = _FakeS3Client({manifest_key: _manifest_bytes(entries)})
-    store = ClipStore(s3_client)
+    store = _store(s3_client)
 
     await store.compact(
         ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1),

@@ -35,10 +35,12 @@ _CONFIG_CONTENT = dedent(
     min_year = 2022
 
     [clips]
+    namespace = "clips"
     normalization_loudness = -14
     normalization_bitrate = 128
 
     [tracks]
+    namespace = "tracks"
     variant_max_duration_minutes = 30
     slowest_variant_speed = 0.5
     """
@@ -54,10 +56,12 @@ _DEV_CONFIG_CONTENT = dedent(
     media_group_max_size = 10
 
     [dev.clips]
+    namespace = "clips-dev"
     normalization_loudness = -12
     normalization_bitrate = 96
 
     [dev.tracks]
+    namespace = "tracks-dev"
     variant_max_duration_minutes = 1
     slowest_variant_speed = 0.75
     """
@@ -67,6 +71,10 @@ _DEV_CONFIG_CONTENT = dedent(
 def _write_runtime_files(tmp_path: Path, *, config_content: str = _CONFIG_CONTENT) -> None:
     (tmp_path / '.env').write_text(_ENV_CONTENT)
     (tmp_path / 'config.toml').write_text(config_content)
+
+
+def _replace_config_line(config_content: str, *, old: str, new: str) -> str:
+    return config_content.replace(old, new, 1)
 
 
 def _clear_runtime_env(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -106,8 +114,10 @@ def test_settings_load_reads_production_config_and_env_values(
     assert settings.message_width == 80
     assert settings.media_group_max_size == 47
     assert settings.min_year == 2022
+    assert settings.clip_namespace == 'clips'
     assert settings.normalization_loudness == -14
     assert settings.normalization_bitrate == 128
+    assert settings.track_namespace == 'tracks'
     assert settings.variant_max_duration == timedelta(minutes=30)
     assert settings.slowest_variant_speed == 0.5
 
@@ -127,8 +137,10 @@ def test_settings_load_applies_dev_overrides_from_same_file(
     assert settings.message_width == 72
     assert settings.media_group_max_size == 10
     assert settings.min_year == 2022
+    assert settings.clip_namespace == 'clips-dev'
     assert settings.normalization_loudness == -12
     assert settings.normalization_bitrate == 96
+    assert settings.track_namespace == 'tracks-dev'
     assert settings.variant_max_duration == timedelta(minutes=1)
     assert settings.slowest_variant_speed == 0.75
 
@@ -154,10 +166,12 @@ def test_settings_load_rejects_unknown_config_keys(
             min_year = 2022
 
             [clips]
+            namespace = "clips"
             normalization_loudness = -14
             normalization_bitrate = 128
 
             [tracks]
+            namespace = "tracks"
             variant_max_duration_minutes = 30
             slowest_variant_speed = 0.5
             """
@@ -168,3 +182,79 @@ def test_settings_load_rejects_unknown_config_keys(
 
     with pytest.raises(ValidationError):
         Settings.load(is_dev=False)
+
+
+@pytest.mark.parametrize(
+    ('old_line', 'new_line'),
+    [
+        ('namespace = "clips"', 'namespace = ""'),
+        ('namespace = "tracks"', 'namespace = ""'),
+    ],
+)
+def test_settings_load_rejects_empty_required_namespaces(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    old_line: str,
+    new_line: str,
+) -> None:
+    _clear_runtime_env(monkeypatch)
+    _write_runtime_files(
+        tmp_path,
+        config_content=_replace_config_line(_CONFIG_CONTENT, old=old_line, new=new_line),
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(settings_module, 'CONFIG_PATH', tmp_path / 'config.toml')
+
+    with pytest.raises(ValidationError):
+        Settings.load(is_dev=False)
+
+
+@pytest.mark.parametrize(
+    ('old_line', 'new_line'),
+    [
+        ('namespace = "clips-dev"', 'namespace = ""'),
+        ('namespace = "tracks-dev"', 'namespace = ""'),
+    ],
+)
+def test_settings_load_rejects_empty_dev_namespace_overrides(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    old_line: str,
+    new_line: str,
+) -> None:
+    _clear_runtime_env(monkeypatch)
+    _write_runtime_files(
+        tmp_path,
+        config_content=_replace_config_line(
+            _CONFIG_CONTENT + '\n' + _DEV_CONFIG_CONTENT,
+            old=old_line,
+            new=new_line,
+        ),
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(settings_module, 'CONFIG_PATH', tmp_path / 'config.toml')
+
+    with pytest.raises(ValidationError):
+        Settings.load(is_dev=True)
+
+
+def test_settings_load_uses_tracked_root_config_for_prod_and_dev_namespaces(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _clear_runtime_env(monkeypatch)
+    (tmp_path / '.env').write_text(_ENV_CONTENT)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        settings_module,
+        'CONFIG_PATH',
+        Path(__file__).resolve().parents[1] / 'config.toml',
+    )
+
+    production_settings = Settings.load(is_dev=False)
+    development_settings = Settings.load(is_dev=True)
+
+    assert production_settings.clip_namespace == 'clips'
+    assert production_settings.track_namespace == 'tracks'
+    assert development_settings.clip_namespace == 'clips-dev'
+    assert development_settings.track_namespace == 'tracks-dev'

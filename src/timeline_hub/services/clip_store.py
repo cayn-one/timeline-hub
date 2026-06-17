@@ -15,7 +15,6 @@ from timeline_hub.infra.ffmpeg import hash_video_content, normalize_video_audio_
 from timeline_hub.infra.s3 import Key, Prefix, S3Client, S3ContentType, S3ObjectNotFoundError
 from timeline_hub.types import Extension, FileBytes, InvalidExtensionError
 
-_CLIPS_PREFIX = 'clips'
 _MANIFEST_FILENAME = 'manifest.json'
 _CLIP_GROUP_SEPARATOR = '-'
 _NORMALIZED_SUFFIX = '-normalized'
@@ -568,9 +567,10 @@ class ClipStore:
     internal processing byte-based. All returned clip files are MP4.
     """
 
-    def __init__(self, s3_client: S3Client) -> None:
+    def __init__(self, s3_client: S3Client, *, namespace: Prefix) -> None:
         """Initialize the store with an opened generic S3 client."""
         self._s3_client = s3_client
+        self._namespace = namespace
         self._manifest_cache: dict[Prefix, Manifest] = {}
 
     async def list_groups(self) -> list[ClipGroup]:
@@ -580,7 +580,7 @@ class ClipStore:
         existence check. After failed first writes, orphaned prefixes may
         appear temporarily until manual cleanup removes them.
         """
-        clip_group_prefixes = await self._s3_client.list_subprefixes(prefix=_CLIPS_PREFIX)
+        clip_group_prefixes = await self._s3_client.list_subprefixes(prefix=self._namespace)
         clip_groups = [self._parse_clip_group_prefix(prefix) for prefix in clip_group_prefixes]
         return sorted(clip_groups, key=lambda group: (group.universe.order(), group.year, int(group.season)))
 
@@ -1467,14 +1467,15 @@ class ClipStore:
 
     def _clip_group_prefix(self, *, universe: Universe, year: int, season: Season) -> Prefix:
         clip_group = _CLIP_GROUP_SEPARATOR.join((universe.value, str(year), str(int(season))))
-        return S3Client.join(_CLIPS_PREFIX, clip_group)
+        return S3Client.join(self._namespace, clip_group)
 
     def _parse_clip_group_prefix(self, prefix: Prefix) -> ClipGroup:
         segments = S3Client.split(prefix)
-        if not segments or segments[0] != _CLIPS_PREFIX:
-            raise ValueError(f'Invalid clip group prefix {prefix!r}: expected prefix under {_CLIPS_PREFIX!r}')
+        namespace_segments = S3Client.split(self._namespace)
+        if segments[: len(namespace_segments)] != namespace_segments:
+            raise ValueError(f'Invalid clip group prefix {prefix!r}: expected prefix under {self._namespace!r}')
 
-        remaining_segments = segments[1:]
+        remaining_segments = segments[len(namespace_segments) :]
         if len(remaining_segments) != 1:
             raise ValueError(f'Invalid clip group prefix {prefix!r}: expected exactly one clip group segment')
 

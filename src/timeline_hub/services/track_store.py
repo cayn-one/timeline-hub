@@ -13,7 +13,6 @@ from timeline_hub.infra.ffmpeg import clip_mp3, create_audio_variant, probe_audi
 from timeline_hub.infra.s3 import Key, Prefix, S3BatchDeleteError, S3Client, S3ContentType, S3ObjectNotFoundError
 from timeline_hub.types import Extension, FileBytes, InvalidExtensionError
 
-_TRACKS_PREFIX = 'tracks'
 _PRESETS_FILENAME = 'presets.json'
 _MANIFEST_FILENAME = 'manifest.json'
 _COVER_SUFFIX = '-cover'
@@ -442,7 +441,7 @@ class Presets:
         """Build presets from a decoded JSON payload.
 
         Args:
-            data: Decoded JSON value from `tracks/presets.json`.
+            data: Decoded JSON value from `<namespace>/presets.json`.
 
         Raises:
             ValueError: If the payload does not match the preset schema.
@@ -738,7 +737,7 @@ class TrackManifestCorruptedError(RuntimeError):
 
 
 class TrackPresetsCorruptedError(RuntimeError):
-    """Raised when `tracks/presets.json` exists but cannot be decoded or validated."""
+    """Raised when `<namespace>/presets.json` exists but cannot be decoded or validated."""
 
     def __init__(self, key: Key, reason: str) -> None:
         self.key = key
@@ -916,12 +915,12 @@ class TrackFetchManifestSyncError(RuntimeError):
 
 
 class PresetStore:
-    """Owner of authoritative preset registry state stored at `tracks/presets.json`.
+    """Owner of authoritative preset registry state stored at `<namespace>/presets.json`.
 
     `PresetStore` fully owns bootstrap initialization, lazy cache state, JSON
     decoding, schema validation, corruption handling, persistence, and preset
     cache-backed preset-management operations. It is the only component that
-    touches `tracks/presets.json`, and higher-level services do not work with
+    touches `<namespace>/presets.json`, and higher-level services do not work with
     raw `Presets` directly.
 
     Preset invariants:
@@ -930,10 +929,11 @@ class PresetStore:
         - Stored preset ids and versions are integers >= 1.
     """
 
-    def __init__(self, s3_client: S3Client, *, bootstrap_preset: Preset) -> None:
+    def __init__(self, s3_client: S3Client, *, bootstrap_preset: Preset, namespace: Prefix) -> None:
         """Initialize the preset store with an opened generic S3 client."""
         self._s3_client = s3_client
         self._bootstrap_preset = bootstrap_preset
+        self._namespace = namespace
         self._presets_cache: Presets | None = None
 
     async def all(self) -> list[PresetRecord]:
@@ -955,7 +955,7 @@ class PresetStore:
         """Append a new stored preset record.
 
         Raises:
-            TrackPresetsCorruptedError: If `tracks/presets.json` exists but is malformed.
+            TrackPresetsCorruptedError: If `<namespace>/presets.json` exists but is malformed.
         """
         presets = await self._load_presets()
         updated_presets = Presets(
@@ -974,7 +974,7 @@ class PresetStore:
         """Replace one stored preset's editable values and bump its version.
 
         Raises:
-            TrackPresetsCorruptedError: If `tracks/presets.json` exists but is malformed.
+            TrackPresetsCorruptedError: If `<namespace>/presets.json` exists but is malformed.
             ValueError: If `preset_id` does not refer to a known preset.
         """
         presets = await self._load_presets()
@@ -997,7 +997,7 @@ class PresetStore:
         """Move the selected preset to the default position at index 0.
 
         Raises:
-            TrackPresetsCorruptedError: If `tracks/presets.json` exists but is malformed.
+            TrackPresetsCorruptedError: If `<namespace>/presets.json` exists but is malformed.
             ValueError: If `preset_id` does not refer to a known preset.
         """
         validated_preset_id = _expect_positive_int(
@@ -1022,7 +1022,7 @@ class PresetStore:
         The default preset cannot be removed.
 
         Raises:
-            TrackPresetsCorruptedError: If `tracks/presets.json` exists but is malformed.
+            TrackPresetsCorruptedError: If `<namespace>/presets.json` exists but is malformed.
             ValueError: If `preset_id` does not refer to a known preset.
             TrackDefaultPresetRemovalError: If `preset_id` refers to the current default preset.
         """
@@ -1094,7 +1094,7 @@ class PresetStore:
         return max(stored_preset.id for stored_preset in presets.presets) + 1
 
     def _presets_key(self) -> Key:
-        return S3Client.join(_TRACKS_PREFIX, _PRESETS_FILENAME)
+        return S3Client.join(self._namespace, _PRESETS_FILENAME)
 
 
 class TrackStore:
@@ -1108,7 +1108,7 @@ class TrackStore:
     Preset registry state is owned by an external `PresetStore`. `TrackStore`
     depends on that service for preset data access only and owns its own
     store/fetch preset-selection policy. It does not bootstrap, parse,
-    validate, persist, or cache `tracks/presets.json` itself.
+    validate, persist, or cache `<namespace>/presets.json` itself.
 
     The group manifest is authoritative for logical tracks in a `TrackGroup`.
     Store-path reads use copy-safe manifests so writes can stage updates before
@@ -1153,6 +1153,7 @@ class TrackStore:
         *,
         preset_store: PresetStore,
         variant_max_duration: timedelta,
+        namespace: Prefix,
     ) -> None:
         """Initialize the store with an opened generic S3 client and preset store.
 
@@ -1160,21 +1161,24 @@ class TrackStore:
         """
         if preset_store._s3_client is not s3_client:
             raise ValueError('TrackStore and PresetStore must share the same S3 client instance')
+        if preset_store._namespace != namespace:
+            raise ValueError('TrackStore and PresetStore must share the same namespace')
 
         self._s3_client = s3_client
         self._preset_store = preset_store
+        self._namespace = namespace
         self._variant_max_duration = variant_max_duration
         self._manifest_cache: dict[Prefix, Manifest] = {}
 
     async def list_groups(self) -> list[TrackGroup]:
         """List all discovered track groups from stored S3 prefixes.
 
-        This method relies on `S3Client.list_subprefixes('tracks')` returning
+        This method relies on `S3Client.list_subprefixes(namespace)` returning
         only immediate prefixes and not ordinary files. That means
-        `tracks/presets.json` is not part of the returned collection and no
+        the preset-registry object is not part of the returned collection and no
         file-specific ignore list is needed here.
         """
-        track_group_prefixes = await self._s3_client.list_subprefixes(prefix=_TRACKS_PREFIX)
+        track_group_prefixes = await self._s3_client.list_subprefixes(prefix=self._namespace)
         track_groups = [self._parse_track_group_prefix(prefix) for prefix in track_group_prefixes]
         return sorted(track_groups, key=lambda group: (group.universe.order(), group.year, int(group.season)))
 
@@ -1189,7 +1193,7 @@ class TrackStore:
         instead of inferring an album-family id from arbitrary track ids.
 
         Raises:
-            TrackPresetsCorruptedError: If `tracks/presets.json` exists but is malformed.
+            TrackPresetsCorruptedError: If `<namespace>/presets.json` exists but is malformed.
             TrackGroupNotFoundError: If the requested group manifest does not exist.
             TrackManifestCorruptedError: If the group manifest exists but is malformed.
         """
@@ -1259,7 +1263,7 @@ class TrackStore:
         cover copy.
 
         Raises:
-            TrackPresetsCorruptedError: If `tracks/presets.json` exists but is malformed.
+            TrackPresetsCorruptedError: If `<namespace>/presets.json` exists but is malformed.
             TrackGroupNotFoundError: If the requested group manifest does not exist.
             TrackManifestCorruptedError: If the requested group manifest exists but is malformed.
             ValueError: If `track_id` is missing from the manifest.
@@ -1600,7 +1604,7 @@ class TrackStore:
         by the system and can be safely removed manually if needed.
 
         Raises:
-            TrackPresetsCorruptedError: If `tracks/presets.json` exists but is malformed.
+            TrackPresetsCorruptedError: If `<namespace>/presets.json` exists but is malformed.
             TrackManifestCorruptedError: If the target group's manifest exists but is malformed.
             ValueError: If `preset_id` is provided but does not refer to a known preset.
             TrackInvalidAudioFormatError: If `track.audio` is not 48_000 Hz audio.
@@ -2053,7 +2057,7 @@ class TrackStore:
         `clear_uploaded_variants()` explicitly to return to generated mode.
 
         Raises:
-            TrackPresetsCorruptedError: If `tracks/presets.json` exists but is malformed.
+            TrackPresetsCorruptedError: If `<namespace>/presets.json` exists but is malformed.
             TrackManifestCorruptedError: If the target group's manifest exists but is malformed.
             TrackGroupNotFoundError: If the target group's manifest does not exist.
             ValueError: If `track_id` does not exist in the provided group's manifest.
@@ -2913,14 +2917,15 @@ class TrackStore:
 
     def _track_group_prefix(self, *, universe: TrackUniverse, year: int, season: Season) -> Prefix:
         track_group = '-'.join((universe.value, str(year), str(int(season))))
-        return S3Client.join(_TRACKS_PREFIX, track_group)
+        return S3Client.join(self._namespace, track_group)
 
     def _parse_track_group_prefix(self, prefix: Prefix) -> TrackGroup:
         segments = S3Client.split(prefix)
-        if not segments or segments[0] != _TRACKS_PREFIX:
-            raise ValueError(f'Invalid track group prefix {prefix!r}: expected prefix under {_TRACKS_PREFIX!r}')
+        namespace_segments = S3Client.split(self._namespace)
+        if segments[: len(namespace_segments)] != namespace_segments:
+            raise ValueError(f'Invalid track group prefix {prefix!r}: expected prefix under {self._namespace!r}')
 
-        remaining_segments = segments[1:]
+        remaining_segments = segments[len(namespace_segments) :]
         if len(remaining_segments) != 1:
             raise ValueError(f'Invalid track group prefix {prefix!r}: expected exactly one track group segment')
 

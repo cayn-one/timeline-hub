@@ -9,16 +9,26 @@ forward_batch_timeout_ms = 250
 min_year = 2022
 
 [clips]
+# S3 namespace for clip manifests and media
+namespace = "clips"
 # Audio normalization target in LUFS
 normalization_loudness = -14
 # Audio bitrate for normalized output
 normalization_bitrate = 128
 
+[dev.clips]
+namespace = "clips-dev"
+
 [tracks]
+# S3 namespace for track media, manifests, and presets
+namespace = "tracks"
 # Maximum clip duration for track variants, in minutes
 variant_max_duration_minutes = 30
 # Slowest allowed variant speed
 slowest_variant_speed = 0.5
+
+[dev.tracks]
+namespace = "tracks-dev"
 
 [telegram]
 # Maximum media-group payload size observed to be accepted by Telegram, in MiB

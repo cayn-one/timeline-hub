@@ -174,6 +174,8 @@ async def test_app_registers_retry_middleware_on_bot_session(monkeypatch: pytest
             access_key_id='ak',
             secret_access_key=SimpleNamespace(get_secret_value=lambda: 'sk'),
         ),
+        clip_namespace='clips',
+        track_namespace='tracks',
         variant_max_duration=timedelta(minutes=15),
     )
     created_bots: list[object] = []

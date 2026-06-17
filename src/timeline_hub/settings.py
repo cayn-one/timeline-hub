@@ -76,6 +76,7 @@ class _FileStoresOverrides(BaseModel):
 
 
 class _FileClipsConfig(BaseModel):
+    namespace: str = Field(min_length=1)
     normalization_loudness: float
     normalization_bitrate: int = Field(gt=0)
 
@@ -86,6 +87,7 @@ class _FileClipsConfig(BaseModel):
 
 
 class _FileClipsOverrides(BaseModel):
+    namespace: str | None = Field(default=None, min_length=1)
     normalization_loudness: float | None = None
     normalization_bitrate: int | None = Field(default=None, gt=0)
 
@@ -96,6 +98,7 @@ class _FileClipsOverrides(BaseModel):
 
 
 class _FileTracksConfig(BaseModel):
+    namespace: str = Field(min_length=1)
     variant_max_duration_minutes: int = Field(gt=0)
     slowest_variant_speed: float = Field(gt=0, le=1)
 
@@ -106,6 +109,7 @@ class _FileTracksConfig(BaseModel):
 
 
 class _FileTracksOverrides(BaseModel):
+    namespace: str | None = Field(default=None, min_length=1)
     variant_max_duration_minutes: int | None = Field(default=None, gt=0)
     slowest_variant_speed: float | None = Field(default=None, gt=0, le=1)
 
@@ -155,9 +159,11 @@ class Settings(BaseModel):
     message_width: int
 
     min_year: int
+    clip_namespace: str
     normalization_loudness: float
     normalization_bitrate: int
 
+    track_namespace: str
     variant_max_duration: timedelta
     slowest_variant_speed: float
     media_group_max_size: int
@@ -181,8 +187,10 @@ class Settings(BaseModel):
             message_width=file_settings.interface.message_width,
             media_group_max_size=file_settings.telegram.media_group_max_size,
             min_year=file_settings.stores.min_year,
+            clip_namespace=file_settings.clips.namespace,
             normalization_loudness=file_settings.clips.normalization_loudness,
             normalization_bitrate=file_settings.clips.normalization_bitrate,
+            track_namespace=file_settings.tracks.namespace,
             variant_max_duration=timedelta(minutes=file_settings.tracks.variant_max_duration_minutes),
             slowest_variant_speed=file_settings.tracks.slowest_variant_speed,
         )

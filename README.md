@@ -41,7 +41,7 @@ At runtime, Telegram updates enter handlers, handlers translate them into domain
 - Deterministic menu geometry. Messages with inline keyboards are rendered as either `padding, padding, content` or `context, padding, prompt`, and keyboards always occupy three rows. This removes layout shift and lets the user rely on position instead of rescanning the screen.
 - Snake-ordered option grids. The first two keyboard rows are filled from the top-right corner in a snake pattern. Newer or more relevant options naturally land in the easiest-to-reach positions without turning the menu into ad hoc per-step logic.
 - UI as a projection of the domain. `Season`, `Universe`, `SubSeason`, and `Scope` remain authoritative domain values, while the handler layer is free to reorder, group, or dummy-fill them for usability. That keeps storage and parsing stable while allowing a highly opinionated Telegram UI.
-- Manifest-backed clip groups. Each group under `clips/<year>-<season>-<universe>/` stores clip objects plus a `manifest.json` index. The manifest is validated on load, defines subgroup membership and order, and acts as the commit boundary for store operations.
+- Manifest-backed clip groups. Each group under `<clip namespace>/<universe>-<year>-<season>/` stores clip objects plus a `manifest.json` index. The manifest is validated on load, defines subgroup membership and order, and acts as the commit boundary for store operations.
 - Buffered ingestion before user choice. Incoming private-chat messages are collected per chat and released after a short debounce. The bot can then present one menu for a burst of forwarded clips and preserve Telegram media-group structure when storing or resending.
 - Fail-fast async orchestration. Detached tasks are supervised centrally. Debounced jobs can be rescheduled by key, but once real work starts it is shielded from cancellation, and unexpected failures trigger a clear shutdown path.
 
@@ -101,12 +101,16 @@ media_group_max_size = 47
 min_year = 2022
 
 [clips]
+# S3 namespace for clip manifests and media
+namespace = "clips"
 # Audio normalization target in LUFS
 normalization_loudness = -14
 # Audio bitrate for normalized output
 normalization_bitrate = 128
 
 [tracks]
+# S3 namespace for track media, manifests, and presets
+namespace = "tracks"
 # Maximum clip duration for track variants, in minutes
 variant_max_duration_minutes = 30
 # Slowest allowed variant speed
@@ -117,6 +121,12 @@ message_width = 72
 
 [dev.telegram]
 media_group_max_size = 10
+
+[dev.clips]
+namespace = "clips-dev"
+
+[dev.tracks]
+namespace = "tracks-dev"
 ```
 
 Required settings:

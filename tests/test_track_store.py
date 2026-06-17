@@ -49,6 +49,7 @@ _UUID_1 = uuid.UUID('018f05c1-f1a3-7b34-8d29-1f53a1c9d0e1').hex
 _UUID_2 = uuid.UUID('018f05c1-f1a3-7b34-8d29-1f53a1c9d0e2').hex
 _UUID_3 = uuid.UUID('018f05c1-f1a3-7b34-8d29-1f53a1c9d0e3').hex
 _VARIANT_MAX_DURATION = timedelta(minutes=15)
+_TRACK_NAMESPACE = 'tracks'
 
 
 class _FakeS3Client:
@@ -110,7 +111,7 @@ class _FakeS3Client:
 
 
 def _track_group_prefix(*, universe: TrackUniverse, year: int, season: Season) -> str:
-    return S3Client.join('tracks', f'{universe.value}-{year}-{int(season)}')
+    return S3Client.join(_TRACK_NAMESPACE, f'{universe.value}-{year}-{int(season)}')
 
 
 def _manifest_key(*, universe: TrackUniverse, year: int, season: Season) -> str:
@@ -118,7 +119,7 @@ def _manifest_key(*, universe: TrackUniverse, year: int, season: Season) -> str:
 
 
 def _presets_key() -> str:
-    return S3Client.join('tracks', 'presets.json')
+    return S3Client.join(_TRACK_NAMESPACE, 'presets.json')
 
 
 def _track_key(*, universe: TrackUniverse, year: int, season: Season, track_id: str) -> str:
@@ -319,6 +320,7 @@ def _store(
             )
         ),
         variant_max_duration=_VARIANT_MAX_DURATION,
+        namespace=_TRACK_NAMESPACE,
     )
 
 
@@ -326,6 +328,7 @@ def _preset_store(s3_client: _FakeS3Client, *, bootstrap_preset: Preset | None =
     return PresetStore(
         s3_client,
         bootstrap_preset=bootstrap_preset or _bootstrap_preset(),
+        namespace=_TRACK_NAMESPACE,
     )
 
 
@@ -1608,6 +1611,24 @@ async def test_track_store_rejects_preset_store_with_different_s3_client() -> No
             _FakeS3Client(),
             preset_store=_preset_store(_FakeS3Client()),
             variant_max_duration=_VARIANT_MAX_DURATION,
+            namespace=_TRACK_NAMESPACE,
+        )
+
+
+@pytest.mark.asyncio
+async def test_track_store_rejects_preset_store_with_different_namespace() -> None:
+    preset_store = PresetStore(
+        _FakeS3Client(),
+        bootstrap_preset=_bootstrap_preset(),
+        namespace='tracks-dev',
+    )
+
+    with pytest.raises(ValueError, match='TrackStore and PresetStore must share the same namespace'):
+        TrackStore(
+            preset_store._s3_client,
+            preset_store=preset_store,
+            variant_max_duration=_VARIANT_MAX_DURATION,
+            namespace=_TRACK_NAMESPACE,
         )
 
 
@@ -1615,7 +1636,12 @@ async def test_track_store_rejects_preset_store_with_different_s3_client() -> No
 async def test_track_store_uses_provided_preset_store_without_own_preset_cache() -> None:
     s3_client = _FakeS3Client(objects={_presets_key(): _presets_bytes()})
     preset_store = _preset_store(s3_client)
-    store = TrackStore(s3_client, preset_store=preset_store, variant_max_duration=_VARIANT_MAX_DURATION)
+    store = TrackStore(
+        s3_client,
+        preset_store=preset_store,
+        variant_max_duration=_VARIANT_MAX_DURATION,
+        namespace=_TRACK_NAMESPACE,
+    )
 
     assert store._preset_store is preset_store
     assert not hasattr(store, '_presets_cache')
@@ -1636,8 +1662,18 @@ async def test_shared_preset_store_cache_is_reused_across_track_store_instances(
 ) -> None:
     s3_client = _FakeS3Client(objects={_presets_key(): _presets_bytes()})
     preset_store = _preset_store(s3_client)
-    first_store = TrackStore(s3_client, preset_store=preset_store, variant_max_duration=_VARIANT_MAX_DURATION)
-    second_store = TrackStore(s3_client, preset_store=preset_store, variant_max_duration=_VARIANT_MAX_DURATION)
+    first_store = TrackStore(
+        s3_client,
+        preset_store=preset_store,
+        variant_max_duration=_VARIANT_MAX_DURATION,
+        namespace=_TRACK_NAMESPACE,
+    )
+    second_store = TrackStore(
+        s3_client,
+        preset_store=preset_store,
+        variant_max_duration=_VARIANT_MAX_DURATION,
+        namespace=_TRACK_NAMESPACE,
+    )
     _patch_uuid7(monkeypatch, _UUID_1, _UUID_2)
     _patch_probe_audio_sample_rate(monkeypatch)
 

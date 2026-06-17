@@ -54,6 +54,7 @@ async def _main(settings: Settings) -> None:
         preset_store = PresetStore(
             s3_client,
             bootstrap_preset=_default_track_preset(),
+            namespace=settings.track_namespace,
         )
 
         dp['services'] = Services(
@@ -61,11 +62,12 @@ async def _main(settings: Settings) -> None:
             task_scheduler=TaskScheduler(
                 task_supervisor=TaskSupervisor(on_failure=on_failure_stop),
             ),
-            clip_store=ClipStore(s3_client),
+            clip_store=ClipStore(s3_client, namespace=settings.clip_namespace),
             track_store=TrackStore(
                 s3_client,
                 preset_store=preset_store,
                 variant_max_duration=settings.variant_max_duration,
+                namespace=settings.track_namespace,
             ),
         )
         dp['settings'] = settings
