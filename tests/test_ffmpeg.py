@@ -4,10 +4,17 @@ import wave
 from datetime import timedelta
 from io import BytesIO
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from timeline_hub.infra import ffmpeg as ffmpeg_module
+
+_VIDEO_FIXTURE_DIR = Path(__file__).parent / 'fixtures' / 'video'
+
+
+def _video_fixture(name: str) -> bytes:
+    return (_VIDEO_FIXTURE_DIR / name).read_bytes()
 
 
 @pytest.mark.asyncio
@@ -601,6 +608,61 @@ async def test_normalize_video_audio_loudness_uses_stderr_capture_for_analysis(
     assert result == b'normalized-video'
     assert calls[0]['capture'] == 'stderr'
     assert calls[1]['capture'] == 'none'
+
+
+@pytest.mark.asyncio
+async def test_hash_video_content_preserves_h264_digest_regression() -> None:
+    assert await ffmpeg_module.hash_video_content(_video_fixture('h264.mp4')) == (
+        '8c332ee605067eca7bf986fb82ca2957dc49467cf3311ca62257ff31f28e23ae'
+    )
+
+
+@pytest.mark.asyncio
+async def test_hash_video_content_supports_hevc() -> None:
+    assert await ffmpeg_module.hash_video_content(_video_fixture('hevc.mp4')) == (
+        'e49208a15f6b1cd4aa4e779d97ed966fe77715cd6b06570c1de7bb03f2ff6b73'
+    )
+
+
+@pytest.mark.asyncio
+async def test_hash_video_content_shares_one_total_timeout_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: dict[str, timedelta] = {}
+    monotonic_values = iter([100.0, 103.0, 107.0])
+
+    async def _fake_probe(input_path: Path, *, timeout: timedelta) -> str:
+        del input_path
+        observed['probe_timeout'] = timeout
+        return 'h264'
+
+    async def _fake_hash(cmd: tuple[str, ...], timeout: timedelta) -> str:
+        del cmd
+        observed['hash_timeout'] = timeout
+        return 'fake-digest'
+
+    monkeypatch.setattr(ffmpeg_module, 'time', SimpleNamespace(monotonic=lambda: next(monotonic_values)))
+    monkeypatch.setattr(ffmpeg_module, '_probe_primary_video_codec', _fake_probe)
+    monkeypatch.setattr(ffmpeg_module, '_hash_process_stdout', _fake_hash)
+
+    assert await ffmpeg_module.hash_video_content(b'clip-bytes', timeout=timedelta(seconds=10)) == ('fake-digest')
+    assert observed['probe_timeout'] == timedelta(seconds=7)
+    assert observed['hash_timeout'] == timedelta(seconds=3)
+
+
+@pytest.mark.asyncio
+async def test_hash_video_content_raises_for_unsupported_codec(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def _fake_probe(input_path: Path, *, timeout: timedelta) -> str:
+        del input_path, timeout
+        return 'vp9'
+
+    monkeypatch.setattr(ffmpeg_module, '_probe_primary_video_codec', _fake_probe)
+
+    with pytest.raises(ffmpeg_module.UnsupportedVideoCodecError) as excinfo:
+        await ffmpeg_module.hash_video_content(_video_fixture('h264.mp4'))
+
+    assert excinfo.value.codec == 'vp9'
+    assert excinfo.value.supported_codecs == ('h264', 'hevc')
 
 
 @pytest.mark.asyncio

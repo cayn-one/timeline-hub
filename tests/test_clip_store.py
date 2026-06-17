@@ -6,6 +6,7 @@ import uuid
 import pytest
 
 import timeline_hub.services.clip_store as clip_store_module
+from timeline_hub.infra.ffmpeg import UnsupportedVideoCodecError
 from timeline_hub.infra.s3 import S3Client, S3ObjectNotFoundError
 from timeline_hub.services.clip_store import (
     AudioNormalization,
@@ -1596,6 +1597,29 @@ async def test_store_rejects_non_mp4_filebytes() -> None:
             ClipSubGroup(sub_season=SubSeason.A, scope=Scope.COLLECTION),
             clips=[FileBytes(data=b'clip', extension=Extension.JPG)],
         )
+
+
+@pytest.mark.asyncio
+async def test_store_propagates_unsupported_codec_before_writes(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def _raise_unsupported(video_bytes: bytes) -> str:
+        del video_bytes
+        raise UnsupportedVideoCodecError(codec='vp9', supported_codecs=('h264', 'hevc'))
+
+    monkeypatch.setattr(clip_store_module, 'hash_video_content', _raise_unsupported)
+    manifest_key = _manifest_key(year=2024, season=Season.S1, universe=Universe.WEST)
+    s3_client = _FakeS3Client({manifest_key: _manifest_bytes([])})
+    store = _store(s3_client)
+
+    with pytest.raises(UnsupportedVideoCodecError) as excinfo:
+        await store.store(
+            ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1),
+            ClipSubGroup(sub_season=SubSeason.A, scope=Scope.COLLECTION),
+            clips=[_mp4_file(b'clip')],
+        )
+
+    assert excinfo.value.codec == 'vp9'
+    assert s3_client.put_calls == []
+    assert json.loads(s3_client.objects[manifest_key].decode('utf-8')) == _manifest_payload([])
 
 
 @pytest.mark.asyncio

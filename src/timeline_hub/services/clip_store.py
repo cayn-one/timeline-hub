@@ -155,6 +155,11 @@ class AudioNormalization:
 class ManifestEntry:
     """Single persisted clip row in a clip-group manifest.
 
+    `video_hash` is the SHA-256 hash of the clip's first encoded video stream
+    after lossless elementary-stream extraction. It is not a hash of the MP4
+    container and excludes audio, subtitles, data streams, and container
+    metadata. Original uploaded bytes are preserved separately in clip storage.
+
     `audio_normalization` records the currently authoritative normalized-cache
     parameters for this clip. `None` means no normalized clip is tracked in
     authoritative state, even if an untracked stale normalized object still
@@ -764,7 +769,10 @@ class ClipStore:
 
         `clips` must contain MP4 `FileBytes`. `store()` validates the
         explicit extension at the boundary, then unwraps to raw bytes for the
-        rest of the storage pipeline.
+        rest of the storage pipeline. Deduplication uses `video_hash`, which
+        hashes only the first encoded video stream after lossless
+        elementary-stream extraction; it does not hash the MP4 container or
+        include audio.
 
         Raises:
             ManifestCorruptedError: If the clip-group manifest exists but is malformed.

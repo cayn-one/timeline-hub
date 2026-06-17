@@ -109,6 +109,7 @@ from timeline_hub.handlers.tracks.retrieve import (
 from timeline_hub.handlers.tracks.retrieve import (
     on_retrieve_menu as on_tracks_retrieve_menu,
 )
+from timeline_hub.infra.ffmpeg import UnsupportedVideoCodecError
 from timeline_hub.infra.ytdlp import DownloadedAudio, TrackMetadata, YtDlpMetadataError
 from timeline_hub.services.clip_store import (
     AudioNormalization,
@@ -13135,6 +13136,67 @@ async def test_route_action_stores_mp4_documents_in_caption_route_order_across_m
 
 
 @pytest.mark.asyncio
+async def test_route_action_replaces_progress_message_for_unsupported_codec(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    message = _fake_message(text='Select action:', chat_id=77, message_id=70)
+    callback = _fake_callback(message)
+    state = _FakeState()
+    buffer = ChatMessageBuffer()
+    buffer.append(
+        _fake_message(
+            chat_id=77,
+            message_id=1,
+            caption='w251',
+            video=_fake_video(file_id='f1', file_name='one.mp4'),
+        ),
+        chat_id=77,
+    )
+
+    clip_store = SimpleNamespace(
+        store=AsyncMock(side_effect=UnsupportedVideoCodecError(codec='vp9', supported_codecs=('h264', 'hevc'))),
+        compact=AsyncMock(),
+    )
+    services = _services(clip_store=clip_store, buffer=buffer)
+
+    bot = AsyncMock()
+    bot.get_file.return_value = SimpleNamespace(file_path='path-1')
+    bot.download_file.return_value = BytesIO(b'one')
+    log_warning = Mock()
+    monkeypatch.setattr(intake_module.logger, 'warning', log_warning)
+
+    await on_intake_action(
+        callback,
+        SimpleNamespace(action=IntakeAction.ROUTE),
+        bot,
+        services,
+        _settings(),
+        state,
+    )
+
+    assert message.edit_text.await_args_list == [
+        call('Routing...', reply_markup=None),
+        call('Invalid codec', reply_markup=None),
+    ]
+    message.answer.assert_not_awaited()
+    clip_store.compact.assert_not_awaited()
+    log_warning.assert_called_once()
+    assert log_warning.call_args.args == (
+        (
+            'unsupported clip codec during route execution '
+            '(codec={}, supported_codecs={}, chat_id={}, message_ids={}, file_ids={}, filenames={}, route_target={})'
+        ),
+        'vp9',
+        ('h264', 'hevc'),
+        77,
+        [1],
+        ['f1'],
+        ['one.mp4'],
+        ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1),
+    )
+
+
+@pytest.mark.asyncio
 async def test_route_action_splits_store_calls_when_caption_route_overrides() -> None:
     message = _fake_message(text='Select action:', chat_id=77, message_id=71)
     callback = _fake_callback(message)
@@ -14999,6 +15061,70 @@ async def test_store_scope_selection_aggregates_results_and_sends_exact_summary(
 
 
 @pytest.mark.asyncio
+async def test_store_scope_selection_replaces_collapsed_message_for_unsupported_codec(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    message = _fake_message(text='Select scope:', chat_id=77, message_id=50)
+    callback = _fake_callback(message)
+    state = _FakeState()
+    await state.set_state(StoreClipFlow.scope)
+    buffer = ChatMessageBuffer()
+    buffer.append(
+        _fake_message(chat_id=77, message_id=1, video=_fake_video(file_id='f1', file_name='one.mp4')),
+        chat_id=77,
+    )
+    await state.update_data(
+        mode='store',
+        menu_message_id=50,
+        year=2025,
+        season=Season.S1,
+        universe=Universe.WEST,
+        sub_season=SubSeason.NONE,
+        buffer_version=buffer.version(77),
+    )
+
+    clip_store = SimpleNamespace(
+        store=AsyncMock(side_effect=UnsupportedVideoCodecError(codec='vp9', supported_codecs=('h264', 'hevc'))),
+        compact=AsyncMock(),
+    )
+    services = _services(clip_store=clip_store, buffer=buffer)
+    bot = AsyncMock()
+    bot.get_file.return_value = SimpleNamespace(file_path='path-1')
+    bot.download_file.return_value = BytesIO(b'one')
+    log_warning = Mock()
+    monkeypatch.setattr(store_execution_module.logger, 'warning', log_warning)
+
+    await on_intake_menu(
+        callback,
+        IntakeCallbackData(action=MenuAction.SELECT, step=MenuStep.SCOPE, value=Scope.COLLECTION.value),
+        bot,
+        services,
+        _settings(),
+        state,
+    )
+
+    assert message.edit_text.await_args_list[-1] == call('Invalid codec', reply_markup=None)
+    message.answer.assert_not_awaited()
+    clip_store.compact.assert_not_awaited()
+    log_warning.assert_called_once()
+    assert log_warning.call_args.args == (
+        (
+            'unsupported clip codec during store execution '
+            '(codec={}, supported_codecs={}, chat_id={}, message_ids={}, file_ids={}, filenames={}, '
+            'clip_group={}, clip_sub_group={})'
+        ),
+        'vp9',
+        ('h264', 'hevc'),
+        77,
+        [1],
+        ['f1'],
+        ['one.mp4'],
+        ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1),
+        ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.COLLECTION),
+    )
+
+
+@pytest.mark.asyncio
 async def test_produce_scope_selection_stores_then_fetches_only_new_subset_via_shared_normalize_send_path(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -15132,6 +15258,75 @@ async def test_produce_scope_selection_stores_then_fetches_only_new_subset_via_s
     bot.send_message.assert_not_awaited()
     assert state.current_state is None
     assert state.clear_count == 1
+
+
+@pytest.mark.asyncio
+async def test_produce_scope_selection_replaces_collapsed_message_for_unsupported_codec(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    message = _fake_message(text='Select scope:', chat_id=77, message_id=60)
+    callback = _fake_callback(message)
+    state = _FakeState()
+    await state.set_state(StoreClipFlow.scope)
+    buffer = ChatMessageBuffer()
+    buffer.append(
+        _fake_message(chat_id=77, message_id=1, document=_fake_document(file_id='f1', file_name='one.mp4')),
+        chat_id=77,
+    )
+    await state.update_data(
+        mode='produce',
+        menu_message_id=60,
+        year=2025,
+        season=Season.S1,
+        universe=Universe.WEST,
+        sub_season=SubSeason.NONE,
+        buffer_version=buffer.version(77),
+    )
+
+    clip_store = SimpleNamespace(
+        store=AsyncMock(side_effect=UnsupportedVideoCodecError(codec='vp9', supported_codecs=('h264', 'hevc'))),
+        compact=AsyncMock(),
+        fetch=AsyncMock(),
+    )
+    services = _services(clip_store=clip_store, buffer=buffer)
+    bot = AsyncMock()
+    bot.get_file.return_value = SimpleNamespace(file_path='path-1')
+    bot.download_file.return_value = BytesIO(b'one')
+    shared_helper = AsyncMock()
+    log_warning = Mock()
+    monkeypatch.setattr(store_execution_module, 'send_fetched_clip_batches', shared_helper)
+    monkeypatch.setattr(store_execution_module.logger, 'warning', log_warning)
+
+    await on_intake_menu(
+        callback,
+        IntakeCallbackData(action=MenuAction.SELECT, step=MenuStep.SCOPE, value=Scope.EXTRA.value),
+        bot,
+        services,
+        _settings(),
+        state,
+    )
+
+    assert message.edit_text.await_args_list[-1] == call('Invalid codec', reply_markup=None)
+    message.answer.assert_not_awaited()
+    clip_store.compact.assert_not_awaited()
+    clip_store.fetch.assert_not_awaited()
+    shared_helper.assert_not_awaited()
+    log_warning.assert_called_once()
+    assert log_warning.call_args.args == (
+        (
+            'unsupported clip codec during store execution '
+            '(codec={}, supported_codecs={}, chat_id={}, message_ids={}, file_ids={}, filenames={}, '
+            'clip_group={}, clip_sub_group={})'
+        ),
+        'vp9',
+        ('h264', 'hevc'),
+        77,
+        [1],
+        ['f1'],
+        ['one.mp4'],
+        ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1),
+        ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.EXTRA),
+    )
 
 
 @pytest.mark.asyncio

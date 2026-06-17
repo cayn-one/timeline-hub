@@ -76,6 +76,7 @@ from timeline_hub.handlers.menu import (
     selection_text,
     validate_flow_state,
 )
+from timeline_hub.infra.ffmpeg import UnsupportedVideoCodecError
 from timeline_hub.services.clip_store import (
     ClipGroup,
     ClipGroupNotFoundError,
@@ -432,12 +433,16 @@ async def on_intake_action(
                     reply_markup=None,
                 )
 
-            route_result = await _store_route_batches(
-                bot=bot,
-                services=services,
-                route_batches=route_batches,
-                on_batch_stored=update_route_progress,
-            )
+            try:
+                route_result = await _store_route_batches(
+                    bot=bot,
+                    services=services,
+                    route_batches=route_batches,
+                    on_batch_stored=update_route_progress,
+                )
+            except UnsupportedVideoCodecError:
+                await message.edit_text('Invalid codec', reply_markup=None)
+                return
             await message.answer(**store_summary_kwargs(route_result.store_result))
 
             for clip_group in route_result.compact_groups:
@@ -1157,14 +1162,24 @@ async def _store_route_batches(
     for route_batch in route_batches:
         stored_any = False
         for start in range(0, len(route_batch.messages), _ROUTE_STORE_CHUNK_SIZE):
-            batch_result = await services.clip_store.store(
-                route_batch.clip_group,
-                clip_sub_group,
-                clips=await _clip_messages_to_clip_files(
-                    bot=bot,
-                    messages=route_batch.messages[start : start + _ROUTE_STORE_CHUNK_SIZE],
-                ),
-            )
+            batch_messages = route_batch.messages[start : start + _ROUTE_STORE_CHUNK_SIZE]
+            try:
+                batch_result = await services.clip_store.store(
+                    route_batch.clip_group,
+                    clip_sub_group,
+                    clips=await _clip_messages_to_clip_files(
+                        bot=bot,
+                        messages=batch_messages,
+                    ),
+                )
+            except UnsupportedVideoCodecError as error:
+                _log_route_unsupported_codec_warning(
+                    error=error,
+                    chat_id=batch_messages[0].chat.id,
+                    clip_group=route_batch.clip_group,
+                    messages=batch_messages,
+                )
+                raise
             result += batch_result
             if batch_result.stored_count > 0:
                 stored_any = True
@@ -1270,6 +1285,41 @@ def _video_file_id(message: Message) -> str:
     if message.video is None:
         raise ValueError('Reorder can resend only video messages')
     return message.video.file_id
+
+
+def _log_route_unsupported_codec_warning(
+    *,
+    error: UnsupportedVideoCodecError,
+    chat_id: ChatId,
+    clip_group: ClipGroup,
+    messages: Sequence[Message],
+) -> None:
+    logger.warning(
+        (
+            'unsupported clip codec during route execution '
+            '(codec={}, supported_codecs={}, chat_id={}, message_ids={}, file_ids={}, filenames={}, route_target={})'
+        ),
+        error.codec,
+        error.supported_codecs,
+        chat_id,
+        [message.message_id for message in messages],
+        [file_id for message in messages if (file_id := extract_clip_file_id(message)) is not None],
+        [_route_message_filename(message) for message in messages if _route_message_filename(message) is not None],
+        clip_group,
+    )
+
+
+def _route_message_filename(message: Message) -> str | None:
+    if message.video is not None:
+        file_name = getattr(message.video, 'file_name', None)
+        return file_name if isinstance(file_name, str) else None
+
+    document = getattr(message, 'document', None)
+    if document is None:
+        return None
+
+    file_name = getattr(document, 'file_name', None)
+    return file_name if isinstance(file_name, str) else None
 
 
 def _intake_action_menu_kwargs(

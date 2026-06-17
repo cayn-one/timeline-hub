@@ -7,6 +7,7 @@ from loguru import logger
 
 from timeline_hub.handlers.clips.common import download_video_bytes, extract_clip_file_id, store_summary_kwargs
 from timeline_hub.handlers.clips.delivery import audio_normalization_from_settings, send_fetched_clip_batches
+from timeline_hub.infra.ffmpeg import UnsupportedVideoCodecError
 from timeline_hub.services.clip_store import ClipGroup, ClipSubGroup, Scope, StoreResult
 from timeline_hub.services.container import Services
 from timeline_hub.services.message_buffer import MessageGroup
@@ -34,13 +35,17 @@ async def execute_store_or_produce(
     )
     await state.clear()
 
-    result = await _store_buffered_clips(
-        bot=bot,
-        chat_id=message.chat.id,
-        services=services,
-        clip_group=clip_group,
-        clip_sub_group=clip_sub_group,
-    )
+    try:
+        result = await _store_buffered_clips(
+            bot=bot,
+            chat_id=message.chat.id,
+            services=services,
+            clip_group=clip_group,
+            clip_sub_group=clip_sub_group,
+        )
+    except UnsupportedVideoCodecError:
+        await message.edit_text('Invalid codec', reply_markup=None)
+        return StoreResult(stored_count=0, duplicate_count=0)
 
     await message.answer(**store_summary_kwargs(result))
 
@@ -92,11 +97,21 @@ async def _store_buffered_clips(
         clip_file_batch = await _message_group_to_clip_files(bot=bot, message_group=message_group)
         if not clip_file_batch:
             continue
-        result += await services.clip_store.store(
-            clip_group,
-            clip_sub_group,
-            clips=clip_file_batch,
-        )
+        try:
+            result += await services.clip_store.store(
+                clip_group,
+                clip_sub_group,
+                clips=clip_file_batch,
+            )
+        except UnsupportedVideoCodecError as error:
+            _log_unsupported_codec_warning(
+                error=error,
+                chat_id=chat_id,
+                clip_group=clip_group,
+                clip_sub_group=clip_sub_group,
+                message_group=message_group,
+            )
+            raise
 
     return result
 
@@ -136,3 +151,41 @@ def _uses_dense_layout(scope: Scope) -> bool:
     decide whether compaction should happen.
     """
     return scope in _DENSE_LAYOUT_SCOPES
+
+
+def _log_unsupported_codec_warning(
+    *,
+    error: UnsupportedVideoCodecError,
+    chat_id: ChatId,
+    clip_group: ClipGroup,
+    clip_sub_group: ClipSubGroup,
+    message_group: MessageGroup,
+) -> None:
+    logger.warning(
+        (
+            'unsupported clip codec during store execution '
+            '(codec={}, supported_codecs={}, chat_id={}, message_ids={}, file_ids={}, filenames={}, '
+            'clip_group={}, clip_sub_group={})'
+        ),
+        error.codec,
+        error.supported_codecs,
+        chat_id,
+        [message.message_id for message in message_group],
+        [file_id for message in message_group if (file_id := extract_clip_file_id(message)) is not None],
+        [_message_filename(message) for message in message_group if _message_filename(message) is not None],
+        clip_group,
+        clip_sub_group,
+    )
+
+
+def _message_filename(message: Message) -> str | None:
+    if message.video is not None:
+        file_name = getattr(message.video, 'file_name', None)
+        return file_name if isinstance(file_name, str) else None
+
+    document = getattr(message, 'document', None)
+    if document is None:
+        return None
+
+    file_name = getattr(document, 'file_name', None)
+    return file_name if isinstance(file_name, str) else None

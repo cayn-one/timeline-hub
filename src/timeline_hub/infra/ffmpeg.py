@@ -4,11 +4,22 @@ import json
 import math
 import os
 import tempfile
+import time
 from datetime import timedelta
 from pathlib import Path
 from typing import Any, Literal
 
 _HASH_READ_SIZE = 64 * 1024
+_SUPPORTED_VIDEO_CODECS = ('h264', 'hevc')
+
+
+class UnsupportedVideoCodecError(ValueError):
+    """Raised when clip hashing encounters a supported container with an unsupported video codec."""
+
+    def __init__(self, *, codec: str, supported_codecs: tuple[str, ...]) -> None:
+        self.codec = codec
+        self.supported_codecs = supported_codecs
+        super().__init__(f'unsupported video codec: {codec!r}; supported codecs: {supported_codecs}')
 
 
 async def to_opus(
@@ -349,36 +360,12 @@ async def probe_audio_sample_rate(
 
     try:
         input_path.write_bytes(audio_bytes)
-
-        proc = await asyncio.create_subprocess_exec(
-            'ffprobe',
-            '-v',
-            'error',
-            '-select_streams',
-            'a:0',
-            '-show_entries',
-            'stream=sample_rate',
-            '-of',
-            'default=nokey=1:noprint_wrappers=1',
-            str(input_path),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+        sample_rate_text = await _run_ffprobe_text(
+            input_path,
+            timeout,
+            select_streams='a:0',
+            show_entries='stream=sample_rate',
         )
-
-        try:
-            stdout, stderr = await asyncio.wait_for(
-                proc.communicate(),
-                timeout=timeout.total_seconds(),
-            )
-        except asyncio.TimeoutError:
-            proc.kill()
-            await proc.wait()
-            raise
-
-        if proc.returncode != 0:
-            raise RuntimeError(f'ffprobe failed: {stderr.decode(errors="replace")}')
-
-        sample_rate_text = stdout.decode().strip()
         try:
             sample_rate = int(sample_rate_text)
         except ValueError as error:
@@ -391,6 +378,23 @@ async def probe_audio_sample_rate(
 
     finally:
         input_path.unlink(missing_ok=True)
+
+
+async def _probe_primary_video_codec(
+    input_path: Path,
+    *,
+    timeout: timedelta,
+) -> str:
+    codec = await _run_ffprobe_text(
+        input_path,
+        timeout,
+        select_streams='v:0',
+        show_entries='stream=codec_name',
+    )
+    if not codec:
+        raise RuntimeError('ffprobe returned no primary video codec')
+
+    return codec
 
 
 async def normalize_video_audio_loudness(
@@ -499,10 +503,13 @@ async def hash_video_content(
     *,
     timeout: timedelta = timedelta(seconds=30),
 ) -> str:
-    """Return a stable SHA-256 hash of the primary video stream content.
+    """Return a stable SHA-256 hash of the primary encoded video stream.
 
-    The hash is computed from ffmpeg's copied first video stream, excluding
-    audio, subtitles, and data streams.
+    The hash is computed from the first video stream only, after lossless
+    extraction into a codec-appropriate elementary stream. Audio, subtitles,
+    data streams, and MP4 container metadata are excluded from the hash.
+    Original uploaded bytes remain authoritative storage bytes elsewhere; this
+    hash is an encoded-stream identity, not a perceptual visual identity.
 
     Args:
         video_bytes: Original MP4 video bytes.
@@ -514,6 +521,21 @@ async def hash_video_content(
 
     try:
         input_path.write_bytes(video_bytes)
+        deadline = time.monotonic() + timeout.total_seconds()
+        codec = await _probe_primary_video_codec(
+            input_path,
+            timeout=_remaining_timeout(deadline),
+        )
+        try:
+            bitstream_filter, output_format = {
+                'h264': ('h264_mp4toannexb', 'h264'),
+                'hevc': ('hevc_mp4toannexb', 'hevc'),
+            }[codec]
+        except KeyError as error:
+            raise UnsupportedVideoCodecError(
+                codec=codec,
+                supported_codecs=_SUPPORTED_VIDEO_CODECS,
+            ) from error
 
         cmd = (
             'ffmpeg',
@@ -534,39 +556,15 @@ async def hash_video_content(
             '-sn',
             '-dn',
             '-bsf:v',
-            'h264_mp4toannexb',
+            bitstream_filter,
             '-f',
-            'h264',
+            output_format,
             'pipe:1',
         )
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+        return await _hash_process_stdout(
+            cmd,
+            _remaining_timeout(deadline),
         )
-
-        if proc.stdout is None or proc.stderr is None:
-            raise RuntimeError('ffmpeg subprocess did not expose stdout/stderr pipes')
-
-        hasher = hashlib.sha256()
-        try:
-            _, stderr, returncode = await asyncio.wait_for(
-                asyncio.gather(
-                    _hash_stream(proc.stdout, hasher),
-                    proc.stderr.read(),
-                    proc.wait(),
-                ),
-                timeout=timeout.total_seconds(),
-            )
-        except asyncio.TimeoutError:
-            proc.kill()
-            await proc.wait()
-            raise
-
-        if returncode != 0:
-            raise RuntimeError(f'ffmpeg failed while hashing clip: {stderr.decode(errors="replace")}')
-
-        return hasher.hexdigest()
     finally:
         input_path.unlink(missing_ok=True)
 
@@ -578,17 +576,121 @@ async def _run_ffmpeg(
     stdin_bytes: bytes | None = None,
     capture: Literal['none', 'stdout', 'stderr'] = 'none',
 ) -> bytes:
-    input_data = stdin_bytes if stdin_bytes is not None else None
     stdout_target = asyncio.subprocess.PIPE if capture == 'stdout' else asyncio.subprocess.DEVNULL
+    stdout, stderr = await _run_process(
+        cmd,
+        timeout,
+        stdin_bytes=stdin_bytes,
+        stdout=stdout_target,
+        error_prefix='ffmpeg failed',
+    )
+    if capture == 'stderr' and not stderr:
+        raise RuntimeError('ffmpeg produced empty stderr')
+    if capture == 'stdout' and not stdout:
+        raise RuntimeError('ffmpeg produced empty stdout')
+    return stderr if capture == 'stderr' else stdout if capture == 'stdout' else b''
+
+
+async def _run_process(
+    cmd: tuple[str, ...],
+    timeout: timedelta,
+    *,
+    stdin_bytes: bytes | None = None,
+    stdout: int | None = asyncio.subprocess.DEVNULL,
+    error_prefix: str,
+) -> tuple[bytes, bytes]:
+    input_data = stdin_bytes if stdin_bytes is not None else None
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         stdin=asyncio.subprocess.PIPE if input_data is not None else None,
-        stdout=stdout_target,
+        stdout=stdout,
         stderr=asyncio.subprocess.PIPE,
     )
 
+    stdout_bytes, stderr_bytes = await _communicate_with_timeout(
+        proc,
+        timeout,
+        input_data=input_data,
+    )
+
+    if proc.returncode != 0:
+        stderr_text = stderr_bytes.decode(errors='replace')
+        raise RuntimeError(f'{error_prefix}: {stderr_text}')
+
+    return stdout_bytes, stderr_bytes
+
+
+async def _run_ffprobe_text(
+    input_path: Path,
+    timeout: timedelta,
+    *,
+    select_streams: str,
+    show_entries: str,
+) -> str:
+    stdout, stderr = await _run_process(
+        (
+            'ffprobe',
+            '-v',
+            'error',
+            '-select_streams',
+            select_streams,
+            '-show_entries',
+            show_entries,
+            '-of',
+            'default=nokey=1:noprint_wrappers=1',
+            str(input_path),
+        ),
+        timeout,
+        stdout=asyncio.subprocess.PIPE,
+        error_prefix='ffprobe failed',
+    )
+    if not stdout:
+        return ''
+    return stdout.decode().strip()
+
+
+async def _hash_process_stdout(
+    cmd: tuple[str, ...],
+    timeout: timedelta,
+) -> str:
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+
+    if proc.stdout is None or proc.stderr is None:
+        raise RuntimeError('ffmpeg subprocess did not expose stdout/stderr pipes')
+
+    hasher = hashlib.sha256()
     try:
-        stdout, stderr = await asyncio.wait_for(
+        _, stderr, returncode = await asyncio.wait_for(
+            asyncio.gather(
+                _hash_stream(proc.stdout, hasher),
+                proc.stderr.read(),
+                proc.wait(),
+            ),
+            timeout=timeout.total_seconds(),
+        )
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        raise
+
+    if returncode != 0:
+        raise RuntimeError(f'ffmpeg failed while hashing clip: {stderr.decode(errors="replace")}')
+
+    return hasher.hexdigest()
+
+
+async def _communicate_with_timeout(
+    proc: asyncio.subprocess.Process,
+    timeout: timedelta,
+    *,
+    input_data: bytes | None,
+) -> tuple[bytes, bytes]:
+    try:
+        stdout_bytes, stderr_bytes = await asyncio.wait_for(
             proc.communicate(input_data),
             timeout=timeout.total_seconds(),
         )
@@ -597,19 +699,14 @@ async def _run_ffmpeg(
         await proc.wait()
         raise
 
-    if proc.returncode != 0:
-        stderr_text = stderr.decode(errors='replace')
-        raise RuntimeError(f'ffmpeg failed: {stderr_text}')
+    return stdout_bytes, stderr_bytes
 
-    if capture == 'stdout':
-        if not stdout:
-            raise RuntimeError('ffmpeg produced empty stdout')
-        return stdout
-    if capture == 'stderr':
-        if not stderr:
-            raise RuntimeError('ffmpeg produced empty stderr')
-        return stderr
-    return b''
+
+def _remaining_timeout(deadline: float) -> timedelta:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise asyncio.TimeoutError
+    return timedelta(seconds=remaining)
 
 
 async def _hash_stream(stream: asyncio.StreamReader, hasher: Any) -> None:

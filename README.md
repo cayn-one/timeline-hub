@@ -10,7 +10,7 @@ Deterministic Telegram bot for storing, normalizing, and retrieving video clips 
 - the bot briefly buffers incoming messages, reconstructs Telegram media albums, and presents a single action menu
 - clips can then be normalized with `ffmpeg`, stored into a structured archive, or fetched back through a deterministic selection flow
 
-Stored clips are organized by `year -> season -> universe -> sub-season -> scope`. Each logical clip group lives under a single S3 prefix and is indexed by a `manifest.json` file. Fetching is driven by that manifest; storing uploads new clip objects first, then commits the updated manifest, with rollback if the manifest step fails.
+Stored clips are organized by `year -> season -> universe -> sub-season -> scope`. Each logical clip group lives under a single S3 prefix and is indexed by a `manifest.json` file. Fetching is driven by that manifest; storing uploads new clip objects first, then commits the updated manifest. If a later store stage fails after uploads begin, the manifest remains authoritative and manual cleanup may be required.
 
 The runtime itself is small: `aiogram` handles Telegram updates, a compact service container exposes domain operations, and the infrastructure layer provides generic S3 and async task primitives. The distinctive part of the project is not framework complexity, but the strictness of the interaction model, storage semantics, and failure behavior.
 
@@ -20,6 +20,7 @@ The runtime itself is small: `aiogram` handles Telegram updates, a compact servi
 - Menus use deterministic placement instead of left-to-right packing. Option grids follow a top-right-first snake layout, and unavailable options become inert dummy buttons instead of collapsing the layout.
 - Store and Get/Pull flows deliberately share the same structural layouts. The UI can differ from the domain model at render time, while storage and parsing still use domain enums as the source of truth.
 - Clip storage is manifest-backed rather than inferred from object listing alone. That gives strict ordering, subgroup discovery, validation, and clip-group-local deduplication by hash or existing clip id.
+- Clip identity uses `video_hash`, which hashes only the first encoded video stream after lossless elementary-stream extraction. MP4 container bytes, audio, subtitles, data streams, and container metadata are not part of clip identity, while the original uploaded bytes are still preserved in storage.
 - Background work is fail-fast. Detached task failures are logged, routed through a one-shot failure hook, and lead to superuser notification plus polling shutdown instead of silent degradation.
 - Tests encode these choices directly. They verify keyboard slot placement, message padding, stale-menu handling, manifest shape, deduplication behavior, and async task semantics.
 
@@ -42,6 +43,7 @@ At runtime, Telegram updates enter handlers, handlers translate them into domain
 - Snake-ordered option grids. The first two keyboard rows are filled from the top-right corner in a snake pattern. Newer or more relevant options naturally land in the easiest-to-reach positions without turning the menu into ad hoc per-step logic.
 - UI as a projection of the domain. `Season`, `Universe`, `SubSeason`, and `Scope` remain authoritative domain values, while the handler layer is free to reorder, group, or dummy-fill them for usability. That keeps storage and parsing stable while allowing a highly opinionated Telegram UI.
 - Manifest-backed clip groups. Each group under `<clip namespace>/<universe>-<year>-<season>/` stores clip objects plus a `manifest.json` index. The manifest is validated on load, defines subgroup membership and order, and acts as the commit boundary for store operations.
+- Encoded-stream clip identity. Clip deduplication is based on the first encoded video stream after lossless elementary-stream extraction. This is not whole-container hashing and not perceptual equivalence: the same visuals encoded differently, including across H.264 and HEVC, are not expected to dedupe.
 - Buffered ingestion before user choice. Incoming private-chat messages are collected per chat and released after a short debounce. The bot can then present one menu for a burst of forwarded clips and preserve Telegram media-group structure when storing or resending.
 - Fail-fast async orchestration. Detached tasks are supervised centrally. Debounced jobs can be rescheduled by key, but once real work starts it is shielded from cancellation, and unexpected failures trigger a clear shutdown path.
 
