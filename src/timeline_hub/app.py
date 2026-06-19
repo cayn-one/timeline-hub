@@ -100,7 +100,7 @@ def _configure_logging() -> None:
     logger.remove()
     logger.add(
         sys.stdout,
-        format='{time:HH:mm:ss} {message}',
+        format='{level.name:.2} {time:HH:mm:ss} {message}',
         enqueue=True,
         backtrace=False,
         diagnose=False,
