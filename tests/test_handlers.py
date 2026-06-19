@@ -6,7 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, call
 
 import pytest
-from aiogram.exceptions import TelegramEntityTooLarge
+from aiogram.exceptions import TelegramBadRequest, TelegramEntityTooLarge
 from aiogram.methods import SendMediaGroup
 from aiogram.types import InlineKeyboardButton, Message
 from aiogram.utils.formatting import Bold, Text
@@ -4837,6 +4837,58 @@ async def test_uploaded_clear_action_extra_messages_rejects_invalid_input() -> N
 
 
 @pytest.mark.asyncio
+async def test_uploaded_clear_action_missing_track_group_uses_invalidation_path() -> None:
+    group = track_store_module.TrackGroup(
+        universe=track_store_module.TrackUniverse.WEST,
+        year=2026,
+        season=track_store_module.Season.S1,
+    )
+    track_id = _CLIP_ID_1
+    identity = track_store_module.TrackStore.track_identity_to_string(group, track_id)
+    buffer = ChatMessageBuffer()
+    buffer.append(
+        _fake_message(
+            chat_id=42,
+            message_id=1,
+            photo=_fake_photo(file_id='photo-1'),
+            caption='·Title',
+            caption_entities=[_linked_dot_entity(f'https://{identity}.com')],
+        ),
+        chat_id=42,
+    )
+    track_store = SimpleNamespace(
+        list_tracks=AsyncMock(
+            side_effect=track_store_module.TrackGroupNotFoundError(
+                universe=group.universe,
+                year=group.year,
+                season=group.season,
+                sub_season=None,
+            )
+        ),
+        upload_variants=AsyncMock(),
+        clear_uploaded_variants=AsyncMock(),
+    )
+    services = _services(clip_store=SimpleNamespace(), track_store=track_store, buffer=buffer)
+    message = _fake_message(text='Select action:', chat_id=42, message_id=15)
+    state = _FakeState()
+
+    await on_track_intake_action(
+        _fake_callback(message, bot=SimpleNamespace()),
+        TrackIntakeActionCallbackData(action=TrackIntakeAction.UPLOADED_CLEAR, buffer_version=buffer.version(42)),
+        state,
+        services,
+        _settings(),
+    )
+
+    track_store.list_tracks.assert_awaited_once_with(group)
+    track_store.clear_uploaded_variants.assert_not_awaited()
+    track_store.upload_variants.assert_not_awaited()
+    message.edit_text.assert_awaited_with('Invalid input', reply_markup=None)
+    assert state.current_state is None
+    assert services.chat_message_buffer.peek_raw(42) == []
+
+
+@pytest.mark.asyncio
 async def test_uploaded_main_action_missing_variants_is_rejected() -> None:
     group = track_store_module.TrackGroup(
         universe=track_store_module.TrackUniverse.WEST,
@@ -5974,6 +6026,279 @@ async def test_uploaded_main_action_invalid_raw_opus_source_rejects_before_mutat
     bot.get_file.assert_awaited_once()
     bot.download_file.assert_awaited_once()
     message.edit_text.assert_awaited_with('Invalid input', reply_markup=None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('action', [TrackIntakeAction.UPLOADED_MAIN, TrackIntakeAction.UPLOADED_INSTRUMENTAL])
+async def test_uploaded_action_oversized_variant_shows_file_too_big_and_clears_state(
+    action: TrackIntakeAction,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings()
+    group = track_store_module.TrackGroup(
+        universe=track_store_module.TrackUniverse.WEST,
+        year=2026,
+        season=track_store_module.Season.S1,
+    )
+    track_id = _CLIP_ID_1
+    identity = track_store_module.TrackStore.track_identity_to_string(group, track_id)
+    buffer = ChatMessageBuffer()
+    buffer.append(
+        _fake_message(
+            chat_id=42,
+            message_id=1,
+            photo=_fake_photo(file_id='photo-1'),
+            caption='·Title',
+            caption_entities=[_linked_dot_entity(f'https://{identity}.com')],
+        ),
+        chat_id=42,
+    )
+    buffer.append(
+        _fake_message(
+            chat_id=42,
+            message_id=2,
+            audio=_fake_audio(file_id='audio-1', file_name='source.opus'),
+        ),
+        chat_id=42,
+    )
+    buffer.append(
+        _fake_message(
+            chat_id=42,
+            message_id=3,
+            document=_fake_document(file_id='document-3', file_name='100_0.mp3'),
+        ),
+        chat_id=42,
+    )
+    track_store = SimpleNamespace(
+        list_tracks=AsyncMock(return_value=_tracks_by_sub_season_with_id(track_id, variant_mode='uploaded')),
+        upload_variants=AsyncMock(),
+        update=AsyncMock(),
+        clear_uploaded_variants=AsyncMock(),
+    )
+    services = _services(clip_store=SimpleNamespace(), track_store=track_store, buffer=buffer)
+    message = _fake_message(text='Select action:', chat_id=42, message_id=15)
+    state = _FakeState()
+    prepared_source = FileBytes(data=b'prepared-source', extension=Extension.OPUS)
+    oversized_error = TelegramBadRequest(
+        method=SimpleNamespace(),
+        message='Bad Request: file is too big',
+    )
+    bot = SimpleNamespace(
+        get_file=AsyncMock(side_effect=oversized_error),
+        download_file=AsyncMock(),
+    )
+    monkeypatch.setattr(
+        track_ingest_module,
+        'prepare_audio_from_message',
+        AsyncMock(return_value=prepared_source),
+    )
+
+    await on_track_intake_action(
+        _fake_callback(message, bot=bot),
+        TrackIntakeActionCallbackData(action=action, buffer_version=buffer.version(42)),
+        state,
+        services,
+        settings,
+    )
+    await _select_uploaded_final(
+        message=message,
+        state=state,
+        services=services,
+        settings=settings,
+        bot=bot,
+        value='skip',
+    )
+
+    track_store.upload_variants.assert_not_awaited()
+    track_store.update.assert_not_awaited()
+    assert bot.get_file.await_args_list == [call('document-3')]
+    bot.download_file.assert_not_awaited()
+    family_label = 'Main' if action == TrackIntakeAction.UPLOADED_MAIN else 'Instrumental'
+    _assert_format_kwargs(
+        message.edit_text.await_args.kwargs,
+        {
+            **_selected_kwargs('Uploaded', family_label, 'West', '2026', '1', 'A'),
+            'reply_markup': None,
+        },
+    )
+    message.answer.assert_awaited_once_with('File is too big')
+    assert state.current_state is None
+    assert state.clear_count == 1
+    assert services.chat_message_buffer.peek_raw(42) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('action', [TrackIntakeAction.UPLOADED_MAIN, TrackIntakeAction.UPLOADED_INSTRUMENTAL])
+async def test_uploaded_action_oversized_source_shows_file_too_big_and_clears_state(
+    action: TrackIntakeAction,
+) -> None:
+    settings = _settings()
+    group = track_store_module.TrackGroup(
+        universe=track_store_module.TrackUniverse.WEST,
+        year=2026,
+        season=track_store_module.Season.S1,
+    )
+    track_id = _CLIP_ID_1
+    identity = track_store_module.TrackStore.track_identity_to_string(group, track_id)
+    buffer = ChatMessageBuffer()
+    buffer.append(
+        _fake_message(
+            chat_id=42,
+            message_id=1,
+            photo=_fake_photo(file_id='photo-1'),
+            caption='·Title',
+            caption_entities=[_linked_dot_entity(f'https://{identity}.com')],
+        ),
+        chat_id=42,
+    )
+    buffer.append(
+        _fake_message(
+            chat_id=42,
+            message_id=2,
+            audio=_fake_audio(file_id='audio-1', file_name='source.opus'),
+        ),
+        chat_id=42,
+    )
+    buffer.append(
+        _fake_message(
+            chat_id=42,
+            message_id=3,
+            document=_fake_document(file_id='document-3', file_name='100_0.mp3'),
+        ),
+        chat_id=42,
+    )
+    track_store = SimpleNamespace(
+        list_tracks=AsyncMock(return_value=_tracks_by_sub_season_with_id(track_id, variant_mode='uploaded')),
+        upload_variants=AsyncMock(),
+        update=AsyncMock(),
+        clear_uploaded_variants=AsyncMock(),
+    )
+    services = _services(clip_store=SimpleNamespace(), track_store=track_store, buffer=buffer)
+    message = _fake_message(text='Select action:', chat_id=42, message_id=15)
+    state = _FakeState()
+    oversized_error = TelegramBadRequest(
+        method=SimpleNamespace(),
+        message='Bad Request: file is too big',
+    )
+    bot = SimpleNamespace(
+        get_file=AsyncMock(side_effect=oversized_error),
+        download_file=AsyncMock(),
+    )
+
+    await on_track_intake_action(
+        _fake_callback(message, bot=bot),
+        TrackIntakeActionCallbackData(action=action, buffer_version=buffer.version(42)),
+        state,
+        services,
+        settings,
+    )
+    await _select_uploaded_final(
+        message=message,
+        state=state,
+        services=services,
+        settings=settings,
+        bot=bot,
+        value='skip',
+    )
+
+    track_store.upload_variants.assert_not_awaited()
+    track_store.update.assert_not_awaited()
+    assert bot.get_file.await_args_list == [call('audio-1')]
+    bot.download_file.assert_not_awaited()
+    family_label = 'Main' if action == TrackIntakeAction.UPLOADED_MAIN else 'Instrumental'
+    _assert_format_kwargs(
+        message.edit_text.await_args.kwargs,
+        {
+            **_selected_kwargs('Uploaded', family_label, 'West', '2026', '1', 'A'),
+            'reply_markup': None,
+        },
+    )
+    message.answer.assert_awaited_once_with('File is too big')
+    assert state.current_state is None
+    assert state.clear_count == 1
+    assert services.chat_message_buffer.peek_raw(42) == []
+
+
+@pytest.mark.asyncio
+async def test_uploaded_main_action_unrelated_telegram_bad_request_propagates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings()
+    group = track_store_module.TrackGroup(
+        universe=track_store_module.TrackUniverse.WEST,
+        year=2026,
+        season=track_store_module.Season.S1,
+    )
+    track_id = _CLIP_ID_1
+    identity = track_store_module.TrackStore.track_identity_to_string(group, track_id)
+    buffer = ChatMessageBuffer()
+    buffer.append(
+        _fake_message(
+            chat_id=42,
+            message_id=1,
+            photo=_fake_photo(file_id='photo-1'),
+            caption='·Title',
+            caption_entities=[_linked_dot_entity(f'https://{identity}.com')],
+        ),
+        chat_id=42,
+    )
+    buffer.append(
+        _fake_message(
+            chat_id=42,
+            message_id=2,
+            audio=_fake_audio(file_id='audio-1', file_name='source.opus'),
+        ),
+        chat_id=42,
+    )
+    buffer.append(
+        _fake_message(
+            chat_id=42,
+            message_id=3,
+            document=_fake_document(file_id='document-3', file_name='100_0.mp3'),
+        ),
+        chat_id=42,
+    )
+    track_store = SimpleNamespace(
+        list_tracks=AsyncMock(return_value=_tracks_by_sub_season_with_id(track_id)),
+        upload_variants=AsyncMock(),
+        update=AsyncMock(),
+        clear_uploaded_variants=AsyncMock(),
+    )
+    services = _services(clip_store=SimpleNamespace(), track_store=track_store, buffer=buffer)
+    message = _fake_message(text='Select action:', chat_id=42, message_id=15)
+    state = _FakeState()
+    prepared_source = FileBytes(data=b'prepared-source', extension=Extension.OPUS)
+    unrelated_error = TelegramBadRequest(
+        method=SimpleNamespace(),
+        message='Bad Request: chat not found',
+    )
+    bot = SimpleNamespace(
+        get_file=AsyncMock(side_effect=unrelated_error),
+        download_file=AsyncMock(),
+    )
+    monkeypatch.setattr(
+        track_ingest_module,
+        'prepare_audio_from_message',
+        AsyncMock(return_value=prepared_source),
+    )
+
+    await on_track_intake_action(
+        _fake_callback(message, bot=bot),
+        TrackIntakeActionCallbackData(action=TrackIntakeAction.UPLOADED_MAIN, buffer_version=buffer.version(42)),
+        state,
+        services,
+        settings,
+    )
+
+    with pytest.raises(TelegramBadRequest, match='chat not found'):
+        await _select_uploaded_final(
+            message=message,
+            state=state,
+            services=services,
+            settings=settings,
+            bot=bot,
+            value='skip',
+        )
 
 
 @pytest.mark.asyncio

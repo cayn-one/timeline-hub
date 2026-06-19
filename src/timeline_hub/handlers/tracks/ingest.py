@@ -5,6 +5,7 @@ from typing import Any
 
 from aiogram import Bot, F, Router
 from aiogram.enums import ChatType
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters.callback_data import CallbackData
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -2401,10 +2402,17 @@ async def _enter_uploaded_track_final_menu(
         if services.chat_message_buffer.version(chat_id) != expected_buffer_version:
             await handle_stale_selection(message=message, state=state)
             return
+    except TrackGroupNotFoundError:
+        await _invalidate_track_intake_buffer(
+            message=message,
+            state=state,
+            services=services,
+            text='Track is not stored',
+        )
+        return
     except (
         TrackInputError,
         InvalidTrackIdentityError,
-        TrackGroupNotFoundError,
     ):
         await _invalidate_track_intake_buffer(
             message=message,
@@ -2545,16 +2553,46 @@ async def _execute_uploaded_track_final_selection(
             await prepare_uploaded_variant_from_parsed(bot=bot, parsed_variant=parsed_variant)
             for parsed_variant in parsed_variants
         ]
-    except (
-        TrackInputError,
-        TrackInvalidAudioFormatError,
-        InvalidExtensionError,
-    ):
+    except TelegramBadRequest as error:
+        oversized_file_messages = {'file is too big', 'Bad Request: file is too big'}
+        matched_oversized_file = error.message in oversized_file_messages
+        logger.warning(
+            'uploaded track final selection hit TelegramBadRequest (message={}, repr={}, matched_oversized_file={})',
+            error.message,
+            repr(error),
+            matched_oversized_file,
+        )
+        if not matched_oversized_file:
+            raise
+        # This is a terminal post-selection failure: preserve the selected
+        # execution message, clear state, and flush the uploaded buffer.
+        await state.clear()
+        services.chat_message_buffer.flush(chat_id)
+        await message.answer('File is too big')
+        return
+    except (TrackInputError, TrackInvalidAudioFormatError, InvalidExtensionError) as error:
+        cause = error.__cause__
+        context = error.__context__
         await _invalidate_track_intake_buffer(
             message=message,
             state=state,
             services=services,
             text='Invalid input',
+        )
+        logger.error(
+            'uploaded track final selection hit generic invalidation '
+            '(type={}, repr={}, str={}, message={}, cause_type={}, cause_repr={}, cause_message={}, '
+            'context_type={}, context_repr={}, context_message={})',
+            type(error).__qualname__,
+            repr(error),
+            str(error),
+            getattr(error, 'message', None),
+            None if cause is None else type(cause).__qualname__,
+            None if cause is None else repr(cause),
+            None if cause is None else getattr(cause, 'message', None),
+            None if context is None else type(context).__qualname__,
+            None if context is None else repr(context),
+            None if context is None else getattr(context, 'message', None),
         )
         return
     except ValueError as error:
