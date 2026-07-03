@@ -1,5 +1,6 @@
 import asyncio
 import math
+from collections.abc import Callable
 from datetime import date, timedelta
 from io import BytesIO
 from types import SimpleNamespace
@@ -2911,6 +2912,46 @@ async def test_mp3_audio_only_batch_dispatches_to_track_menu() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ('media_kind', 'file_name'),
+    [
+        ('audio', 'song.opus.part0'),
+        ('document', '50_6.mp3.part0'),
+    ],
+)
+async def test_multipart_uploaded_file_only_batch_dispatches_to_track_menu(
+    media_kind: str,
+    file_name: str,
+) -> None:
+    scheduler = _FakeScheduler()
+    buffer = ChatMessageBuffer()
+    services = _services(clip_store=SimpleNamespace(), scheduler=scheduler, buffer=buffer)
+    if media_kind == 'audio':
+        message = _fake_message(chat_id=42, message_id=2, audio=_fake_audio(file_id='file-1', file_name=file_name))
+    else:
+        message = _fake_message(
+            chat_id=42, message_id=2, document=_fake_document(file_id='file-1', file_name=file_name)
+        )
+
+    await on_buffered_relevant_message(message, services, _settings())
+    assert scheduler.job is not None
+
+    await scheduler.job()
+
+    expected = Text(
+        create_padding_line(_settings().message_width),
+        '\n',
+        Text('Messages: ', Bold('1')),
+        '. Select action:',
+    ).as_kwargs()
+    _assert_format_kwargs(message.answer.await_args.kwargs, expected)
+    reply_markup = message.answer.await_args.kwargs['reply_markup']
+    _assert_three_rows(reply_markup)
+    assert _keyboard_rows(reply_markup) == [['Uploaded', 'Store'], ['Remove', 'Replace'], ['Cancel']]
+    assert [buffered_message.message_id for buffered_message in services.chat_message_buffer.peek_raw(42)] == [2]
+
+
+@pytest.mark.asyncio
 async def test_song_mp3_document_only_batch_shows_fallback_menu() -> None:
     scheduler = _FakeScheduler()
     buffer = ChatMessageBuffer()
@@ -3826,6 +3867,476 @@ def test_parse_uploaded_variant_filename_rejects_malformed_names(file_name: str)
         track_store_execution_module.parse_uploaded_variant_filename(file_name)
 
 
+@pytest.mark.parametrize(
+    ('message', 'logical_name', 'part_index'),
+    [
+        (
+            _fake_message(chat_id=42, message_id=1, audio=_fake_audio(file_id='audio-1', file_name='source.opus')),
+            'source.opus',
+            None,
+        ),
+        (
+            _fake_message(
+                chat_id=42,
+                message_id=1,
+                document=_fake_document(file_id='document-1', file_name='source.opus.part0'),
+            ),
+            'source.opus',
+            0,
+        ),
+        (
+            _fake_message(
+                chat_id=42, message_id=1, document=_fake_document(file_id='document-1', file_name='85_6.mp3')
+            ),
+            '85_6.mp3',
+            None,
+        ),
+        (
+            _fake_message(
+                chat_id=42,
+                message_id=1,
+                audio=_fake_audio(file_id='audio-1', file_name='85_6.mp3.part9'),
+            ),
+            '85_6.mp3',
+            9,
+        ),
+    ],
+)
+def test_extract_uploaded_file_ref_accepts_logical_names(
+    message: Message,
+    logical_name: str,
+    part_index: int | None,
+) -> None:
+    file_ref = track_store_execution_module.extract_uploaded_file_ref(message)
+    assert file_ref == track_store_execution_module.UploadedFileRef(
+        logical_name=logical_name,
+        file_id='audio-1' if message.audio is not None else 'document-1',
+        file_name=message.audio.file_name if message.audio is not None else message.document.file_name,
+        part_index=part_index,
+    )
+
+
+@pytest.mark.parametrize(
+    'file_name',
+    ['song.txt.part0', 'song.opus.part10', 'song.opus.partx', 'random.part0'],
+)
+def test_extract_uploaded_file_ref_rejects_malformed_or_unsupported_names(file_name: str) -> None:
+    message = _fake_message(
+        chat_id=42, message_id=1, document=_fake_document(file_id='document-1', file_name=file_name)
+    )
+    assert track_store_execution_module.extract_uploaded_file_ref(message) is None
+
+
+@pytest.mark.parametrize(
+    ('message', 'expected'),
+    [
+        (
+            _fake_message(chat_id=42, message_id=1, audio=_fake_audio(file_id='audio-1', file_name='source.opus')),
+            track_store_execution_module.UploadedFileRef(
+                logical_name='source.opus',
+                file_id='audio-1',
+                file_name='source.opus',
+                part_index=None,
+            ),
+        ),
+        (
+            _fake_message(
+                chat_id=42,
+                message_id=1,
+                document=_fake_document(file_id='document-1', file_name='source.opus.part0'),
+            ),
+            track_store_execution_module.UploadedFileRef(
+                logical_name='source.opus',
+                file_id='document-1',
+                file_name='source.opus.part0',
+                part_index=0,
+            ),
+        ),
+        (
+            _fake_message(
+                chat_id=42,
+                message_id=1,
+                document=_fake_document(file_id='document-1', file_name='85_6.mp3'),
+            ),
+            track_store_execution_module.UploadedFileRef(
+                logical_name='85_6.mp3',
+                file_id='document-1',
+                file_name='85_6.mp3',
+                part_index=None,
+            ),
+        ),
+        (
+            _fake_message(
+                chat_id=42,
+                message_id=1,
+                audio=_fake_audio(file_id='audio-1', file_name='85_6.mp3.part9'),
+            ),
+            track_store_execution_module.UploadedFileRef(
+                logical_name='85_6.mp3',
+                file_id='audio-1',
+                file_name='85_6.mp3.part9',
+                part_index=9,
+            ),
+        ),
+    ],
+)
+def test_uploaded_dispatch_extractors_accept_logical_candidates(
+    message: Message,
+    expected: track_store_execution_module.UploadedFileRef,
+) -> None:
+    extractor = (
+        track_store_execution_module.extract_uploaded_opus_attachment
+        if expected.logical_name == 'source.opus'
+        else track_store_execution_module.extract_uploaded_mp3_attachment
+    )
+    assert extractor(message) == expected
+
+
+@pytest.mark.parametrize(
+    ('message', 'extractor'),
+    [
+        (
+            _fake_message(
+                chat_id=42,
+                message_id=1,
+                document=_fake_document(file_id='document-1', file_name='song.mp3'),
+            ),
+            track_store_execution_module.extract_uploaded_mp3_attachment,
+        ),
+        (
+            _fake_message(
+                chat_id=42,
+                message_id=1,
+                document=_fake_document(file_id='document-1', file_name='song.mp3.part0'),
+            ),
+            track_store_execution_module.extract_uploaded_mp3_attachment,
+        ),
+        (
+            _fake_message(
+                chat_id=42,
+                message_id=1,
+                document=_fake_document(file_id='document-1', file_name='song.txt.part0'),
+            ),
+            track_store_execution_module.extract_uploaded_opus_attachment,
+        ),
+    ],
+)
+def test_uploaded_dispatch_extractors_reject_non_candidates(
+    message: Message,
+    extractor: Callable[[Message], track_store_execution_module.UploadedFileRef | None],
+) -> None:
+    assert extractor(message) is None
+
+
+@pytest.mark.asyncio
+async def test_validate_uploaded_source_variant_batch_accepts_multipart_files_in_any_message_order() -> None:
+    photo_message = _fake_message(
+        chat_id=42,
+        message_id=1,
+        photo=_fake_photo(file_id='photo-1'),
+        caption='·Title',
+        caption_entities=[_linked_dot_entity('https://west-2026-1--018f05c1f1a37b348d291f53a1c9d0e1.com')],
+    )
+    messages = [
+        photo_message,
+        _fake_message(
+            chat_id=42, message_id=2, document=_fake_document(file_id='variant-fast-1', file_name='85_6.mp3.part1')
+        ),
+        _fake_message(chat_id=42, message_id=3, audio=_fake_audio(file_id='source-1', file_name='source.opus.part1')),
+        _fake_message(
+            chat_id=42, message_id=4, document=_fake_document(file_id='source-0', file_name='source.opus.part0')
+        ),
+        _fake_message(
+            chat_id=42, message_id=5, audio=_fake_audio(file_id='variant-fast-0', file_name='85_6.mp3.part0')
+        ),
+        _fake_message(chat_id=42, message_id=6, document=_fake_document(file_id='variant-slow', file_name='113_5.mp3')),
+    ]
+
+    returned_photo_message, source_file_refs, parsed_variants = (
+        track_store_execution_module.validate_uploaded_source_variant_batch(messages)
+    )
+
+    assert returned_photo_message is photo_message
+    assert source_file_refs == (
+        track_store_execution_module.UploadedFileRef(
+            logical_name='source.opus',
+            file_id='source-0',
+            file_name='source.opus.part0',
+            part_index=0,
+        ),
+        track_store_execution_module.UploadedFileRef(
+            logical_name='source.opus',
+            file_id='source-1',
+            file_name='source.opus.part1',
+            part_index=1,
+        ),
+    )
+    assert [
+        (variant.speed, variant.reverb, [file_ref.file_id for file_ref in variant.file_refs])
+        for variant in parsed_variants
+    ] == [
+        (0.85, 0.6, ['variant-fast-0', 'variant-fast-1']),
+        (1.13, 0.5, ['variant-slow']),
+    ]
+
+
+def test_validate_uploaded_source_variant_batch_accepts_variants_only() -> None:
+    photo_message = _fake_message(
+        chat_id=42,
+        message_id=1,
+        photo=_fake_photo(file_id='photo-1'),
+        caption='·Title',
+        caption_entities=[_linked_dot_entity('https://west-2026-1--018f05c1f1a37b348d291f53a1c9d0e1.com')],
+    )
+    messages = [
+        photo_message,
+        _fake_message(chat_id=42, message_id=2, document=_fake_document(file_id='variant-fast', file_name='85_6.mp3')),
+        _fake_message(chat_id=42, message_id=3, document=_fake_document(file_id='variant-slow', file_name='113_5.mp3')),
+    ]
+
+    returned_photo_message, source_file_refs, parsed_variants = (
+        track_store_execution_module.validate_uploaded_source_variant_batch(messages)
+    )
+
+    assert returned_photo_message is photo_message
+    assert source_file_refs is None
+    assert [(variant.speed, variant.reverb) for variant in parsed_variants] == [
+        (0.85, 0.6),
+        (1.13, 0.5),
+    ]
+
+
+@pytest.mark.parametrize(
+    'uploaded_file_refs',
+    [
+        [
+            track_store_execution_module.UploadedFileRef(
+                logical_name='source.opus',
+                file_id='source-dup-0',
+                file_name='source.opus.part0',
+                part_index=0,
+            ),
+            track_store_execution_module.UploadedFileRef(
+                logical_name='source.opus',
+                file_id='source-dup-1',
+                file_name='source.opus.part0',
+                part_index=0,
+            ),
+        ],
+        [
+            track_store_execution_module.UploadedFileRef(
+                logical_name='source.opus',
+                file_id='source-missing-1',
+                file_name='source.opus.part1',
+                part_index=1,
+            ),
+        ],
+        [
+            track_store_execution_module.UploadedFileRef(
+                logical_name='source.opus',
+                file_id='source-truncated-0',
+                file_name='source.opus.part0',
+                part_index=0,
+            ),
+        ],
+        [
+            track_store_execution_module.UploadedFileRef(
+                logical_name='85_6.mp3',
+                file_id='variant-truncated-0',
+                file_name='85_6.mp3.part0',
+                part_index=0,
+            ),
+        ],
+        [
+            track_store_execution_module.UploadedFileRef(
+                logical_name='source.opus',
+                file_id='source-whole',
+                file_name='source.opus',
+                part_index=None,
+            ),
+            track_store_execution_module.UploadedFileRef(
+                logical_name='source.opus',
+                file_id='source-part-0',
+                file_name='source.opus.part0',
+                part_index=0,
+            ),
+        ],
+    ],
+)
+def test_validate_and_order_uploaded_file_refs_rejects_invalid_groups(
+    uploaded_file_refs: list[track_store_execution_module.UploadedFileRef],
+) -> None:
+    with pytest.raises(track_store_execution_module.TrackInputError, match='Invalid input'):
+        track_store_execution_module._validate_and_order_uploaded_file_refs(uploaded_file_refs)
+
+
+def test_validate_uploaded_source_variant_batch_rejects_multiple_source_groups() -> None:
+    messages = [
+        _fake_message(chat_id=42, message_id=1, photo=_fake_photo(file_id='photo-1'), caption='·Title'),
+        _fake_message(chat_id=42, message_id=2, document=_fake_document(file_id='source-0', file_name='source.opus')),
+        _fake_message(chat_id=42, message_id=3, audio=_fake_audio(file_id='source-1', file_name='source.opus.part0')),
+        _fake_message(chat_id=42, message_id=4, document=_fake_document(file_id='variant-1', file_name='85_6.mp3')),
+    ]
+
+    with pytest.raises(track_store_execution_module.TrackInputError, match='Invalid input'):
+        track_store_execution_module.validate_uploaded_source_variant_batch(messages)
+
+
+def test_validate_uploaded_source_variant_batch_rejects_zero_variants() -> None:
+    messages = [
+        _fake_message(chat_id=42, message_id=1, photo=_fake_photo(file_id='photo-1'), caption='·Title'),
+        _fake_message(chat_id=42, message_id=2, document=_fake_document(file_id='source-0', file_name='source.opus')),
+    ]
+
+    with pytest.raises(track_store_execution_module.TrackInputError, match='Invalid input'):
+        track_store_execution_module.validate_uploaded_source_variant_batch(messages)
+
+
+@pytest.mark.asyncio
+async def test_prepare_uploaded_source_from_file_refs_merges_parts_in_numeric_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_file_refs = (
+        track_store_execution_module.UploadedFileRef(
+            logical_name='source.opus',
+            file_id='source-1',
+            file_name='source.opus.part1',
+            part_index=1,
+        ),
+        track_store_execution_module.UploadedFileRef(
+            logical_name='source.opus',
+            file_id='source-0',
+            file_name='source.opus.part0',
+            part_index=0,
+        ),
+    )
+    bot = SimpleNamespace(
+        get_file=AsyncMock(
+            side_effect=[SimpleNamespace(file_path='source-path-0'), SimpleNamespace(file_path='source-path-1')]
+        ),
+        download_file=AsyncMock(side_effect=[BytesIO(b'part0-'), BytesIO(b'part1')]),
+    )
+    probe_audio_sample_rate = AsyncMock(return_value=48_000)
+    monkeypatch.setattr(track_store_execution_module, 'probe_audio_sample_rate', probe_audio_sample_rate)
+
+    prepared = await track_store_execution_module.prepare_uploaded_source_from_file_refs(
+        bot=bot,
+        source_file_refs=source_file_refs,
+        max_file_size_bytes=100,
+    )
+
+    assert prepared == FileBytes(data=b'part0-part1', extension=Extension.OPUS)
+    assert bot.get_file.await_args_list == [call('source-0'), call('source-1')]
+    probe_audio_sample_rate.assert_awaited_once_with(b'part0-part1')
+
+
+@pytest.mark.asyncio
+async def test_prepare_uploaded_variant_from_parsed_merges_parts_in_numeric_order() -> None:
+    parsed_variant = track_store_execution_module.ParsedUploadedVariant(
+        file_refs=(
+            track_store_execution_module.UploadedFileRef(
+                logical_name='85_6.mp3',
+                file_id='variant-1',
+                file_name='85_6.mp3.part1',
+                part_index=1,
+            ),
+            track_store_execution_module.UploadedFileRef(
+                logical_name='85_6.mp3',
+                file_id='variant-0',
+                file_name='85_6.mp3.part0',
+                part_index=0,
+            ),
+        ),
+        speed=0.85,
+        reverb=0.6,
+    )
+    bot = SimpleNamespace(
+        get_file=AsyncMock(
+            side_effect=[SimpleNamespace(file_path='variant-path-0'), SimpleNamespace(file_path='variant-path-1')]
+        ),
+        download_file=AsyncMock(side_effect=[BytesIO(b'fast-0-'), BytesIO(b'fast-1')]),
+    )
+
+    prepared = await track_store_execution_module.prepare_uploaded_variant_from_parsed(
+        bot=bot,
+        parsed_variant=parsed_variant,
+        max_file_size_bytes=100,
+    )
+
+    assert prepared == track_store_module.UploadedVariant(
+        speed=0.85,
+        reverb=0.6,
+        audio=FileBytes(data=b'fast-0-fast-1', extension=Extension.MP3),
+    )
+    assert bot.get_file.await_args_list == [call('variant-0'), call('variant-1')]
+
+
+@pytest.mark.asyncio
+async def test_prepare_uploaded_source_from_file_refs_rejects_oversized_merged_bytes() -> None:
+    source_file_refs = (
+        track_store_execution_module.UploadedFileRef(
+            logical_name='source.opus',
+            file_id='source-0',
+            file_name='source.opus.part0',
+            part_index=0,
+        ),
+        track_store_execution_module.UploadedFileRef(
+            logical_name='source.opus',
+            file_id='source-1',
+            file_name='source.opus.part1',
+            part_index=1,
+        ),
+    )
+    bot = SimpleNamespace(
+        get_file=AsyncMock(
+            side_effect=[SimpleNamespace(file_path='source-path-0'), SimpleNamespace(file_path='source-path-1')]
+        ),
+        download_file=AsyncMock(side_effect=[BytesIO(b'part0-'), BytesIO(b'part1')]),
+    )
+
+    with pytest.raises(track_store_execution_module.UploadedFileTooBigError):
+        await track_store_execution_module.prepare_uploaded_source_from_file_refs(
+            bot=bot,
+            source_file_refs=source_file_refs,
+            max_file_size_bytes=10,
+        )
+
+
+@pytest.mark.asyncio
+async def test_prepare_uploaded_variant_from_parsed_rejects_oversized_merged_bytes() -> None:
+    parsed_variant = track_store_execution_module.ParsedUploadedVariant(
+        file_refs=(
+            track_store_execution_module.UploadedFileRef(
+                logical_name='85_6.mp3',
+                file_id='variant-0',
+                file_name='85_6.mp3.part0',
+                part_index=0,
+            ),
+            track_store_execution_module.UploadedFileRef(
+                logical_name='85_6.mp3',
+                file_id='variant-1',
+                file_name='85_6.mp3.part1',
+                part_index=1,
+            ),
+        ),
+        speed=0.85,
+        reverb=0.6,
+    )
+    bot = SimpleNamespace(
+        get_file=AsyncMock(
+            side_effect=[SimpleNamespace(file_path='variant-path-0'), SimpleNamespace(file_path='variant-path-1')]
+        ),
+        download_file=AsyncMock(side_effect=[BytesIO(b'fast-0-'), BytesIO(b'fast-1')]),
+    )
+
+    with pytest.raises(track_store_execution_module.UploadedFileTooBigError):
+        await track_store_execution_module.prepare_uploaded_variant_from_parsed(
+            bot=bot,
+            parsed_variant=parsed_variant,
+            max_file_size_bytes=10,
+        )
+
+
 @pytest.mark.asyncio
 async def test_uploaded_main_action_uploads_raw_mp3_variants_and_skips_opus_helpers(
     monkeypatch: pytest.MonkeyPatch,
@@ -3842,7 +4353,7 @@ async def test_uploaded_main_action_uploads_raw_mp3_variants_and_skips_opus_help
     source_message = _fake_message(
         chat_id=42,
         message_id=2,
-        audio=_fake_audio(file_id='audio-1', file_name='85_6.MP3'),
+        audio=_fake_audio(file_id='audio-1', file_name='source.opus'),
     )
     buffer.append(
         _fake_message(
@@ -3879,9 +4390,13 @@ async def test_uploaded_main_action_uploads_raw_mp3_variants_and_skips_opus_help
         download_file=AsyncMock(return_value=BytesIO(b'raw-audio-3')),
     )
     to_opus = AsyncMock(side_effect=AssertionError('uploaded variants must not be converted'))
-    prepare_audio_from_message = AsyncMock(return_value=prepared_source)
+    prepare_uploaded_source_from_file_refs = AsyncMock(return_value=prepared_source)
     monkeypatch.setattr(track_store_execution_module, 'to_opus', to_opus)
-    monkeypatch.setattr(track_ingest_module, 'prepare_audio_from_message', prepare_audio_from_message)
+    monkeypatch.setattr(
+        track_ingest_module,
+        'prepare_uploaded_source_from_file_refs',
+        prepare_uploaded_source_from_file_refs,
+    )
 
     await on_track_intake_action(
         _fake_callback(message, bot=bot),
@@ -3912,7 +4427,6 @@ async def test_uploaded_main_action_uploads_raw_mp3_variants_and_skips_opus_help
     track_store.update.assert_awaited_once_with(group, track_id, track=prepared_source)
     track_store.clear_uploaded_variants.assert_not_awaited()
     to_opus.assert_not_awaited()
-    prepare_audio_from_message.assert_awaited_once_with(bot=bot, audio_message=source_message)
     _assert_format_kwargs(
         message.edit_text.await_args.kwargs,
         _selected_kwargs('Uploaded', 'Main', 'West', '2026', '1', 'A'),
@@ -3922,7 +4436,9 @@ async def test_uploaded_main_action_uploads_raw_mp3_variants_and_skips_opus_help
 
 
 @pytest.mark.asyncio
-async def test_uploaded_main_action_old_cover_plus_variants_only_shape_is_invalid() -> None:
+async def test_uploaded_main_action_variants_only_keeps_existing_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     group = track_store_module.TrackGroup(
         universe=track_store_module.TrackUniverse.WEST,
         year=2026,
@@ -3950,29 +4466,53 @@ async def test_uploaded_main_action_old_cover_plus_variants_only_shape_is_invali
         chat_id=42,
     )
     track_store = SimpleNamespace(
-        list_tracks=AsyncMock(),
+        list_tracks=AsyncMock(return_value=_tracks_by_sub_season_with_id(track_id)),
         upload_variants=AsyncMock(),
         update=AsyncMock(),
         clear_uploaded_variants=AsyncMock(),
     )
     services = _services(clip_store=SimpleNamespace(), track_store=track_store, buffer=buffer)
     message = _fake_message(text='Select action:', chat_id=42, message_id=15)
-    bot = SimpleNamespace(get_file=AsyncMock(), download_file=AsyncMock())
+    state = _FakeState()
+    bot = SimpleNamespace(
+        get_file=AsyncMock(return_value=SimpleNamespace(file_path='audio-path-2')),
+        download_file=AsyncMock(return_value=BytesIO(b'raw-variant')),
+    )
+    prepare_uploaded_source_from_file_refs = AsyncMock()
+    monkeypatch.setattr(
+        track_ingest_module,
+        'prepare_uploaded_source_from_file_refs',
+        prepare_uploaded_source_from_file_refs,
+    )
 
     await on_track_intake_action(
         _fake_callback(message, bot=bot),
         TrackIntakeActionCallbackData(action=TrackIntakeAction.UPLOADED_MAIN, buffer_version=buffer.version(42)),
-        _FakeState(),
+        state,
         services,
         _settings(),
     )
+    await _select_uploaded_final(
+        message=message,
+        state=state,
+        services=services,
+        settings=_settings(),
+        bot=bot,
+        value='skip',
+    )
 
-    track_store.list_tracks.assert_not_awaited()
-    track_store.upload_variants.assert_not_awaited()
+    track_store.list_tracks.assert_awaited_once()
+    track_store.upload_variants.assert_awaited_once()
+    assert track_store.upload_variants.await_args.args == (group, track_id)
+    uploaded_variants = track_store.upload_variants.await_args.kwargs['variants']
+    assert [(variant.speed, variant.reverb, variant.audio) for variant in uploaded_variants] == [
+        (1.0, 0.0, FileBytes(data=b'raw-variant', extension=Extension.MP3)),
+    ]
     track_store.update.assert_not_awaited()
-    bot.get_file.assert_not_awaited()
-    bot.download_file.assert_not_awaited()
-    message.edit_text.assert_awaited_with('Invalid input', reply_markup=None)
+    prepare_uploaded_source_from_file_refs.assert_not_awaited()
+    assert bot.get_file.await_args_list == [call('document-2')]
+    bot.download_file.assert_awaited_once_with('audio-path-2')
+    message.answer.assert_awaited_once_with('Done')
     assert services.chat_message_buffer.peek_raw(42) == []
 
 
@@ -4045,7 +4585,11 @@ async def test_uploaded_main_action_accepts_multiple_variants_sorted_by_speed(
             ]
         ),
     )
-    monkeypatch.setattr(track_ingest_module, 'prepare_audio_from_message', AsyncMock(return_value=prepared_source))
+    monkeypatch.setattr(
+        track_ingest_module,
+        'prepare_uploaded_source_from_file_refs',
+        AsyncMock(return_value=prepared_source),
+    )
 
     await on_track_intake_action(
         _fake_callback(message, bot=bot),
@@ -4168,7 +4712,7 @@ async def test_uploaded_main_action_opus_source_audio_uses_existing_fast_path(
 
 
 @pytest.mark.asyncio
-async def test_uploaded_main_action_non_opus_source_audio_uses_existing_source_preparation(
+async def test_uploaded_main_action_opus_source_audio_uses_source_file_refs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     settings = _settings()
@@ -4194,7 +4738,7 @@ async def test_uploaded_main_action_non_opus_source_audio_uses_existing_source_p
         _fake_message(
             chat_id=42,
             message_id=2,
-            audio=_fake_audio(file_id='audio-1', file_name='source.mp3'),
+            audio=_fake_audio(file_id='audio-1', file_name='source.opus'),
         ),
         chat_id=42,
     )
@@ -4229,8 +4773,13 @@ async def test_uploaded_main_action_non_opus_source_audio_uses_existing_source_p
             ]
         ),
     )
-    to_opus = AsyncMock(return_value=b'opus-converted')
-    monkeypatch.setattr(track_store_execution_module, 'to_opus', to_opus)
+    prepared_source = FileBytes(data=b'prepared-source', extension=Extension.OPUS)
+    prepare_uploaded_source_from_file_refs = AsyncMock(return_value=prepared_source)
+    monkeypatch.setattr(
+        track_ingest_module,
+        'prepare_uploaded_source_from_file_refs',
+        prepare_uploaded_source_from_file_refs,
+    )
 
     await on_track_intake_action(
         _fake_callback(message, bot=bot),
@@ -4252,10 +4801,10 @@ async def test_uploaded_main_action_non_opus_source_audio_uses_existing_source_p
     track_store.update.assert_awaited_once_with(
         group,
         track_id,
-        track=FileBytes(data=b'opus-converted', extension=Extension.OPUS),
+        track=prepared_source,
     )
     track_store.clear_uploaded_variants.assert_not_awaited()
-    to_opus.assert_awaited_once_with(b'source-audio')
+    prepare_uploaded_source_from_file_refs.assert_awaited_once()
     message.answer.assert_awaited_once_with('Done')
 
 
@@ -4310,8 +4859,12 @@ async def test_uploaded_instrumental_action_calls_upload_variants_with_instrumen
         get_file=AsyncMock(return_value=SimpleNamespace(file_path='audio-path-3')),
         download_file=AsyncMock(return_value=BytesIO(b'raw-inst')),
     )
-    prepare_audio_from_message = AsyncMock(return_value=prepared_source)
-    monkeypatch.setattr(track_ingest_module, 'prepare_audio_from_message', prepare_audio_from_message)
+    prepare_uploaded_source_from_file_refs = AsyncMock(return_value=prepared_source)
+    monkeypatch.setattr(
+        track_ingest_module,
+        'prepare_uploaded_source_from_file_refs',
+        prepare_uploaded_source_from_file_refs,
+    )
 
     await on_track_intake_action(
         _fake_callback(message, bot=bot),
@@ -4340,8 +4893,92 @@ async def test_uploaded_instrumental_action_calls_upload_variants_with_instrumen
     ]
     track_store.update.assert_awaited_once_with(group, track_id, instrumental=prepared_source)
     track_store.clear_uploaded_variants.assert_not_awaited()
-    prepare_audio_from_message.assert_awaited_once_with(bot=bot, audio_message=source_message)
     message.answer.assert_awaited_once_with('Done')
+
+
+@pytest.mark.asyncio
+async def test_uploaded_instrumental_action_variants_only_keeps_existing_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings()
+    group = track_store_module.TrackGroup(
+        universe=track_store_module.TrackUniverse.WEST,
+        year=2026,
+        season=track_store_module.Season.S1,
+    )
+    track_id = _CLIP_ID_1
+    identity = track_store_module.TrackStore.track_identity_to_string(group, track_id)
+    buffer = ChatMessageBuffer()
+    buffer.append(
+        _fake_message(
+            chat_id=42,
+            message_id=1,
+            photo=_fake_photo(file_id='photo-1'),
+            caption='·Title',
+            caption_entities=[_linked_dot_entity(f'https://{identity}.com')],
+        ),
+        chat_id=42,
+    )
+    buffer.append(
+        _fake_message(
+            chat_id=42,
+            message_id=2,
+            document=_fake_document(file_id='document-2', file_name='100_0.mp3'),
+        ),
+        chat_id=42,
+    )
+    track_store = SimpleNamespace(
+        list_tracks=AsyncMock(return_value=_tracks_by_sub_season_with_id(track_id, variant_mode='uploaded')),
+        upload_variants=AsyncMock(),
+        update=AsyncMock(),
+        clear_uploaded_variants=AsyncMock(),
+    )
+    services = _services(clip_store=SimpleNamespace(), track_store=track_store, buffer=buffer)
+    message = _fake_message(text='Select action:', chat_id=42, message_id=15)
+    state = _FakeState()
+    bot = SimpleNamespace(
+        get_file=AsyncMock(return_value=SimpleNamespace(file_path='audio-path-2')),
+        download_file=AsyncMock(return_value=BytesIO(b'raw-inst')),
+    )
+    prepare_uploaded_source_from_file_refs = AsyncMock()
+    monkeypatch.setattr(
+        track_ingest_module,
+        'prepare_uploaded_source_from_file_refs',
+        prepare_uploaded_source_from_file_refs,
+    )
+
+    await on_track_intake_action(
+        _fake_callback(message, bot=bot),
+        TrackIntakeActionCallbackData(
+            action=TrackIntakeAction.UPLOADED_INSTRUMENTAL,
+            buffer_version=buffer.version(42),
+        ),
+        state,
+        services,
+        settings,
+    )
+    await _select_uploaded_final(
+        message=message,
+        state=state,
+        services=services,
+        settings=settings,
+        bot=bot,
+        value='skip',
+    )
+
+    track_store.list_tracks.assert_awaited_once()
+    track_store.upload_variants.assert_awaited_once()
+    assert track_store.upload_variants.await_args.args == (group, track_id)
+    instrumental_variants = track_store.upload_variants.await_args.kwargs['instrumental_variants']
+    assert [(variant.speed, variant.reverb, variant.audio) for variant in instrumental_variants] == [
+        (1.0, 0.0, FileBytes(data=b'raw-inst', extension=Extension.MP3)),
+    ]
+    track_store.update.assert_not_awaited()
+    prepare_uploaded_source_from_file_refs.assert_not_awaited()
+    assert bot.get_file.await_args_list == [call('document-2')]
+    bot.download_file.assert_awaited_once_with('audio-path-2')
+    message.answer.assert_awaited_once_with('Done')
+    assert services.chat_message_buffer.peek_raw(42) == []
 
 
 @pytest.mark.asyncio
@@ -4582,7 +5219,7 @@ async def test_uploaded_final_fetch_executes_mutation_and_fetches_target_track(m
     monkeypatch.setattr(track_ingest_module, 'send_fetched_tracks_by_ids', send_fetched_tracks_by_ids)
     monkeypatch.setattr(
         track_ingest_module,
-        'prepare_audio_from_message',
+        'prepare_uploaded_source_from_file_refs',
         AsyncMock(return_value=FileBytes(data=b'prepared-source', extension=Extension.OPUS)),
     )
 
@@ -4917,7 +5554,7 @@ async def test_uploaded_main_action_missing_variants_is_rejected() -> None:
         chat_id=42,
     )
     track_store = SimpleNamespace(
-        list_tracks=AsyncMock(),
+        list_tracks=AsyncMock(return_value=_tracks_by_sub_season_with_id(track_id)),
         upload_variants=AsyncMock(),
         update=AsyncMock(),
         clear_uploaded_variants=AsyncMock(),
@@ -5017,7 +5654,9 @@ async def test_uploaded_main_action_rejects_extra_non_variant_messages(extra_mes
 
 
 @pytest.mark.asyncio
-async def test_uploaded_main_action_source_document_is_rejected() -> None:
+async def test_uploaded_main_action_multipart_source_document_is_accepted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     group = track_store_module.TrackGroup(
         universe=track_store_module.TrackUniverse.WEST,
         year=2026,
@@ -5040,7 +5679,7 @@ async def test_uploaded_main_action_source_document_is_rejected() -> None:
         _fake_message(
             chat_id=42,
             message_id=2,
-            document=_fake_document(file_id='document-2', file_name='source.opus'),
+            document=_fake_document(file_id='document-2', file_name='source.opus.part1'),
         ),
         chat_id=42,
     )
@@ -5048,34 +5687,74 @@ async def test_uploaded_main_action_source_document_is_rejected() -> None:
         _fake_message(
             chat_id=42,
             message_id=3,
-            document=_fake_document(file_id='document-3', file_name='100_0.mp3'),
+            document=_fake_document(file_id='document-3', file_name='source.opus.part0'),
+        ),
+        chat_id=42,
+    )
+    buffer.append(
+        _fake_message(
+            chat_id=42,
+            message_id=4,
+            document=_fake_document(file_id='document-4', file_name='100_0.mp3'),
         ),
         chat_id=42,
     )
     track_store = SimpleNamespace(
-        list_tracks=AsyncMock(),
+        list_tracks=AsyncMock(return_value=_tracks_by_sub_season_with_id(track_id)),
         upload_variants=AsyncMock(),
         update=AsyncMock(),
         clear_uploaded_variants=AsyncMock(),
     )
     services = _services(clip_store=SimpleNamespace(), track_store=track_store, buffer=buffer)
     message = _fake_message(text='Select action:', chat_id=42, message_id=15)
-    bot = SimpleNamespace(get_file=AsyncMock(), download_file=AsyncMock())
+    bot = SimpleNamespace(
+        get_file=AsyncMock(
+            side_effect=[
+                SimpleNamespace(file_path='source-path-0'),
+                SimpleNamespace(file_path='source-path-1'),
+                SimpleNamespace(file_path='variant-path-4'),
+            ]
+        ),
+        download_file=AsyncMock(
+            side_effect=[
+                BytesIO(b'raw-source-0'),
+                BytesIO(b'raw-source-1'),
+                BytesIO(b'raw-variant'),
+            ]
+        ),
+    )
+    probe_audio_sample_rate = AsyncMock(return_value=48_000)
+    monkeypatch.setattr(track_store_execution_module, 'probe_audio_sample_rate', probe_audio_sample_rate)
+    state = _FakeState()
 
     await on_track_intake_action(
         _fake_callback(message, bot=bot),
         TrackIntakeActionCallbackData(action=TrackIntakeAction.UPLOADED_MAIN, buffer_version=buffer.version(42)),
-        _FakeState(),
+        state,
         services,
         _settings(),
     )
+    await _select_uploaded_final(
+        message=message,
+        state=state,
+        services=services,
+        settings=_settings(),
+        bot=bot,
+        value='skip',
+    )
 
-    track_store.list_tracks.assert_not_awaited()
-    track_store.upload_variants.assert_not_awaited()
-    track_store.update.assert_not_awaited()
-    bot.get_file.assert_not_awaited()
-    bot.download_file.assert_not_awaited()
-    message.edit_text.assert_awaited_with('Invalid input', reply_markup=None)
+    track_store.list_tracks.assert_awaited_once()
+    track_store.upload_variants.assert_awaited_once()
+    track_store.update.assert_awaited_once_with(
+        group,
+        track_id,
+        track=FileBytes(data=b'raw-source-0raw-source-1', extension=Extension.OPUS),
+    )
+    probe_audio_sample_rate.assert_awaited_once_with(b'raw-source-0raw-source-1')
+    assert bot.get_file.await_args_list == [call('document-3'), call('document-2'), call('document-4')]
+    assert bot.download_file.await_count == 3
+    message.edit_text.assert_awaited()
+    message.answer.assert_awaited_once_with('Done')
     assert services.chat_message_buffer.peek_raw(42) == []
 
 
@@ -5407,9 +6086,13 @@ async def test_uploaded_main_action_update_failure_after_variant_replacement_add
         get_file=AsyncMock(return_value=SimpleNamespace(file_path='audio-path-3')),
         download_file=AsyncMock(return_value=BytesIO(b'raw-variant')),
     )
-    prepare_audio_from_message = AsyncMock(return_value=prepared_source)
+    prepare_uploaded_source_from_file_refs = AsyncMock(return_value=prepared_source)
     logger = SimpleNamespace(exception=Mock())
-    monkeypatch.setattr(track_ingest_module, 'prepare_audio_from_message', prepare_audio_from_message)
+    monkeypatch.setattr(
+        track_ingest_module,
+        'prepare_uploaded_source_from_file_refs',
+        prepare_uploaded_source_from_file_refs,
+    )
     monkeypatch.setattr(track_ingest_module, 'logger', logger)
 
     await on_track_intake_action(
@@ -5515,7 +6198,11 @@ async def test_uploaded_main_action_track_group_not_found_after_upload_propagate
         get_file=AsyncMock(return_value=SimpleNamespace(file_path='audio-path-3')),
         download_file=AsyncMock(return_value=BytesIO(b'raw-variant')),
     )
-    monkeypatch.setattr(track_ingest_module, 'prepare_audio_from_message', AsyncMock(return_value=prepared_source))
+    monkeypatch.setattr(
+        track_ingest_module,
+        'prepare_uploaded_source_from_file_refs',
+        AsyncMock(return_value=prepared_source),
+    )
     logger = SimpleNamespace(exception=Mock())
     monkeypatch.setattr(track_ingest_module, 'logger', logger)
 
@@ -5617,7 +6304,11 @@ async def test_uploaded_main_action_missing_track_value_error_after_upload_propa
         get_file=AsyncMock(return_value=SimpleNamespace(file_path='audio-path-3')),
         download_file=AsyncMock(return_value=BytesIO(b'raw-variant')),
     )
-    monkeypatch.setattr(track_ingest_module, 'prepare_audio_from_message', AsyncMock(return_value=prepared_source))
+    monkeypatch.setattr(
+        track_ingest_module,
+        'prepare_uploaded_source_from_file_refs',
+        AsyncMock(return_value=prepared_source),
+    )
     logger = SimpleNamespace(exception=Mock())
     monkeypatch.setattr(track_ingest_module, 'logger', logger)
 
@@ -5719,7 +6410,11 @@ async def test_uploaded_instrumental_action_track_group_not_found_after_upload_p
         get_file=AsyncMock(return_value=SimpleNamespace(file_path='audio-path-3')),
         download_file=AsyncMock(return_value=BytesIO(b'raw-inst')),
     )
-    monkeypatch.setattr(track_ingest_module, 'prepare_audio_from_message', AsyncMock(return_value=prepared_source))
+    monkeypatch.setattr(
+        track_ingest_module,
+        'prepare_uploaded_source_from_file_refs',
+        AsyncMock(return_value=prepared_source),
+    )
     logger = SimpleNamespace(exception=Mock())
     monkeypatch.setattr(track_ingest_module, 'logger', logger)
 
@@ -5824,7 +6519,11 @@ async def test_uploaded_instrumental_action_missing_track_value_error_after_uplo
         get_file=AsyncMock(return_value=SimpleNamespace(file_path='audio-path-3')),
         download_file=AsyncMock(return_value=BytesIO(b'raw-inst')),
     )
-    monkeypatch.setattr(track_ingest_module, 'prepare_audio_from_message', AsyncMock(return_value=prepared_source))
+    monkeypatch.setattr(
+        track_ingest_module,
+        'prepare_uploaded_source_from_file_refs',
+        AsyncMock(return_value=prepared_source),
+    )
     logger = SimpleNamespace(exception=Mock())
     monkeypatch.setattr(track_ingest_module, 'logger', logger)
 
@@ -5898,7 +6597,7 @@ async def test_uploaded_main_action_source_preparation_failure_still_invalidates
     source_message = _fake_message(
         chat_id=42,
         message_id=2,
-        audio=_fake_audio(file_id='audio-1', file_name='source.mp3'),
+        audio=_fake_audio(file_id='audio-1', file_name='source.opus'),
     )
     buffer.append(source_message, chat_id=42)
     buffer.append(
@@ -5921,7 +6620,7 @@ async def test_uploaded_main_action_source_preparation_failure_still_invalidates
     bot = SimpleNamespace(get_file=AsyncMock(), download_file=AsyncMock())
     monkeypatch.setattr(
         track_ingest_module,
-        'prepare_audio_from_message',
+        'prepare_uploaded_source_from_file_refs',
         AsyncMock(side_effect=track_store_execution_module.TrackInputError("Can't process audio")),
     )
 
@@ -6089,7 +6788,7 @@ async def test_uploaded_action_oversized_variant_shows_file_too_big_and_clears_s
     )
     monkeypatch.setattr(
         track_ingest_module,
-        'prepare_audio_from_message',
+        'prepare_uploaded_source_from_file_refs',
         AsyncMock(return_value=prepared_source),
     )
 
@@ -6220,6 +6919,292 @@ async def test_uploaded_action_oversized_source_shows_file_too_big_and_clears_st
 
 
 @pytest.mark.asyncio
+async def test_uploaded_main_action_reconstructed_variant_over_limit_shows_file_too_big(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings(media_group_max_size=1)
+    group = track_store_module.TrackGroup(
+        universe=track_store_module.TrackUniverse.WEST,
+        year=2026,
+        season=track_store_module.Season.S1,
+    )
+    track_id = _CLIP_ID_1
+    identity = track_store_module.TrackStore.track_identity_to_string(group, track_id)
+    buffer = ChatMessageBuffer()
+    buffer.append(
+        _fake_message(
+            chat_id=42,
+            message_id=1,
+            photo=_fake_photo(file_id='photo-1'),
+            caption='·Title',
+            caption_entities=[_linked_dot_entity(f'https://{identity}.com')],
+        ),
+        chat_id=42,
+    )
+    buffer.append(
+        _fake_message(
+            chat_id=42,
+            message_id=2,
+            audio=_fake_audio(file_id='audio-1', file_name='source.opus'),
+        ),
+        chat_id=42,
+    )
+    buffer.append(
+        _fake_message(
+            chat_id=42,
+            message_id=3,
+            document=_fake_document(file_id='variant-0', file_name='100_0.mp3.part0'),
+        ),
+        chat_id=42,
+    )
+    buffer.append(
+        _fake_message(
+            chat_id=42,
+            message_id=4,
+            document=_fake_document(file_id='variant-1', file_name='100_0.mp3.part1'),
+        ),
+        chat_id=42,
+    )
+    track_store = SimpleNamespace(
+        list_tracks=AsyncMock(return_value=_tracks_by_sub_season_with_id(track_id, variant_mode='uploaded')),
+        upload_variants=AsyncMock(),
+        update=AsyncMock(),
+        clear_uploaded_variants=AsyncMock(),
+    )
+    services = _services(clip_store=SimpleNamespace(), track_store=track_store, buffer=buffer)
+    message = _fake_message(text='Select action:', chat_id=42, message_id=15)
+    state = _FakeState()
+    source_bytes = b'source-opus'
+    oversized_part = b'v' * (700 * 1024)
+    monkeypatch.setattr(track_store_execution_module, 'probe_audio_sample_rate', AsyncMock(return_value=48_000))
+    bot = SimpleNamespace(
+        get_file=AsyncMock(
+            side_effect=[
+                SimpleNamespace(file_path='source-path'),
+                SimpleNamespace(file_path='variant-path-0'),
+                SimpleNamespace(file_path='variant-path-1'),
+            ]
+        ),
+        download_file=AsyncMock(
+            side_effect=[
+                BytesIO(source_bytes),
+                BytesIO(oversized_part),
+                BytesIO(oversized_part),
+            ]
+        ),
+    )
+
+    await on_track_intake_action(
+        _fake_callback(message, bot=bot),
+        TrackIntakeActionCallbackData(action=TrackIntakeAction.UPLOADED_MAIN, buffer_version=buffer.version(42)),
+        state,
+        services,
+        settings,
+    )
+    await _select_uploaded_final(
+        message=message,
+        state=state,
+        services=services,
+        settings=settings,
+        bot=bot,
+        value='skip',
+    )
+
+    track_store.upload_variants.assert_not_awaited()
+    track_store.update.assert_not_awaited()
+    assert bot.get_file.await_args_list == [call('audio-1'), call('variant-0'), call('variant-1')]
+    message.answer.assert_awaited_once_with('File is too big')
+    assert state.current_state is None
+    assert state.clear_count == 1
+    assert services.chat_message_buffer.peek_raw(42) == []
+
+
+@pytest.mark.asyncio
+async def test_uploaded_main_action_reconstructed_source_over_limit_shows_file_too_big() -> None:
+    settings = _settings(media_group_max_size=1)
+    group = track_store_module.TrackGroup(
+        universe=track_store_module.TrackUniverse.WEST,
+        year=2026,
+        season=track_store_module.Season.S1,
+    )
+    track_id = _CLIP_ID_1
+    identity = track_store_module.TrackStore.track_identity_to_string(group, track_id)
+    buffer = ChatMessageBuffer()
+    buffer.append(
+        _fake_message(
+            chat_id=42,
+            message_id=1,
+            photo=_fake_photo(file_id='photo-1'),
+            caption='·Title',
+            caption_entities=[_linked_dot_entity(f'https://{identity}.com')],
+        ),
+        chat_id=42,
+    )
+    buffer.append(
+        _fake_message(
+            chat_id=42,
+            message_id=2,
+            document=_fake_document(file_id='source-0', file_name='source.opus.part0'),
+        ),
+        chat_id=42,
+    )
+    buffer.append(
+        _fake_message(
+            chat_id=42,
+            message_id=3,
+            document=_fake_document(file_id='source-1', file_name='source.opus.part1'),
+        ),
+        chat_id=42,
+    )
+    buffer.append(
+        _fake_message(
+            chat_id=42,
+            message_id=4,
+            document=_fake_document(file_id='variant-0', file_name='100_0.mp3'),
+        ),
+        chat_id=42,
+    )
+    track_store = SimpleNamespace(
+        list_tracks=AsyncMock(return_value=_tracks_by_sub_season_with_id(track_id, variant_mode='uploaded')),
+        upload_variants=AsyncMock(),
+        update=AsyncMock(),
+        clear_uploaded_variants=AsyncMock(),
+    )
+    services = _services(clip_store=SimpleNamespace(), track_store=track_store, buffer=buffer)
+    message = _fake_message(text='Select action:', chat_id=42, message_id=15)
+    state = _FakeState()
+    oversized_part = b's' * (700 * 1024)
+    bot = SimpleNamespace(
+        get_file=AsyncMock(
+            side_effect=[
+                SimpleNamespace(file_path='source-path-0'),
+                SimpleNamespace(file_path='source-path-1'),
+            ]
+        ),
+        download_file=AsyncMock(
+            side_effect=[
+                BytesIO(oversized_part),
+                BytesIO(oversized_part),
+            ]
+        ),
+    )
+
+    await on_track_intake_action(
+        _fake_callback(message, bot=bot),
+        TrackIntakeActionCallbackData(action=TrackIntakeAction.UPLOADED_MAIN, buffer_version=buffer.version(42)),
+        state,
+        services,
+        settings,
+    )
+    await _select_uploaded_final(
+        message=message,
+        state=state,
+        services=services,
+        settings=settings,
+        bot=bot,
+        value='skip',
+    )
+
+    track_store.upload_variants.assert_not_awaited()
+    track_store.update.assert_not_awaited()
+    assert bot.get_file.await_args_list == [call('source-0'), call('source-1')]
+    message.answer.assert_awaited_once_with('File is too big')
+    assert state.current_state is None
+    assert state.clear_count == 1
+    assert services.chat_message_buffer.peek_raw(42) == []
+
+
+@pytest.mark.asyncio
+async def test_uploaded_instrumental_action_variants_only_reconstructed_variant_over_limit_shows_file_too_big() -> None:
+    settings = _settings(media_group_max_size=1)
+    group = track_store_module.TrackGroup(
+        universe=track_store_module.TrackUniverse.WEST,
+        year=2026,
+        season=track_store_module.Season.S1,
+    )
+    track_id = _CLIP_ID_1
+    identity = track_store_module.TrackStore.track_identity_to_string(group, track_id)
+    buffer = ChatMessageBuffer()
+    buffer.append(
+        _fake_message(
+            chat_id=42,
+            message_id=1,
+            photo=_fake_photo(file_id='photo-1'),
+            caption='·Title',
+            caption_entities=[_linked_dot_entity(f'https://{identity}.com')],
+        ),
+        chat_id=42,
+    )
+    buffer.append(
+        _fake_message(
+            chat_id=42,
+            message_id=2,
+            document=_fake_document(file_id='variant-0', file_name='100_0.mp3.part0'),
+        ),
+        chat_id=42,
+    )
+    buffer.append(
+        _fake_message(
+            chat_id=42,
+            message_id=3,
+            document=_fake_document(file_id='variant-1', file_name='100_0.mp3.part1'),
+        ),
+        chat_id=42,
+    )
+    track_store = SimpleNamespace(
+        list_tracks=AsyncMock(return_value=_tracks_by_sub_season_with_id(track_id, variant_mode='uploaded')),
+        upload_variants=AsyncMock(),
+        update=AsyncMock(),
+        clear_uploaded_variants=AsyncMock(),
+    )
+    services = _services(clip_store=SimpleNamespace(), track_store=track_store, buffer=buffer)
+    message = _fake_message(text='Select action:', chat_id=42, message_id=15)
+    state = _FakeState()
+    oversized_part = b'i' * (700 * 1024)
+    bot = SimpleNamespace(
+        get_file=AsyncMock(
+            side_effect=[
+                SimpleNamespace(file_path='variant-path-0'),
+                SimpleNamespace(file_path='variant-path-1'),
+            ]
+        ),
+        download_file=AsyncMock(
+            side_effect=[
+                BytesIO(oversized_part),
+                BytesIO(oversized_part),
+            ]
+        ),
+    )
+
+    await on_track_intake_action(
+        _fake_callback(message, bot=bot),
+        TrackIntakeActionCallbackData(
+            action=TrackIntakeAction.UPLOADED_INSTRUMENTAL,
+            buffer_version=buffer.version(42),
+        ),
+        state,
+        services,
+        settings,
+    )
+    await _select_uploaded_final(
+        message=message,
+        state=state,
+        services=services,
+        settings=settings,
+        bot=bot,
+        value='skip',
+    )
+
+    track_store.upload_variants.assert_not_awaited()
+    track_store.update.assert_not_awaited()
+    assert bot.get_file.await_args_list == [call('variant-0'), call('variant-1')]
+    message.answer.assert_awaited_once_with('File is too big')
+    assert state.current_state is None
+    assert state.clear_count == 1
+    assert services.chat_message_buffer.peek_raw(42) == []
+
+
+@pytest.mark.asyncio
 async def test_uploaded_main_action_unrelated_telegram_bad_request_propagates(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -6278,7 +7263,7 @@ async def test_uploaded_main_action_unrelated_telegram_bad_request_propagates(
     )
     monkeypatch.setattr(
         track_ingest_module,
-        'prepare_audio_from_message',
+        'prepare_uploaded_source_from_file_refs',
         AsyncMock(return_value=prepared_source),
     )
 

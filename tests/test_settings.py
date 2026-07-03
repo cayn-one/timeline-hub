@@ -29,7 +29,7 @@ _CONFIG_CONTENT = dedent(
     message_width = 80
 
     [telegram]
-    media_group_max_size = 47
+    media_group_max_size = 49
 
     [stores]
     min_year = 2022
@@ -112,7 +112,7 @@ def test_settings_load_reads_production_config_and_env_values(
     assert settings.s3.secret_access_key.get_secret_value() == 'secret'
     assert settings.forward_batch_timeout == timedelta(milliseconds=250)
     assert settings.message_width == 80
-    assert settings.media_group_max_size == 47
+    assert settings.media_group_max_size == 49
     assert settings.min_year == 2022
     assert settings.clip_namespace == 'clips'
     assert settings.normalization_loudness == -14
@@ -160,7 +160,7 @@ def test_settings_load_rejects_unknown_config_keys(
             unexpected = 1
 
             [telegram]
-            media_group_max_size = 47
+            media_group_max_size = 49
 
             [stores]
             min_year = 2022

@@ -63,7 +63,7 @@ async def test_main_wires_storage_namespaces_into_stores(monkeypatch: pytest.Mon
         track_namespace='tracks-dev',
         variant_max_duration=timedelta(minutes=30),
         slowest_variant_speed=0.5,
-        media_group_max_size=47,
+        media_group_max_size=49,
     )
     dispatcher = MagicMock()
     dispatcher.include_router = Mock()

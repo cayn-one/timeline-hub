@@ -18,6 +18,7 @@ from timeline_hub.handlers.tracks.ingest import try_dispatch_track_intake
 from timeline_hub.handlers.tracks.store_execution import (
     extract_track_audio_attachment,
     extract_uploaded_mp3_attachment,
+    extract_uploaded_opus_attachment,
     is_supported_youtube_store_url,
 )
 from timeline_hub.services.container import Services
@@ -48,8 +49,9 @@ async def on_buffered_relevant_message(
             extract_track_audio_attachment(buffered_message) is not None
             for buffered_message in ordered_buffered_messages
         )
-        has_uploaded_mp3_candidate = any(
-            extract_uploaded_mp3_attachment(buffered_message) is not None
+        has_uploaded_file_candidate = any(
+            extract_uploaded_opus_attachment(buffered_message) is not None
+            or extract_uploaded_mp3_attachment(buffered_message) is not None
             for buffered_message in ordered_buffered_messages
         )
         has_clip_media = any(
@@ -61,7 +63,7 @@ async def on_buffered_relevant_message(
         )
         text_messages = [buffered_message for buffered_message in ordered_buffered_messages if buffered_message.text]
 
-        if (has_video or has_clip_media) and (has_photo or has_track_audio_candidate or has_uploaded_mp3_candidate):
+        if (has_video or has_clip_media) and (has_photo or has_track_audio_candidate or has_uploaded_file_candidate):
             services.chat_message_buffer.flush(chat_id)
             await message.answer(text="Can't dispatch")
             return
@@ -74,7 +76,7 @@ async def on_buffered_relevant_message(
             )
             if handled:
                 return
-        elif has_photo or ((has_track_audio_candidate or has_uploaded_mp3_candidate) and not has_video):
+        elif has_photo or ((has_track_audio_candidate or has_uploaded_file_candidate) and not has_video):
             handled = await try_dispatch_track_intake(
                 message=message,
                 services=services,

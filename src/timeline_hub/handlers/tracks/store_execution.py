@@ -1,4 +1,5 @@
 import math
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import timedelta
@@ -27,6 +28,10 @@ class TrackInputError(ValueError):
 
 
 class TrackLinkDownloadError(RuntimeError):
+    pass
+
+
+class UploadedFileTooBigError(RuntimeError):
     pass
 
 
@@ -66,19 +71,32 @@ class TrackAudioAttachment:
 
 
 @dataclass(frozen=True, slots=True)
-class UploadedMp3Attachment:
+class UploadedFileRef:
+    """One Telegram file-bearing Uploaded item before logical grouping.
+
+    `logical_name` is the reconstructed filename with any `.partN` transport
+    suffix removed. `part_index` is `None` for a normal upload and `0..9` for
+    multipart fragments.
+    """
+
+    logical_name: str
     file_id: str
     file_name: str
+    part_index: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class ParsedUploadedVariant:
-    attachment: UploadedMp3Attachment
+    """One grouped Uploaded variant logical file with parsed speed metadata."""
+
+    file_refs: tuple[UploadedFileRef, ...]
     speed: float
     reverb: float
 
 
+_UPLOADED_PART_SUFFIX_PATTERN = re.compile(r'^(?P<logical_name>.+?)\.part(?P<part_index>[0-9])$', re.IGNORECASE)
 _SUPPORTED_DOCUMENT_AUDIO_EXTENSIONS = frozenset({'.wav', '.flac', '.opus'})
+_SUPPORTED_UPLOADED_LOGICAL_EXTENSIONS = frozenset({Extension.OPUS, Extension.MP3})
 
 
 def extract_track_audio_attachment(message: Message) -> TrackAudioAttachment | None:
@@ -104,41 +122,58 @@ def _is_supported_document_audio_filename(file_name: str | None) -> bool:
     return any(file_name.lower().endswith(suffix) for suffix in _SUPPORTED_DOCUMENT_AUDIO_EXTENSIONS)
 
 
-def extract_uploaded_mp3_attachment(message: Message) -> UploadedMp3Attachment | None:
-    audio = message.audio
-    if audio is not None:
-        file_name = getattr(audio, 'file_name', None)
-        file_id = getattr(audio, 'file_id', None)
-        if isinstance(file_name, str) and _is_uploaded_mp3_filename(file_name) and isinstance(file_id, str) and file_id:
-            return UploadedMp3Attachment(file_id=file_id, file_name=file_name)
+def extract_uploaded_file_ref(message: Message) -> UploadedFileRef | None:
+    return _extract_uploaded_file_ref(message, accepted_extensions=_SUPPORTED_UPLOADED_LOGICAL_EXTENSIONS)
 
-    document = getattr(message, 'document', None)
-    if document is None:
+
+def extract_uploaded_opus_attachment(message: Message) -> UploadedFileRef | None:
+    return _extract_uploaded_file_ref(message, accepted_extensions=frozenset({Extension.OPUS}))
+
+
+def extract_uploaded_mp3_attachment(message: Message) -> UploadedFileRef | None:
+    uploaded_file_ref = _extract_uploaded_file_ref(message, accepted_extensions=frozenset({Extension.MP3}))
+    if uploaded_file_ref is None:
         return None
-    file_name = getattr(document, 'file_name', None)
-    file_id = getattr(document, 'file_id', None)
-    if not isinstance(file_name, str) or not _is_uploaded_mp3_filename(file_name):
-        return None
-    if not isinstance(file_id, str) or not file_id:
-        return None
-    return UploadedMp3Attachment(file_id=file_id, file_name=file_name)
-
-
-def _is_uploaded_mp3_filename(file_name: str | None) -> bool:
-    if not isinstance(file_name, str):
-        return False
-    if not file_name.lower().endswith(Extension.MP3.suffix):
-        return False
-
-    stem_parts = Path(file_name).stem.split('_')
-    if len(stem_parts) != 2:
-        return False
     try:
-        int(stem_parts[0])
-        int(stem_parts[1])
-    except ValueError:
-        return False
-    return True
+        parse_uploaded_variant_filename(uploaded_file_ref.logical_name)
+    except TrackInputError:
+        return None
+    return uploaded_file_ref
+
+
+def _extract_uploaded_file_ref(
+    message: Message,
+    *,
+    accepted_extensions: frozenset[Extension],
+) -> UploadedFileRef | None:
+    for media in (message.audio, getattr(message, 'document', None)):
+        if media is None:
+            continue
+        file_name = getattr(media, 'file_name', None)
+        file_id = getattr(media, 'file_id', None)
+        if not isinstance(file_name, str) or not isinstance(file_id, str) or not file_id:
+            continue
+        parsed_file_name = _parse_uploaded_logical_file_name(file_name)
+        if parsed_file_name is None:
+            continue
+        logical_name, part_index = parsed_file_name
+        extension = Extension.try_from_filename(logical_name)
+        if extension not in accepted_extensions:
+            continue
+        return UploadedFileRef(
+            logical_name=logical_name,
+            file_id=file_id,
+            file_name=file_name,
+            part_index=part_index,
+        )
+    return None
+
+
+def _parse_uploaded_logical_file_name(file_name: str) -> tuple[str, int | None] | None:
+    match = _UPLOADED_PART_SUFFIX_PATTERN.fullmatch(file_name)
+    if match is not None:
+        return match.group('logical_name'), int(match.group('part_index'))
+    return file_name, None
 
 
 def extract_single_photo_audio_messages(messages: Sequence[Message]) -> tuple[Message, Message]:
@@ -162,23 +197,28 @@ def extract_photo_messages_for_remove(messages: Sequence[Message]) -> tuple[Mess
     return tuple(messages)
 
 
-def _validate_and_order_uploaded_variant_messages(
-    uploaded_messages: Sequence[Message],
+def _validate_and_order_uploaded_variant_file_refs(
+    uploaded_file_refs: Sequence[UploadedFileRef],
 ) -> tuple[ParsedUploadedVariant, ...]:
-    """Validate uploaded variant messages fully before any file download."""
+    """Validate grouped uploaded variant file refs fully before any file download."""
+    if not uploaded_file_refs:
+        raise TrackInputError('Invalid input')
+
+    grouped_file_refs: dict[str, list[UploadedFileRef]] = {}
+    for uploaded_file_ref in uploaded_file_refs:
+        grouped_file_refs.setdefault(uploaded_file_ref.logical_name, []).append(uploaded_file_ref)
+
     parsed_variants: list[ParsedUploadedVariant] = []
-    for uploaded_message in uploaded_messages:
-        attachment = extract_uploaded_mp3_attachment(uploaded_message)
-        if attachment is None:
-            raise TrackInputError('Invalid input')
-        speed, reverb = parse_uploaded_variant_filename(attachment.file_name)
+    for logical_name, file_refs in grouped_file_refs.items():
+        ordered_file_refs = _validate_and_order_uploaded_file_refs(file_refs)
+        speed, reverb = parse_uploaded_variant_filename(logical_name)
         if not math.isfinite(speed) or speed <= 0.0:
             raise TrackInputError('Invalid input')
         if not math.isfinite(reverb) or reverb < 0.0:
             raise TrackInputError('Invalid input')
         parsed_variants.append(
             ParsedUploadedVariant(
-                attachment=attachment,
+                file_refs=ordered_file_refs,
                 speed=speed,
                 reverb=reverb,
             )
@@ -197,38 +237,94 @@ def _validate_and_order_uploaded_variant_messages(
     return tuple(ordered_variants)
 
 
+def _validate_and_order_uploaded_file_refs(
+    uploaded_file_refs: Sequence[UploadedFileRef],
+) -> tuple[UploadedFileRef, ...]:
+    if not uploaded_file_refs or len(uploaded_file_refs) > 10:
+        raise TrackInputError('Invalid input')
+
+    part_indices = [uploaded_file_ref.part_index for uploaded_file_ref in uploaded_file_refs]
+    has_whole_file = any(part_index is None for part_index in part_indices)
+    has_multipart_parts = any(part_index is not None for part_index in part_indices)
+    if has_whole_file and has_multipart_parts:
+        raise TrackInputError('Invalid input')
+
+    if has_whole_file:
+        if len(uploaded_file_refs) != 1:
+            raise TrackInputError('Invalid input')
+        return (uploaded_file_refs[0],)
+
+    def _uploaded_file_ref_part_index(uploaded_file_ref: UploadedFileRef) -> int:
+        part_index = uploaded_file_ref.part_index
+        if part_index is None:
+            raise TrackInputError('Invalid input')
+        return part_index
+
+    if len(uploaded_file_refs) < 2:
+        raise TrackInputError('Invalid input')
+
+    ordered_file_refs = tuple(sorted(uploaded_file_refs, key=_uploaded_file_ref_part_index))
+    expected_part_indices = list(range(len(ordered_file_refs)))
+    if [uploaded_file_ref.part_index for uploaded_file_ref in ordered_file_refs] != expected_part_indices:
+        raise TrackInputError('Invalid input')
+
+    return ordered_file_refs
+
+
 def validate_uploaded_source_variant_batch(
     messages: Sequence[Message],
-) -> tuple[Message, Message, tuple[ParsedUploadedVariant, ...]]:
+) -> tuple[Message, tuple[UploadedFileRef, ...] | None, tuple[ParsedUploadedVariant, ...]]:
     """Validate one ordered uploaded action batch before any file download.
 
     Expected shape:
-        1. identity-bearing cover photo
-        2. authoritative source Telegram audio
-        3..N uploaded MP3 variants
+        1. exactly one identity-bearing cover photo
+        2. zero or one logical `.opus` source file
+        3. one or more logical `.mp3` variant files
+
+    Source and variant file-bearing messages may arrive in any order.
     """
-    if len(messages) < 3:
+    if len(messages) < 2:
         raise TrackInputError('Invalid input')
     if any(message.text is not None for message in messages):
         raise TrackInputError('Invalid input')
     if any(message.video is not None or getattr(message, 'animation', None) is not None for message in messages):
         raise TrackInputError('Invalid input')
 
-    photo_message = messages[0]
-    if photo_message.photo is None:
+    photo_messages = [message for message in messages if message.photo is not None]
+    if len(photo_messages) != 1:
         raise TrackInputError('Invalid input')
-    if any(message.photo is not None for message in messages[1:]):
+    photo_message = photo_messages[0]
+
+    uploaded_file_refs = []
+    for message in messages:
+        if message.photo is not None:
+            continue
+        uploaded_file_ref = extract_uploaded_file_ref(message)
+        if uploaded_file_ref is None:
+            raise TrackInputError('Invalid input')
+        uploaded_file_refs.append(uploaded_file_ref)
+
+    grouped_file_refs: dict[str, list[UploadedFileRef]] = {}
+    for uploaded_file_ref in uploaded_file_refs:
+        grouped_file_refs.setdefault(uploaded_file_ref.logical_name, []).append(uploaded_file_ref)
+
+    source_file_refs: tuple[UploadedFileRef, ...] | None = None
+    variant_file_refs: list[UploadedFileRef] = []
+    for logical_name, grouped_refs in grouped_file_refs.items():
+        ordered_refs = _validate_and_order_uploaded_file_refs(grouped_refs)
+        extension = Extension.try_from_filename(logical_name)
+        if extension is Extension.OPUS:
+            if source_file_refs is not None:
+                raise TrackInputError('Invalid input')
+            source_file_refs = ordered_refs
+            continue
+        if extension is Extension.MP3:
+            variant_file_refs.extend(ordered_refs)
+            continue
         raise TrackInputError('Invalid input')
 
-    source_audio_message = messages[1]
-    if source_audio_message.audio is None:
-        raise TrackInputError('Invalid input')
-
-    uploaded_messages = tuple(messages[2:])
-    if any(extract_uploaded_mp3_attachment(message) is None for message in uploaded_messages):
-        raise TrackInputError('Invalid input')
-
-    return photo_message, source_audio_message, _validate_and_order_uploaded_variant_messages(uploaded_messages)
+    parsed_variants = _validate_and_order_uploaded_variant_file_refs(variant_file_refs)
+    return photo_message, source_file_refs, parsed_variants
 
 
 def extract_track_identity_from_photo_message(photo_message: Message) -> tuple[TrackGroup, TrackId]:
@@ -290,9 +386,32 @@ async def prepare_audio_from_message(*, bot: Bot, audio_message: Message) -> Fil
     return FileBytes(data=audio_opus, extension=Extension.OPUS)
 
 
+async def prepare_uploaded_source_from_file_refs(
+    *,
+    bot: Bot,
+    source_file_refs: Sequence[UploadedFileRef],
+    max_file_size_bytes: int,
+) -> FileBytes:
+    """Download and validate an Uploaded source file without transcoding it."""
+    raw_bytes = await _download_uploaded_file_refs(
+        bot=bot,
+        file_refs=source_file_refs,
+        max_file_size_bytes=max_file_size_bytes,
+    )
+    try:
+        audio_opus = await _validate_raw_opus_audio_bytes(raw_bytes)
+    except TrackInvalidAudioFormatError:
+        raise
+    except Exception as error:
+        raise TrackInputError("Can't process audio") from error
+
+    return FileBytes(data=audio_opus, extension=Extension.OPUS)
+
+
 def parse_uploaded_variant_filename(file_name: str) -> tuple[float, float]:
     """Parse exact `<int>_<int>.mp3` metadata from an uploaded variant filename."""
-    if not _is_uploaded_mp3_filename(file_name):
+    extension = Extension.try_from_filename(file_name)
+    if extension is not Extension.MP3:
         raise TrackInputError('Invalid input')
 
     stem_parts = Path(file_name).stem.split('_')
@@ -311,9 +430,14 @@ async def prepare_uploaded_variant_from_parsed(
     *,
     bot: Bot,
     parsed_variant: ParsedUploadedVariant,
+    max_file_size_bytes: int,
 ) -> UploadedVariant:
     """Download one validated uploaded MP3 message without transcoding it."""
-    raw_bytes = await _download_file_bytes(bot=bot, file_id=parsed_variant.attachment.file_id)
+    raw_bytes = await _download_uploaded_file_refs(
+        bot=bot,
+        file_refs=parsed_variant.file_refs,
+        max_file_size_bytes=max_file_size_bytes,
+    )
     try:
         return UploadedVariant(
             speed=parsed_variant.speed,
@@ -654,3 +778,25 @@ async def _download_file_bytes(*, bot: Bot, file_id: str) -> bytes:
         raise TrackInputError("Can't dispatch input")
 
     return downloaded.read()
+
+
+async def _download_uploaded_file_refs(
+    *,
+    bot: Bot,
+    file_refs: Sequence[UploadedFileRef],
+    max_file_size_bytes: int,
+) -> bytes:
+    if not file_refs:
+        raise TrackInputError('Invalid input')
+    ordered_file_refs = sorted(
+        file_refs,
+        key=lambda uploaded_file_ref: 0 if uploaded_file_ref.part_index is None else uploaded_file_ref.part_index,
+    )
+    downloaded_parts = [
+        await _download_file_bytes(bot=bot, file_id=uploaded_file_ref.file_id)
+        for uploaded_file_ref in ordered_file_refs
+    ]
+    raw_bytes = downloaded_parts[0] if len(downloaded_parts) == 1 else b''.join(downloaded_parts)
+    if len(raw_bytes) > max_file_size_bytes:
+        raise UploadedFileTooBigError('Uploaded file exceeds Telegram media group size limit')
+    return raw_bytes

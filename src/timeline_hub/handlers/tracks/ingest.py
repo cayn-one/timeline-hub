@@ -30,6 +30,7 @@ from timeline_hub.handlers.tracks.store_execution import (
     LinkOnlyTrackInput,
     TrackInputError,
     TrackLinkDownloadError,
+    UploadedFileTooBigError,
     download_link_audio,
     download_link_audio_and_cover,
     extract_photo_messages_for_remove,
@@ -44,6 +45,7 @@ from timeline_hub.handlers.tracks.store_execution import (
     prepare_audio_only_track_from_buffer,
     prepare_link_only_track_from_buffer,
     prepare_tracks_from_buffer,
+    prepare_uploaded_source_from_file_refs,
     prepare_uploaded_variant_from_parsed,
     validate_audio_link_store_input,
     validate_audio_only_store_input,
@@ -2380,9 +2382,7 @@ async def _enter_uploaded_track_final_menu(
     chat_id = message.chat.id
     buffered_messages = services.chat_message_buffer.peek_flat(chat_id)
     try:
-        photo_message, _source_audio_message, _parsed_variants = validate_uploaded_source_variant_batch(
-            buffered_messages
-        )
+        photo_message, _source_file_refs, _parsed_variants = validate_uploaded_source_variant_batch(buffered_messages)
         group, track_id = extract_track_identity_from_photo_message(photo_message)
         tracks_by_sub_season = await services.track_store.list_tracks(group)
         matched_sub_season = _resolve_track_sub_season(tracks_by_sub_season, track_id)
@@ -2545,14 +2545,28 @@ async def _execute_uploaded_track_final_selection(
     )
 
     try:
-        _photo_message, source_audio_message, parsed_variants = validate_uploaded_source_variant_batch(
-            buffered_messages
-        )
-        prepared_source = await prepare_audio_from_message(bot=bot, audio_message=source_audio_message)
+        _photo_message, source_file_refs, parsed_variants = validate_uploaded_source_variant_batch(buffered_messages)
+        max_uploaded_file_bytes = settings.media_group_max_size * 1024 * 1024
+        prepared_source = None
+        if source_file_refs is not None:
+            prepared_source = await prepare_uploaded_source_from_file_refs(
+                bot=bot,
+                source_file_refs=source_file_refs,
+                max_file_size_bytes=max_uploaded_file_bytes,
+            )
         uploaded_variants = [
-            await prepare_uploaded_variant_from_parsed(bot=bot, parsed_variant=parsed_variant)
+            await prepare_uploaded_variant_from_parsed(
+                bot=bot,
+                parsed_variant=parsed_variant,
+                max_file_size_bytes=max_uploaded_file_bytes,
+            )
             for parsed_variant in parsed_variants
         ]
+    except UploadedFileTooBigError:
+        await state.clear()
+        services.chat_message_buffer.flush(chat_id)
+        await message.answer('File is too big')
+        return
     except TelegramBadRequest as error:
         oversized_file_messages = {'file is too big', 'Bad Request: file is too big'}
         matched_oversized_file = error.message in oversized_file_messages
@@ -2636,12 +2650,14 @@ async def _apply_uploaded_track_mutation(
     group: TrackGroup,
     track_id: str,
     family: TrackUploadedFamily,
-    prepared_source: FileBytes,
+    prepared_source: FileBytes | None,
     uploaded_variants: list[UploadedVariant],
 ) -> None:
     variant_specs = [(variant.speed, variant.reverb) for variant in uploaded_variants]
     if family is TrackUploadedFamily.MAIN:
         await services.track_store.upload_variants(group, track_id, variants=uploaded_variants)
+        if prepared_source is None:
+            return
         try:
             await services.track_store.update(group, track_id, track=prepared_source)
         except Exception as error:
@@ -2667,6 +2683,8 @@ async def _apply_uploaded_track_mutation(
         track_id,
         instrumental_variants=uploaded_variants,
     )
+    if prepared_source is None:
+        return
     try:
         await services.track_store.update(group, track_id, instrumental=prepared_source)
     except Exception as error:

@@ -32,4 +32,4 @@ namespace = "tracks-dev"
 
 [telegram]
 # Maximum media-group payload size observed to be accepted by Telegram, in MiB
-media_group_max_size = 47
+media_group_max_size = 49
