@@ -1,230 +1,50 @@
-# Project Overview
-
-## Telegram UI invariants
-
-These rules apply only to real action-selection menus with inline keyboards. Plain text messages must remain unmodified and must not be padded or height-normalized.
-
-Every real action-selection menu must render:
-- exactly 2 text lines
-- exactly 3 rows of buttons
-
-Short informational prompts with a single terminal action are not action-selection menus.
-They may use a smaller keyboard when they are explicitly informing the user about buffer state and only offering a flush/cancel action.
-
-The UI is intentionally fixed-size and structurally predictable:
-- button positions follow stable patterns
-- the same conceptual actions stay in the same areas
-- missing options do not collapse layout; they are replaced structurally
-
-## Intake action invariants
-
-All intake actions operate on the buffered chat messages.
-
-Actions are classified into:
-- single-shot actions
-- interactive actions
-
-Single-shot actions:
-- flush the buffer immediately on entry
-- validate after flush
-- do not restore the buffer on failure
-- intentionally keep the UI stateless
-- require the user to resend clips after rejection if needed
-
-Interactive actions:
-- enter a multi-step stateful flow only after successful entry validation
-- do not flush the buffer on entry after validation succeeds
-- use buffer versioning for consistency
-- invalidate interaction if the buffer changes
-- flush only on final execution
-
-Failed entry validation is not part of the interactive flow. It is a stateless rejection and may intentionally flush the buffer to keep the UI simple.
-
-## Validation invariants
-
-Validation must complete before execution.
-
-Rules:
-- no downloads before validation completes
-- no `store()` calls before validation completes
-- no partial execution
-
-Validation must be:
-- deterministic
-- global across the full input
-- consistent with Get/Pull logic where applicable
-
-Validation failures should:
-- return a single generic error message
-- avoid partial processing
-- avoid side effects unless the stateless rejection model intentionally flushes the buffer
-
-## Ordering invariants
-
-Message order is authoritative.
-
-Rules:
-- preserve original message order unless the user explicitly changes it
-- preserve relative order in transformations such as Route batching
-- keep `store()` input order identical to original message order
-
-Reorder defines an explicit new order and final output must follow it exactly.
-
-## Interaction invariants
-
-Interactive flows must remain version-safe.
-
-Rules:
-- all interactions depend on buffer version
-- version mismatch invalidates the interaction
-- invalidation removes buttons and shows `Selection is no longer available`
-
-Back behavior:
-- resets only local interaction state
-- does not partially revert state
-- returns to the main action menu
-
-## Media handling invariants
-
-Treat Telegram media groups as transport detail only.
-
-Rules:
-- flatten all input video messages
-- ignore original media-group boundaries
-- reconstruct dense output media groups
-- respect Telegram’s max 10 items per media group
-- operate on logical clip sequences, not Telegram grouping
-
-## Text layout
-
-Only real text lines count as content. Padding lines exist only for layout stability.
-
-Allowed layouts:
-
-Single-content messages:
-- real content on line 2
-- line 1 is padding
-
-Context messages:
-- line 1 is padding
-- context on line 2
-
-Padding must use one consistent width-based mechanism.
-Do not use:
-- manual spacing
-- empty lines
-- alternate padding tricks
-
-## Selected formatting
-
-Selection state must be visually structured.
-
-Rules:
-- each selected value is emphasized individually
-- separators are plain
-- do not emphasize the whole concatenated string
-
-## Button layout invariants
-
-All inline keyboards must always have exactly 3 rows.
-
-Buttons follow a fixed spatial grid:
-- top + middle rows = selectable options
-- bottom row = navigation or terminal action
-
-If Back exists:
-- it occupies the entire bottom row
-- its position never changes
-
-### Option grid layouts
-
-The first two rows are a deterministic option grid.
-
-Two layouts are allowed:
-- snake layout
-- columnar right-to-left layout
-
-Use the layout already established for the specific flow. Do not switch an existing flow from one layout to the other unless the task explicitly requires that UI change.
-
-### Snake layout
-
-Snake rules:
-- start at the top-right corner
-- go down
-- move left
-- go up
-- continue alternating while moving left
-
-If the number of option slots is odd:
-- the first row contains one fewer slot than the second row
-
-Do not place options sequentially left-to-right.
-
-### Columnar right-to-left layout
-
-Columnar rules:
-- group options in input-order top/bottom pairs
-- treat each pair as one vertical column
-- render columns from right to left
-- preserve the fixed 3-row keyboard shape
-
-Example with `[1,2,3,4,5,6]`:
-- top row = `[5,3,1]`
-- middle row = `[6,4,2]`
-
-## Fixed layout across flows
-
-Menus must not change shape based on data availability.
-
-Rules:
-- define a full set of possible option slots
-- render available options normally
-- render unavailable options as structural dummy placeholders
-- never collapse layout because data is missing
-- never insert placeholders if enough real options exist
-
-## Dummy buttons
-
-Dummy buttons are structural only.
-
-Rules:
-- preserve layout height and option positions
-- remain inert
-- do not affect logic, parsing, or state transitions
-- do not visually compete with real actions
-
-## UI/domain separation
-
-UI is a projection of domain state.
-
-Rules:
-- domain enums and values remain authoritative
-- UI may reorder or group values for usability
-- UI transformations must not affect storage, parsing, or business logic
-
-## Action menu contract
-
-Root action menus intentionally show all high-level actions.
-
-Rules:
-- do not hide or disable root actions based on current buffered input shape
-- each action validates its own input when clicked
-- invalid action input must invalidate the active menu with exactly `Invalid input` and remove buttons
-- submenus may be contextual, but root visibility must not duplicate action-level validation
-
 # Repository Agent Rules
+
+## General defaults
+
+- Prefer the smallest clear change that solves the current problem.
+- Preserve existing behavior unless the request explicitly changes it.
+- Avoid speculative architecture for hypothetical scale.
+- If output expectations are unclear, ask before producing the final artifact.
+- In plan/spec mode, prefer numbered clarification questions over assumptions.
+- Keep recommendations scoped and actionable.
+- Distinguish between:
+  - now — required due to active impact
+  - later — optional until a real trigger appears
+- Do not introduce new abstractions or helpers unless required to solve the task correctly.
+- Do not refactor unrelated code.
+- Do not modify unrelated code or documentation.
+- When editing docs, preserve existing structure and tone unless the task asks for a rewrite.
+- When the response format is unconstrained, after completing a task, propose a short, high-signal next step or action that the user is likely to want next.
 
 ## Tooling
 
 Environment and workflow:
 - Use `uv` for dependency management and command execution.
-- Pin exact versions when adding dependencies.
+- Add dependency ranges in `pyproject.toml`; rely on `uv.lock` for exact resolved versions.
 - Install the dev environment with `uv sync --dev`.
 - The repository uses `src/`; tests must import the installed package.
 - Do not modify `sys.path` in tests or use pytest/pythonpath hacks.
 
 Testing:
 - Run tests with `uv run pytest`.
+- Tests marked `live` hit external services and are skipped by default.
+- Run live tests with `uv run pytest --live` when changing live integration coverage or when verifying external-service behavior.
+- Keep existing unittest-style tests working under pytest.
+- New tests should use pytest style unless there is a specific reason not to.
+
+Test quality:
+- Prefer fewer high-signal tests over broad low-value coverage.
+- Add tests only when they protect a real invariant, failure mode, data contract, or behavior that would hurt if it silently changed.
+- Avoid tests that merely assert default argument values, dataclass field defaults, trivial constructor wiring, or constant policy choices. Test explicit input -> behavior instead.
+- Test defaults directly only when the default is an intentional stable public contract with meaningful user-facing behavior.
+- Avoid tests that depend on exact checked-in config values or repo policy thresholds unless those exact values are an intentional stable public contract. Prefer explicit test fixtures that assert parsing, override precedence, validation, or resulting behavior.
+- Avoid `__repr__` / formatting tests unless the exact representation is a stable public contract consumed by humans/tools. Do not test arbitrary visual output.
+- Avoid tests that simply mirror implementation details, private helper structure, call order, or current refactor shape without validating observable behavior.
+- Avoid dummy smoke tests that only instantiate objects or assert that code “does not crash” unless the absence of crashing is itself a meaningful regression boundary.
+- Prefer tests for durable invariants: validation rules, conversion semantics, ordering guarantees, failure handling, idempotency, boundary behavior, persistence format, and externally visible API behavior.
+- For data/domain code, prioritize edge cases that would corrupt stored data, hide invalid provider behavior, break replayability, or silently change model-facing features.
+- If a change is purely mechanical and no durable behavior is affected, it is acceptable to add no tests rather than create weak tests.
 
 Pre-commit:
 - Pre-commit is the final enforcement gate.
@@ -234,64 +54,81 @@ Pre-commit:
 - After completing any coding task, run `uv run pre-commit run --all-files`.
 - Do not stop after tests, Ruff, or Pyright alone if pre-commit has not been run.
 - Treat a failing pre-commit run as unfinished work and fix the issues before handing the result back for review.
-- The final delivered state must pass pre-commit, not just targeted checks.
 
 ## Code style
 
 - Target modern Python as defined by `pyproject.toml`.
 - Prefer current language features over legacy compatibility patterns.
+- Do not add backward-compatibility patterns unless explicitly required.
 - Prefer explicit code over clever abstractions.
+- Prefer public documented APIs over private internals.
+- Prefer fixing root causes over `Any`, `cast`, broad suppressions, or fragile hacks.
+- Prefer explicit `None` checks and proper type narrowing.
+- Use single quotes for normal strings.
+- Use triple double quotes for triple-quoted strings and docstrings.
+- Use Google-style docstrings.
+- Do not add `from __future__ import annotations` unless there is a real need.
+- Prefer snake_case naming.
+- Use absolute imports from top-level packages.
 - Do not rely on private attributes or methods unless explicitly required or there is no viable public alternative.
-- Use absolute imports only.
-- Import paths should start from the top-level package.
 - Document intentional contract-level exceptions in `Raises:` sections.
-- Do not document incidental internal exceptions unless they are part of the intended API behavior.
+- Do not document incidental internal exceptions unless they are part of intended API behavior.
+- In behavioral and API-facing modules, prefer top-down organization:
+  - public constants, types, and protocols
+  - public classes and functions
+  - private methods
+  - private helper functions
+- Readers should be able to understand the module's public surface before encountering implementation details.
+- Avoid placing private helpers above the public APIs that use them unless there is a strong readability or dependency reason.
+- Declaration, schema, model-definition, and infrastructure/support modules may keep dependency-first ordering when that structure is more natural.
 
 Type checking:
 - Do not distort architecture just to satisfy static analysis.
 - If a library relies on dynamic runtime behavior that static analysis cannot model, prefer a narrow, well-commented suppression over architectural duplication or private API usage.
 
+Markdown defaults:
+- Do not use horizontal rules (`---`) to separate sections.
+- Rely on headers (`#`, `##`, etc.) for structure and visual separation.
+- Avoid redundant visual separators that add noise without improving readability.
+
 ## Operating assumptions
 
 Audience and scale:
 - primary user is the repository owner, possibly a few trusted users
-- traffic is low and mostly sequential
+- scheduled/background work may be unattended and reliability-sensitive
+- API traffic may be bursty during collection jobs and must be throttled explicitly when needed
 - developer time is the most constrained resource
 
 Design principles:
 - prefer simplicity and explicit assumptions over defensive completeness
-- fail fast on unhandled exceptions
-- soft or unbounded buffering is acceptable when aligned with personal usage
-- handlers may orchestrate logic pragmatically
+- fail fast inside domain/data contracts
+- long-running workers should log recoverable job failures and continue when safe
 - keep logs concise and human-readable
 - optimize for common paths and maintainability over exhaustive guards
-
-Refactor triggers:
-- repeated production failures
-- difficult debugging
-- increasing message or user volume
-- handlers becoming hard to modify safely
-- memory or runtime limits reached
-
-Accepted risks:
-- some edge cases may remain intentionally unhandled
-- stronger isolation or hard limits can be added after real incidents
-- maintenance speed and clarity take priority over defensive completeness
+- add stronger isolation or hard limits after real incidents, not speculatively
+- keep ownership aligned with architectural layers: domain/lifecycle entities
+  own domain facts, identity, and lifecycle-local state; services/orchestrators
+  own runtime policy and cross-component coordination; transports own delivery
+  mechanics; adapters own representation conversion; ML/runtime code owns model
+  and feature-extraction concerns
+- lifecycle convenience is not sufficient ownership justification
+- do not place higher-level concerns into lower-level entities merely because
+  cleanup, access, or lifecycle management is easier there
+- prefer explicit cleanup over downward coupling
 
 Documentation of invariants:
 - Persist important architectural invariants and source-of-truth assumptions in docstrings near the owning class or function.
 - Document non-obvious contracts when a reasonable reviewer might otherwise infer the wrong behavior.
-- Prefer documenting the invariant once at the highest-value location (usually the owning class, core dataclass, or public method), not repeating it everywhere.
+- Prefer documenting the invariant once at the highest-value location.
 - Especially document:
   - what state is authoritative
   - what is cache-like or derived
-  - intentional stale or unsynchronized states that may temporarily exist
   - ordering and grouping guarantees
-  - single-writer or concurrency assumptions
-- Do not add generic or redundant docstrings; document only invariants that materially affect design, review, debugging, or future changes.
+  - retry, throttling, and concurrency assumptions
+  - single-writer or lifecycle assumptions
+- Do not add generic or redundant docstrings.
 
 ## Review expectations
-
 Reviews should evaluate:
 - abstraction boundaries
 - architecture fit by layer
@@ -302,20 +139,16 @@ Reviews should evaluate:
 - naming quality
 - modern Python usage
 
+Prefer comments only when they clarify non-obvious invariants, tradeoffs, or failure modes.
+
+Review feedback should explicitly call out hidden coupling and implicit assumptions.
+
 Infrastructure code must remain generic and domain-independent.
 
 For internal packages:
 - prefer empty `__init__.py`
 - do not create package-level APIs unless explicitly requested
 - do not re-export internal symbols for convenience
-
-Preferred:
-- `from timeline_hub.infra.tasks import TaskScheduler`
-- `from timeline_hub.infra.tasks import TaskSupervisor`
-- `from timeline_hub.infra.s3 import S3Client`
-
-Avoid:
-- `from timeline_hub.infra import TaskScheduler`
 
 Review feedback should be grouped as:
 - critical issues
@@ -329,168 +162,104 @@ Use Conventional Commits.
 Format:
 - `type(scope): short description`
 
-Core rule:
-- describe the PRIMARY system change introduced by the full diff
-- do not describe the last edited function, the most recent follow-up, the loudest error path, or a local implementation detail
-- describe the resulting capability or behavior at system level, not the mechanical patch that happened to be edited last
-
-Commit generation source of truth:
-- infer the commit message from the final staged diff first
-- use conversation context only to disambiguate intent, not to override the diff
-- if the work happened across multiple follow-ups or fragmented sessions, synthesize the commit from the final resulting change, not from the most recent patch
-- prefer reviewer-style interpretation of the completed diff over builder-style narration of the latest edit
-
 Allowed types:
 - feat
 - fix
 - refactor
-- perf
 - test
 - docs
+- build
 - chore
 
 Type guidance:
-- `feat` = new capability or new managed behavior, even if the change also includes follow-up correctness work or failure handling for that new capability
+- `feat` = new capability or new managed behavior
 - `fix` = corrected existing runtime behavior without introducing a materially new capability
 - `refactor` = restructuring without intended behavior change
-- `perf` = performance improvement without changing intended behavior
+- `test` = add or modify tests without changing application behavior
 - `docs` = documentation-only changes
-- `chore` = tooling, formatting, dependencies, repo maintenance, runtime-version bumps
+- `build` = dependency management, package/build configuration, lockfiles, runtime version constraints, Docker, and deployment build setup
+- `chore` = repository maintenance that does not affect build, dependency resolution, runtime packaging, or application behavior
 
-Type selection rules:
+Core rule:
+- describe the primary system change introduced by the full diff
+- infer the commit message from the final staged diff first
+- use conversation context only to disambiguate intent
+- do not anchor on the last edited function, latest bug fix, or local implementation detail
+- when a diff changes rules, policies, contracts, workflows, or instructions, describe the behavior being changed rather than the fact that text changed
+- if the affected actor matters for understanding the change, name it plainly in the subject
+
+Commit-intent pass:
+1. Inspect the final diff before every commit.
+   - Use `git diff --cached` if changes are staged.
+   - Otherwise use `git diff`.
+2. Summarize the complete semantic change set in 3-5 bullets.
+3. Identify the dominant system-level change introduced by the full diff.
+4. Choose the Conventional Commit message from that dominant change.
+5. Do not anchor on:
+   - the latest bug fix
+   - the last edited function
+   - the most recent review comment
+   - a small validation or edge-case change that only supports a broader feature
+6. If the diff contains a broad feature plus supporting fixes, tests, or docs, the subject must describe the broad feature. Put supporting details in the body when useful.
+7. If the diff appears to mix unrelated intents, propose the preferred split, but still choose the best single commit message if the current diff must remain as-is.
+8. For broad diffs, prefer a commit body that explains:
+   - why the change exists
+   - the main behavior, API, or entity changes
+   - important invariants or guarantees
+9. Use `refactor` for intentional presentation, wording, naming, metadata, layout, or formatting changes when they do not add a new capability and do not correct behavior that was explicitly wrong under the existing contract.
+
+Type selection:
 - if the diff introduces a new stored artifact, cache, lifecycle, workflow, API behavior, or managed derived state, use `feat`
-- do not use `fix` just because the diff contains error handling, rollback removal, validation tightening, or sync logic
+- do not use `fix` just because the diff contains error handling, validation tightening, or retry logic
 - if error handling or consistency logic exists mainly to support a new capability, the type is still `feat`
-- use `fix` only when the dominant purpose of the diff is correcting wrong behavior that already existed as the intended feature
-- when in doubt between `feat` and `fix`, choose based on the PRIMARY capability added by the full diff, not the most recent patch chunk
+- use `fix` only when the dominant purpose is correcting wrong behavior in an existing intended feature
+- use `build` for uv, dependency, lockfile, Docker, runtime, packaging, or deployment build changes
 
 Breaking changes:
 - use `type!:` or `type(scope)!:`
 - include a `BREAKING CHANGE:` footer
-- assume config, settings, env-var, public API, persisted-format, and runtime-version changes are breaking unless clearly proven otherwise
+- assume config, env-var, public API, persisted-format, and runtime-version changes are breaking unless clearly proven otherwise
 
 Subject rules:
 - lowercase by default
 - imperative mood
 - ≤72 characters
 - system-level wording
-- name the dominant capability or behavior added/changed
-- implementation details belong in the body, not the subject
-- avoid vague or low-signal subjects
-- avoid describing only failure handling when the real change is a larger feature
-- avoid describing only metadata tracking when the real change is caching, storage, generation, reuse, or lifecycle management
-- prefer the user/system outcome over internal representation details
-- when updating `AGENTS.md`, make it explicit in the subject that the change is about agent behavior, agent rules, or agent instructions
-- prefer subjects that name who the rule applies to and what behavior changed
-- avoid ambiguous wording that could sound like general repository or developer policy when the change is specifically about agent behavior
-- avoid vague terms like `guidance`, `cleanup`, or `tweaks` when the change affects agent instructions or decision rules
-
-Commit subject prioritization:
-- first identify the PRIMARY capability or behavior introduced by the full diff
-- then choose the type based on that primary change
-- then write the subject from that primary change
-- do not anchor on:
-  - the last patch in the conversation
-  - the last bug fixed during review
-  - rollback/error-path work that only supports a broader feature
-  - internal representation wording when the externally meaningful change is clearer
-- when the diff changes rules for a specific actor (for example agents), preserve that actor in the subject instead of generalizing to repository-wide wording
-
-Large refactors:
-- when the dominant result is architectural extraction, responsibility reassignment, or API-surface simplification, name that in the subject
-- prefer concrete verbs such as `extract`, `move`, `separate`, `delegate`, `unify`, `simplify`
-- avoid vague verbs like `centralize`, `improve`, or `update` when a clearer structural change exists
-- keep resolver, fallback, validation, and invariant-tightening details in the body unless they are the primary change
-
-Prefer outcome-oriented wording:
-- prefer `cache normalized clips`
-- prefer `reuse generated track variants`
-- prefer `preserve clip subgroup ordering`
-- prefer `tighten manifest validation`
-- avoid unnecessary representation-heavy wording like:
-  - `track normalized clip twins in manifests`
-  - `store applied cache metadata`
-  when the real system change is better expressed as caching, reuse, generation, cleanup, or lifecycle behavior
-
-User-facing concepts in subjects:
-- prefer neutral lowercase phrasing by default
-- do not preserve UI sentence casing unless needed for disambiguation
+- name the dominant capability or behavior changed
+- do not use tools, checker complaints, or mechanical diff descriptions as the main subject
+- avoid vague terms like `cleanup`, `tweaks`, or `guidance`
 - avoid backticks in subjects unless they add clear value
+- put implementation details in the body, not the subject
 
-Prefer:
-- `feat(services): cache normalized clips`
-- `feat(services): reuse generated track variants`
-- `fix(services): reject clip ids outside the requested subgroup`
-- `refactor(handlers): rename fetch flows to get and pull`
-- `docs: clarify agent commit scope rules`
-
-Over:
-- `feat(services): track normalized clip twins in manifests`
-- `fix(services): fail fast for normalized clip sync`
-- `refactor(handlers): rename \`Fetch\` flows to \`Get\` and \`Pull\``
-- `docs: clarify commit scope guidance`
-
-Backticks remain acceptable in bodies for precise code entities.
-
-Tooling-related subjects:
-- mention the tool only when the change is truly about adopting or configuring it
-- otherwise describe the resulting system change
-
-Code-entity references:
-- wrap file names, modules, classes, and functions in backticks when referenced in prose or bodies
-
-Shell safety:
-- avoid backticks inside double-quoted commit messages
-- prefer single quotes or heredocs when backticks appear
+Examples:
+- `build: migrate environment management to uv`
+- `feat(api): add throttled async client`
+- `fix(client): retry malformed responses`
+- `refactor(storage): separate snapshot persistence from collection`
+- `test(parser): cover retry exhaustion`
+- `docs: clarify agent commit rules`
+- Bad when the full diff adds convenience properties, repr output, and validation:
+  `feat(api): update repr output`
+- Better:
+  `feat(api): add convenience properties and validation`
 
 Commit bodies:
-- body optional for tiny obvious changes
-- short body preferred by default for non-trivial commits, especially:
-  - wide-surface renames
-  - behavior-preserving structural changes
-  - broad refactors touching many files
-  - multi-subsystem changes
-  - changes where preserved semantics or guarantees matter
-  - commits where the subject names the main feature and the body needs to explain lifecycle, invariants, or failure semantics
-
-Bodies should:
+- optional for tiny obvious changes
+- preferred for non-trivial refactors, behavior-preserving changes, broad diffs, or lifecycle/invariant changes
+- explain why, summarize scope, and clarify important guarantees
 - use normal sentence case
-- explain why
-- summarize scope and key guarantees
-- clarify important secondary behavior that should not dominate the subject
-- avoid mechanically restating the diff
-
-Good body topics:
-- pure rename / no behavior change
-- preserved semantics
-- key invariants or guarantees
-- scope boundaries
-- lifecycle of new derived artifacts or caches
-- explicit note that secondary sync/error-handling work supports a larger feature
-
-Body prioritization:
-- subject = primary capability
-- body = important supporting mechanics, guarantees, and failure semantics
-- if the diff adds a feature plus supporting sync/error handling, put the sync/error handling in the body, not the subject
+- keep secondary error-handling details in the body when they support a larger primary change
 
 Scopes:
 - use stable architectural subsystems
-- valid scopes: `app`, `handlers`, `services`, `infra`, `settings`, `deps`
+- use scope only when the change affects a clear, meaningful component
 - omit scope when the change is cross-cutting or repository-level
 - choose scope by system intent, not just touched file
-- do not use a narrow scope when the change modifies contracts or behavior across multiple subsystems
-- if handlers orchestration depends on new services/domain contracts, usually omit scope
-
-Root-level files usually omit scope.
+- do not infer scope from filenames alone
+- root-level files usually omit scope
 
 Commit coherence:
 - keep commits conceptually coherent by subsystem and intent
 - split unrelated changes
-- do not mix substantial runtime logic changes with unrelated tooling or formatting if that hurts clarity
-
-Pre-write check:
-- before finalizing a commit message, explicitly verify:
-  - what is the primary capability or behavior introduced by the full diff?
-  - is the chosen type driven by that primary change?
-  - is the subject naming the real outcome rather than a local implementation detail?
-  - are secondary fixes/error-path changes kept in the body instead of hijacking the subject?
+- do not mix substantial runtime logic changes with unrelated tooling or formatting
+- use kebab-case for scopes when a separator is needed; avoid snake_case scopes
