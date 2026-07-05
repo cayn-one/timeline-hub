@@ -62,7 +62,11 @@ async def _main(settings: Settings) -> None:
             task_scheduler=TaskScheduler(
                 task_supervisor=TaskSupervisor(on_failure=on_failure_stop),
             ),
-            clip_store=ClipStore(s3_client, namespace=settings.clip_namespace),
+            clip_store=ClipStore(
+                s3_client,
+                namespace=settings.clip_namespace,
+                sampled_phash_mean_threshold=settings.sampled_phash_mean_threshold,
+            ),
             track_store=TrackStore(
                 s3_client,
                 preset_store=preset_store,

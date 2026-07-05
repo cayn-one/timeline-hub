@@ -15,6 +15,11 @@ namespace = "clips"
 normalization_loudness = -14
 # Audio bitrate for normalized output
 normalization_bitrate = 128
+# Mean sampled-frame pHash distance threshold.
+# Duplicates observed at 0.16..1.04; non-duplicates at 23.44+.
+# Range is 0..63. ~1.0 is very conservative; 1.5 is the current default.
+# Values >5 are likely too permissive; 63 is degenerate.
+sampled_phash_mean_threshold = 1.5
 
 [dev.clips]
 namespace = "clips-dev"

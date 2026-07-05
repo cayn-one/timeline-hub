@@ -38,6 +38,7 @@ _CONFIG_CONTENT = dedent(
     namespace = "clips"
     normalization_loudness = -14
     normalization_bitrate = 128
+    sampled_phash_mean_threshold = 1.5
 
     [tracks]
     namespace = "tracks"
@@ -59,6 +60,7 @@ _DEV_CONFIG_CONTENT = dedent(
     namespace = "clips-dev"
     normalization_loudness = -12
     normalization_bitrate = 96
+    sampled_phash_mean_threshold = 2.5
 
     [dev.tracks]
     namespace = "tracks-dev"
@@ -117,6 +119,7 @@ def test_settings_load_reads_production_config_and_env_values(
     assert settings.clip_namespace == 'clips'
     assert settings.normalization_loudness == -14
     assert settings.normalization_bitrate == 128
+    assert settings.sampled_phash_mean_threshold == 1.5
     assert settings.track_namespace == 'tracks'
     assert settings.variant_max_duration == timedelta(minutes=30)
     assert settings.slowest_variant_speed == 0.5
@@ -140,6 +143,7 @@ def test_settings_load_applies_dev_overrides_from_same_file(
     assert settings.clip_namespace == 'clips-dev'
     assert settings.normalization_loudness == -12
     assert settings.normalization_bitrate == 96
+    assert settings.sampled_phash_mean_threshold == 2.5
     assert settings.track_namespace == 'tracks-dev'
     assert settings.variant_max_duration == timedelta(minutes=1)
     assert settings.slowest_variant_speed == 0.75
@@ -169,6 +173,7 @@ def test_settings_load_rejects_unknown_config_keys(
             namespace = "clips"
             normalization_loudness = -14
             normalization_bitrate = 128
+            sampled_phash_mean_threshold = 1.5
 
             [tracks]
             namespace = "tracks"
@@ -258,3 +263,64 @@ def test_settings_load_uses_tracked_root_config_for_prod_and_dev_namespaces(
     assert production_settings.track_namespace == 'tracks'
     assert development_settings.clip_namespace == 'clips-dev'
     assert development_settings.track_namespace == 'tracks-dev'
+
+
+def test_settings_load_rejects_zero_sampled_phash_mean_threshold(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _clear_runtime_env(monkeypatch)
+    _write_runtime_files(
+        tmp_path,
+        config_content=_replace_config_line(
+            _CONFIG_CONTENT,
+            old='sampled_phash_mean_threshold = 1.5',
+            new='sampled_phash_mean_threshold = 0',
+        ),
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(settings_module, 'CONFIG_PATH', tmp_path / 'config.toml')
+
+    with pytest.raises(ValidationError):
+        Settings.load(is_dev=False)
+
+
+def test_settings_load_accepts_max_sampled_phash_mean_threshold(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _clear_runtime_env(monkeypatch)
+    _write_runtime_files(
+        tmp_path,
+        config_content=_replace_config_line(
+            _CONFIG_CONTENT,
+            old='sampled_phash_mean_threshold = 1.5',
+            new='sampled_phash_mean_threshold = 63',
+        ),
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(settings_module, 'CONFIG_PATH', tmp_path / 'config.toml')
+
+    settings = Settings.load(is_dev=False)
+
+    assert settings.sampled_phash_mean_threshold == 63
+
+
+def test_settings_load_rejects_sampled_phash_mean_threshold_above_range(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _clear_runtime_env(monkeypatch)
+    _write_runtime_files(
+        tmp_path,
+        config_content=_replace_config_line(
+            _CONFIG_CONTENT,
+            old='sampled_phash_mean_threshold = 1.5',
+            new='sampled_phash_mean_threshold = 64',
+        ),
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(settings_module, 'CONFIG_PATH', tmp_path / 'config.toml')
+
+    with pytest.raises(ValidationError):
+        Settings.load(is_dev=False)

@@ -6,7 +6,7 @@ import uuid
 import pytest
 
 import timeline_hub.services.clip_store as clip_store_module
-from timeline_hub.infra.ffmpeg import UnsupportedVideoCodecError
+from timeline_hub.infra.ffmpeg import PerceptualMetadataUnavailableError, UnsupportedVideoCodecError
 from timeline_hub.infra.s3 import S3Client, S3ObjectNotFoundError
 from timeline_hub.services.clip_store import (
     AudioNormalization,
@@ -47,6 +47,8 @@ _HASH_C = 'c' * 64
 _HASH_D = 'd' * 64
 _HASH_E = 'e' * 64
 _CLIP_NAMESPACE = 'clips'
+_FRAME_COUNT = 3
+_SAMPLED_PHASHES = (11, 22, 33)
 
 
 def test_store_result_adds_counts() -> None:
@@ -228,6 +230,41 @@ def _patch_hashes(monkeypatch: pytest.MonkeyPatch, hashes: dict[bytes, str]) -> 
     monkeypatch.setattr(clip_store_module, 'hash_video_content', _fake_hash)
 
 
+def _patch_perceptual_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+    metadata: dict[bytes, tuple[int, tuple[int, ...]]],
+) -> None:
+    async def _fake_frame_count(video_bytes: bytes) -> int:
+        return metadata[video_bytes][0]
+
+    async def _fake_sampled_phashes(video_bytes: bytes, *, frame_count: int) -> tuple[int, ...]:
+        expected_frame_count, sampled_phashes = metadata[video_bytes]
+        assert frame_count == expected_frame_count
+        return sampled_phashes
+
+    monkeypatch.setattr(clip_store_module, 'compute_video_frame_count', _fake_frame_count)
+    monkeypatch.setattr(clip_store_module, 'compute_video_sampled_phashes', _fake_sampled_phashes)
+
+
+def _sampled_phashes_for(video_bytes: bytes) -> tuple[int, ...]:
+    base = int.from_bytes(video_bytes[:8].ljust(8, b'\0'), 'big') % (2**63)
+    return (base, (base + 1) % (2**63), (base + 2) % (2**63))
+
+
+async def _default_compute_video_frame_count(video_bytes: bytes) -> int:
+    del video_bytes
+    return _FRAME_COUNT
+
+
+async def _default_compute_video_sampled_phashes(video_bytes: bytes, *, frame_count: int) -> tuple[int, ...]:
+    assert frame_count == _FRAME_COUNT
+    return _sampled_phashes_for(video_bytes)
+
+
+clip_store_module.compute_video_frame_count = _default_compute_video_frame_count
+clip_store_module.compute_video_sampled_phashes = _default_compute_video_sampled_phashes
+
+
 def _patch_uuid7(monkeypatch: pytest.MonkeyPatch, *clip_ids: str) -> None:
     uuids = iter(uuid.UUID(clip_id) for clip_id in clip_ids)
     monkeypatch.setattr(clip_store_module, '_uuid7', lambda: next(uuids))
@@ -238,7 +275,18 @@ def _mp4_file(data: bytes) -> FileBytes:
 
 
 def _store(s3_client: _FakeS3Client) -> ClipStore:
-    return ClipStore(s3_client, namespace=_CLIP_NAMESPACE)
+    return ClipStore(s3_client, namespace=_CLIP_NAMESPACE, sampled_phash_mean_threshold=1.5)
+
+
+def _entry(**kwargs: object) -> ManifestEntry:
+    payload = {
+        'frame_count': _FRAME_COUNT,
+        'sampled_phashes': _SAMPLED_PHASHES,
+    }
+    payload.update(kwargs)
+    return ManifestEntry(
+        **payload,
+    )
 
 
 def test_extension_mp4_supports_string_and_filename_parsing() -> None:
@@ -250,7 +298,7 @@ def test_extension_mp4_supports_string_and_filename_parsing() -> None:
 
 @pytest.mark.asyncio
 async def test_manifest_uses_data_root_with_preferred_field_order() -> None:
-    entry = ManifestEntry(
+    entry = _entry(
         id=_UUID_1,
         video_hash=_HASH_A,
         sub_season=SubSeason.A,
@@ -267,6 +315,8 @@ async def test_manifest_uses_data_root_with_preferred_field_order() -> None:
             {
                 'id': _UUID_1,
                 'video_hash': _HASH_A,
+                'frame_count': _FRAME_COUNT,
+                'sampled_phashes': list(_SAMPLED_PHASHES),
                 'audio_normalization': {'loudness': -14, 'bitrate': 128},
                 'sub_season': 'A',
                 'scope': 'collection',
@@ -278,6 +328,8 @@ async def test_manifest_uses_data_root_with_preferred_field_order() -> None:
     assert list(payload['data'][0]) == [
         'id',
         'video_hash',
+        'frame_count',
+        'sampled_phashes',
         'audio_normalization',
         'sub_season',
         'scope',
@@ -297,6 +349,44 @@ def test_manifest_rejects_old_list_root_shape() -> None:
         Manifest.from_dict([])
 
 
+def test_manifest_accepts_null_perceptual_metadata_pair() -> None:
+    entry = _entry(
+        id=_UUID_1,
+        video_hash=_HASH_A,
+        frame_count=None,
+        sampled_phashes=None,
+        sub_season=SubSeason.A,
+        scope=Scope.COLLECTION,
+        batch=1,
+        order=1,
+    )
+
+    payload = Manifest([entry]).to_dict()
+
+    assert payload['data'][0]['frame_count'] is None
+    assert payload['data'][0]['sampled_phashes'] is None
+    assert list(Manifest.from_dict(payload)) == [entry]
+
+
+def test_manifest_accepts_frame_count_without_sampled_phashes() -> None:
+    entry = _entry(
+        id=_UUID_1,
+        video_hash=_HASH_A,
+        frame_count=_FRAME_COUNT,
+        sampled_phashes=None,
+        sub_season=SubSeason.A,
+        scope=Scope.COLLECTION,
+        batch=1,
+        order=1,
+    )
+
+    payload = Manifest([entry]).to_dict()
+
+    assert payload['data'][0]['frame_count'] == _FRAME_COUNT
+    assert payload['data'][0]['sampled_phashes'] is None
+    assert list(Manifest.from_dict(payload)) == [entry]
+
+
 def test_manifest_rejects_legacy_null_sub_season() -> None:
     with pytest.raises(ValueError, match='manifest `sub_season` must be a string'):
         Manifest.from_dict(
@@ -305,6 +395,8 @@ def test_manifest_rejects_legacy_null_sub_season() -> None:
                     {
                         'id': _UUID_1,
                         'video_hash': _HASH_A,
+                        'frame_count': _FRAME_COUNT,
+                        'sampled_phashes': list(_SAMPLED_PHASHES),
                         'audio_normalization': None,
                         'sub_season': None,
                         'scope': 'extra',
@@ -314,6 +406,32 @@ def test_manifest_rejects_legacy_null_sub_season() -> None:
                 ]
             }
         )
+
+
+@pytest.mark.parametrize(
+    ('frame_count', 'sampled_phashes'),
+    [
+        (None, [1]),
+    ],
+)
+def test_manifest_rejects_mixed_null_perceptual_metadata(
+    frame_count: int | None,
+    sampled_phashes: list[int] | None,
+) -> None:
+    payload = {
+        'id': _UUID_1,
+        'video_hash': _HASH_A,
+        'frame_count': frame_count,
+        'sampled_phashes': sampled_phashes,
+        'audio_normalization': None,
+        'sub_season': 'A',
+        'scope': 'collection',
+        'batch': 1,
+        'order': 1,
+    }
+
+    with pytest.raises(ValueError, match='`frame_count` must be present when `sampled_phashes` are present'):
+        Manifest.from_dict({'data': [payload]})
 
 
 @pytest.mark.parametrize(
@@ -331,6 +449,8 @@ def test_manifest_rejects_non_positive_batch_and_order(
     payload = {
         'id': _UUID_1,
         'video_hash': _HASH_A,
+        'frame_count': _FRAME_COUNT,
+        'sampled_phashes': list(_SAMPLED_PHASHES),
         'audio_normalization': None,
         'sub_season': 'A',
         'scope': 'collection',
@@ -340,6 +460,94 @@ def test_manifest_rejects_non_positive_batch_and_order(
     payload[field] = value
 
     with pytest.raises(ValueError, match=expected_message):
+        Manifest.from_dict({'data': [payload]})
+
+
+@pytest.mark.parametrize(
+    ('field', 'expected_message'),
+    [
+        ('frame_count', 'manifest clip entry has unexpected fields'),
+        ('sampled_phashes', 'manifest clip entry has unexpected fields'),
+    ],
+)
+def test_manifest_rejects_missing_required_perceptual_fields(field: str, expected_message: str) -> None:
+    payload = Manifest(
+        [
+            _entry(
+                id=_UUID_1,
+                video_hash=_HASH_A,
+                sub_season=SubSeason.A,
+                scope=Scope.COLLECTION,
+                batch=1,
+                order=1,
+            )
+        ]
+    ).to_dict()['data'][0]
+    del payload[field]
+
+    with pytest.raises(ValueError, match=expected_message):
+        Manifest.from_dict({'data': [payload]})
+
+
+@pytest.mark.parametrize(
+    ('field', 'value', 'expected_message'),
+    [
+        ('frame_count', 0, 'manifest `frame_count` must be >= 1'),
+        ('sampled_phashes', [], 'manifest `sampled_phashes` must not be empty'),
+        ('sampled_phashes', [-1], 'manifest `sampled_phashes` entries must be >= 0'),
+        ('sampled_phashes', [2**63], 'manifest `sampled_phashes` entries must be < 2\\*\\*63'),
+    ],
+)
+def test_manifest_rejects_invalid_perceptual_fields(
+    field: str,
+    value: object,
+    expected_message: str,
+) -> None:
+    payload = Manifest(
+        [
+            _entry(
+                id=_UUID_1,
+                video_hash=_HASH_A,
+                sub_season=SubSeason.A,
+                scope=Scope.COLLECTION,
+                batch=1,
+                order=1,
+            )
+        ]
+    ).to_dict()['data'][0]
+    payload[field] = value
+
+    with pytest.raises(ValueError, match=expected_message):
+        Manifest.from_dict({'data': [payload]})
+
+
+@pytest.mark.parametrize(
+    ('frame_count', 'sampled_phashes'),
+    [
+        (2, [1]),
+        (2, [1, 2, 3]),
+    ],
+)
+def test_manifest_rejects_sampled_phash_length_mismatch(
+    frame_count: int,
+    sampled_phashes: list[int],
+) -> None:
+    payload = Manifest(
+        [
+            _entry(
+                id=_UUID_1,
+                video_hash=_HASH_A,
+                sub_season=SubSeason.A,
+                scope=Scope.COLLECTION,
+                batch=1,
+                order=1,
+            )
+        ]
+    ).to_dict()['data'][0]
+    payload['frame_count'] = frame_count
+    payload['sampled_phashes'] = sampled_phashes
+
+    with pytest.raises(ValueError, match=r'manifest `sampled_phashes` length must equal min\(frame_count, 25\)'):
         Manifest.from_dict({'data': [payload]})
 
 
@@ -354,6 +562,8 @@ def test_manifest_rejects_duplicate_batch_order_position() -> None:
                     {
                         'id': _UUID_1,
                         'video_hash': _HASH_A,
+                        'frame_count': _FRAME_COUNT,
+                        'sampled_phashes': list(_SAMPLED_PHASHES),
                         'audio_normalization': None,
                         'sub_season': 'A',
                         'scope': 'collection',
@@ -363,6 +573,8 @@ def test_manifest_rejects_duplicate_batch_order_position() -> None:
                     {
                         'id': _UUID_2,
                         'video_hash': _HASH_B,
+                        'frame_count': _FRAME_COUNT,
+                        'sampled_phashes': list(_SAMPLED_PHASHES),
                         'audio_normalization': None,
                         'sub_season': 'A',
                         'scope': 'collection',
@@ -387,7 +599,7 @@ async def test_fetch_returns_grouped_clips_with_portable_filenames(
         {
             manifest_key: _manifest_bytes(
                 [
-                    ManifestEntry(
+                    _entry(
                         id=_UUID_4,
                         video_hash=_HASH_D,
                         sub_season=SubSeason.A,
@@ -395,7 +607,7 @@ async def test_fetch_returns_grouped_clips_with_portable_filenames(
                         batch=2,
                         order=2,
                     ),
-                    ManifestEntry(
+                    _entry(
                         id=_UUID_2,
                         video_hash=_HASH_B,
                         sub_season=SubSeason.A,
@@ -403,7 +615,7 @@ async def test_fetch_returns_grouped_clips_with_portable_filenames(
                         batch=1,
                         order=2,
                     ),
-                    ManifestEntry(
+                    _entry(
                         id=_UUID_3,
                         video_hash=_HASH_C,
                         sub_season=SubSeason.A,
@@ -411,7 +623,7 @@ async def test_fetch_returns_grouped_clips_with_portable_filenames(
                         batch=2,
                         order=1,
                     ),
-                    ManifestEntry(
+                    _entry(
                         id=_UUID_1,
                         video_hash=_HASH_A,
                         sub_season=SubSeason.A,
@@ -478,7 +690,7 @@ async def test_fetch_raw_preserves_manifest_order_with_concurrent_reads() -> Non
             {
                 manifest_key: _manifest_bytes(
                     [
-                        ManifestEntry(
+                        _entry(
                             id=_UUID_1,
                             video_hash=_HASH_A,
                             sub_season=SubSeason.A,
@@ -486,7 +698,7 @@ async def test_fetch_raw_preserves_manifest_order_with_concurrent_reads() -> Non
                             batch=1,
                             order=1,
                         ),
-                        ManifestEntry(
+                        _entry(
                             id=_UUID_2,
                             video_hash=_HASH_B,
                             sub_season=SubSeason.A,
@@ -494,7 +706,7 @@ async def test_fetch_raw_preserves_manifest_order_with_concurrent_reads() -> Non
                             batch=1,
                             order=2,
                         ),
-                        ManifestEntry(
+                        _entry(
                             id=_UUID_3,
                             video_hash=_HASH_C,
                             sub_season=SubSeason.A,
@@ -547,7 +759,7 @@ async def test_fetch_with_audio_normalization_generates_normalized_twins_and_upd
         {
             manifest_key: _manifest_bytes(
                 [
-                    ManifestEntry(
+                    _entry(
                         id=_UUID_1,
                         video_hash=_HASH_A,
                         sub_season=SubSeason.A,
@@ -555,7 +767,7 @@ async def test_fetch_with_audio_normalization_generates_normalized_twins_and_upd
                         batch=1,
                         order=1,
                     ),
-                    ManifestEntry(
+                    _entry(
                         id=_UUID_2,
                         video_hash=_HASH_B,
                         sub_season=SubSeason.A,
@@ -563,7 +775,7 @@ async def test_fetch_with_audio_normalization_generates_normalized_twins_and_upd
                         batch=1,
                         order=2,
                     ),
-                    ManifestEntry(
+                    _entry(
                         id=_UUID_3,
                         video_hash=_HASH_C,
                         sub_season=SubSeason.A,
@@ -571,7 +783,7 @@ async def test_fetch_with_audio_normalization_generates_normalized_twins_and_upd
                         batch=2,
                         order=1,
                     ),
-                    ManifestEntry(
+                    _entry(
                         id=_UUID_4,
                         video_hash=_HASH_D,
                         sub_season=SubSeason.A,
@@ -628,7 +840,7 @@ async def test_fetch_with_audio_normalization_generates_normalized_twins_and_upd
     assert s3_client.objects[normalized_key_4] == b'normalized:batch-2-second'
     assert json.loads(s3_client.objects[manifest_key].decode('utf-8')) == _manifest_payload(
         [
-            ManifestEntry(
+            _entry(
                 id=_UUID_1,
                 video_hash=_HASH_A,
                 sub_season=SubSeason.A,
@@ -637,7 +849,7 @@ async def test_fetch_with_audio_normalization_generates_normalized_twins_and_upd
                 order=1,
                 audio_normalization=normalization,
             ),
-            ManifestEntry(
+            _entry(
                 id=_UUID_2,
                 video_hash=_HASH_B,
                 sub_season=SubSeason.A,
@@ -646,7 +858,7 @@ async def test_fetch_with_audio_normalization_generates_normalized_twins_and_upd
                 order=2,
                 audio_normalization=normalization,
             ),
-            ManifestEntry(
+            _entry(
                 id=_UUID_3,
                 video_hash=_HASH_C,
                 sub_season=SubSeason.A,
@@ -655,7 +867,7 @@ async def test_fetch_with_audio_normalization_generates_normalized_twins_and_upd
                 order=1,
                 audio_normalization=normalization,
             ),
-            ManifestEntry(
+            _entry(
                 id=_UUID_4,
                 video_hash=_HASH_D,
                 sub_season=SubSeason.A,
@@ -690,7 +902,7 @@ async def test_fetch_with_same_audio_normalization_reuses_existing_normalized_tw
         {
             manifest_key: _manifest_bytes(
                 [
-                    ManifestEntry(
+                    _entry(
                         id=_UUID_1,
                         video_hash=_HASH_A,
                         sub_season=SubSeason.A,
@@ -699,7 +911,7 @@ async def test_fetch_with_same_audio_normalization_reuses_existing_normalized_tw
                         order=1,
                         audio_normalization=normalization,
                     ),
-                    ManifestEntry(
+                    _entry(
                         id=_UUID_2,
                         video_hash=_HASH_B,
                         sub_season=SubSeason.A,
@@ -757,7 +969,7 @@ async def test_fetch_with_changed_audio_normalization_overwrites_stable_normaliz
         {
             manifest_key: _manifest_bytes(
                 [
-                    ManifestEntry(
+                    _entry(
                         id=_UUID_1,
                         video_hash=_HASH_A,
                         sub_season=SubSeason.A,
@@ -766,7 +978,7 @@ async def test_fetch_with_changed_audio_normalization_overwrites_stable_normaliz
                         order=1,
                         audio_normalization=old_normalization,
                     ),
-                    ManifestEntry(
+                    _entry(
                         id=_UUID_2,
                         video_hash=_HASH_B,
                         sub_season=SubSeason.A,
@@ -815,7 +1027,7 @@ async def test_fetch_with_changed_audio_normalization_overwrites_stable_normaliz
     assert s3_client.objects[normalized_key_2] == b'new:raw-second'
     assert json.loads(s3_client.objects[manifest_key].decode('utf-8')) == _manifest_payload(
         [
-            ManifestEntry(
+            _entry(
                 id=_UUID_1,
                 video_hash=_HASH_A,
                 sub_season=SubSeason.A,
@@ -824,7 +1036,7 @@ async def test_fetch_with_changed_audio_normalization_overwrites_stable_normaliz
                 order=1,
                 audio_normalization=new_normalization,
             ),
-            ManifestEntry(
+            _entry(
                 id=_UUID_2,
                 video_hash=_HASH_B,
                 sub_season=SubSeason.A,
@@ -847,7 +1059,7 @@ async def test_fetch_audio_normalization_runs_sequentially(monkeypatch: pytest.M
         {
             manifest_key: _manifest_bytes(
                 [
-                    ManifestEntry(
+                    _entry(
                         id=_UUID_1,
                         video_hash=_HASH_A,
                         sub_season=SubSeason.A,
@@ -855,7 +1067,7 @@ async def test_fetch_audio_normalization_runs_sequentially(monkeypatch: pytest.M
                         batch=1,
                         order=1,
                     ),
-                    ManifestEntry(
+                    _entry(
                         id=_UUID_2,
                         video_hash=_HASH_B,
                         sub_season=SubSeason.A,
@@ -863,7 +1075,7 @@ async def test_fetch_audio_normalization_runs_sequentially(monkeypatch: pytest.M
                         batch=1,
                         order=2,
                     ),
-                    ManifestEntry(
+                    _entry(
                         id=_UUID_3,
                         video_hash=_HASH_C,
                         sub_season=SubSeason.A,
@@ -920,7 +1132,7 @@ async def test_fetch_raises_explicit_error_when_manifest_write_fails_after_norma
         {
             manifest_key: _manifest_bytes(
                 [
-                    ManifestEntry(
+                    _entry(
                         id=_UUID_1,
                         video_hash=_HASH_A,
                         sub_season=SubSeason.A,
@@ -928,7 +1140,7 @@ async def test_fetch_raises_explicit_error_when_manifest_write_fails_after_norma
                         batch=1,
                         order=1,
                     ),
-                    ManifestEntry(
+                    _entry(
                         id=_UUID_2,
                         video_hash=_HASH_B,
                         sub_season=SubSeason.A,
@@ -981,7 +1193,7 @@ async def test_fetch_raises_explicit_error_when_normalized_write_path_fails_befo
         {
             manifest_key: _manifest_bytes(
                 [
-                    ManifestEntry(
+                    _entry(
                         id=_UUID_1,
                         video_hash=_HASH_A,
                         sub_season=SubSeason.A,
@@ -989,7 +1201,7 @@ async def test_fetch_raises_explicit_error_when_normalized_write_path_fails_befo
                         batch=1,
                         order=1,
                     ),
-                    ManifestEntry(
+                    _entry(
                         id=_UUID_2,
                         video_hash=_HASH_B,
                         sub_season=SubSeason.A,
@@ -1041,7 +1253,7 @@ async def test_fetch_regenerates_missing_normalized_twin_when_manifest_says_it_e
         {
             manifest_key: _manifest_bytes(
                 [
-                    ManifestEntry(
+                    _entry(
                         id=_UUID_1,
                         video_hash=_HASH_A,
                         sub_season=SubSeason.A,
@@ -1078,7 +1290,7 @@ async def test_fetch_regenerates_missing_normalized_twin_when_manifest_says_it_e
     assert s3_client.objects[normalized_key_1] == b'regenerated:raw-first'
     assert json.loads(s3_client.objects[manifest_key].decode('utf-8')) == _manifest_payload(
         [
-            ManifestEntry(
+            _entry(
                 id=_UUID_1,
                 video_hash=_HASH_A,
                 sub_season=SubSeason.A,
@@ -1103,7 +1315,7 @@ async def test_fetch_with_clip_ids_returns_only_requested_sub_group_subset_in_ma
             {
                 manifest_key: _manifest_bytes(
                     [
-                        ManifestEntry(
+                        _entry(
                             id=_UUID_1,
                             video_hash=_HASH_A,
                             sub_season=SubSeason.A,
@@ -1111,7 +1323,7 @@ async def test_fetch_with_clip_ids_returns_only_requested_sub_group_subset_in_ma
                             batch=1,
                             order=1,
                         ),
-                        ManifestEntry(
+                        _entry(
                             id=_UUID_2,
                             video_hash=_HASH_B,
                             sub_season=SubSeason.A,
@@ -1119,7 +1331,7 @@ async def test_fetch_with_clip_ids_returns_only_requested_sub_group_subset_in_ma
                             batch=1,
                             order=2,
                         ),
-                        ManifestEntry(
+                        _entry(
                             id=_UUID_3,
                             video_hash=_HASH_C,
                             sub_season=SubSeason.A,
@@ -1127,7 +1339,7 @@ async def test_fetch_with_clip_ids_returns_only_requested_sub_group_subset_in_ma
                             batch=2,
                             order=1,
                         ),
-                        ManifestEntry(
+                        _entry(
                             id=_UUID_4,
                             video_hash=_HASH_D,
                             sub_season=SubSeason.B,
@@ -1168,7 +1380,7 @@ async def test_fetch_with_duplicate_clip_ids_raises() -> None:
             {
                 manifest_key: _manifest_bytes(
                     [
-                        ManifestEntry(
+                        _entry(
                             id=_UUID_1,
                             video_hash=_HASH_A,
                             sub_season=SubSeason.A,
@@ -1201,7 +1413,7 @@ async def test_fetch_with_unknown_clip_ids_raises() -> None:
             {
                 manifest_key: _manifest_bytes(
                     [
-                        ManifestEntry(
+                        _entry(
                             id=_UUID_1,
                             video_hash=_HASH_A,
                             sub_season=SubSeason.A,
@@ -1234,7 +1446,7 @@ async def test_fetch_with_clip_ids_from_other_sub_group_raises() -> None:
             {
                 manifest_key: _manifest_bytes(
                     [
-                        ManifestEntry(
+                        _entry(
                             id=_UUID_1,
                             video_hash=_HASH_A,
                             sub_season=SubSeason.A,
@@ -1242,7 +1454,7 @@ async def test_fetch_with_clip_ids_from_other_sub_group_raises() -> None:
                             batch=1,
                             order=1,
                         ),
-                        ManifestEntry(
+                        _entry(
                             id=_UUID_2,
                             video_hash=_HASH_B,
                             sub_season=SubSeason.B,
@@ -1295,7 +1507,7 @@ async def test_fetch_fails_with_requested_sub_group_fields_when_sub_group_is_mis
             {
                 manifest_key: _manifest_bytes(
                     [
-                        ManifestEntry(
+                        _entry(
                             id=_UUID_1,
                             video_hash=_HASH_A,
                             sub_season=SubSeason.B,
@@ -1379,7 +1591,7 @@ async def test_list_clips_returns_unique_sub_groups_as_keys() -> None:
             {
                 manifest_key: _manifest_bytes(
                     [
-                        ManifestEntry(
+                        _entry(
                             id=_UUID_1,
                             video_hash=_HASH_A,
                             sub_season=SubSeason.A,
@@ -1387,7 +1599,7 @@ async def test_list_clips_returns_unique_sub_groups_as_keys() -> None:
                             batch=1,
                             order=1,
                         ),
-                        ManifestEntry(
+                        _entry(
                             id=_UUID_2,
                             video_hash=_HASH_B,
                             sub_season=SubSeason.A,
@@ -1395,7 +1607,7 @@ async def test_list_clips_returns_unique_sub_groups_as_keys() -> None:
                             batch=2,
                             order=1,
                         ),
-                        ManifestEntry(
+                        _entry(
                             id=_UUID_4,
                             video_hash=_HASH_C,
                             sub_season=SubSeason.NONE,
@@ -1432,7 +1644,7 @@ async def test_list_clips_returns_sorted_sub_groups() -> None:
             {
                 manifest_key: _manifest_bytes(
                     [
-                        ManifestEntry(
+                        _entry(
                             id=_UUID_1,
                             video_hash=_HASH_A,
                             sub_season=SubSeason.B,
@@ -1440,7 +1652,7 @@ async def test_list_clips_returns_sorted_sub_groups() -> None:
                             batch=1,
                             order=1,
                         ),
-                        ManifestEntry(
+                        _entry(
                             id=_UUID_2,
                             video_hash=_HASH_B,
                             sub_season=SubSeason.NONE,
@@ -1448,7 +1660,7 @@ async def test_list_clips_returns_sorted_sub_groups() -> None:
                             batch=1,
                             order=1,
                         ),
-                        ManifestEntry(
+                        _entry(
                             id=_UUID_4,
                             video_hash=_HASH_C,
                             sub_season=SubSeason.B,
@@ -1479,7 +1691,7 @@ async def test_list_clips_returns_batches_sorted_within_sub_group() -> None:
             {
                 manifest_key: _manifest_bytes(
                     [
-                        ManifestEntry(
+                        _entry(
                             id=_UUID_4,
                             video_hash=_HASH_C,
                             sub_season=SubSeason.A,
@@ -1487,7 +1699,7 @@ async def test_list_clips_returns_batches_sorted_within_sub_group() -> None:
                             batch=2,
                             order=2,
                         ),
-                        ManifestEntry(
+                        _entry(
                             id=_UUID_2,
                             video_hash=_HASH_B,
                             sub_season=SubSeason.A,
@@ -1495,7 +1707,7 @@ async def test_list_clips_returns_batches_sorted_within_sub_group() -> None:
                             batch=1,
                             order=2,
                         ),
-                        ManifestEntry(
+                        _entry(
                             id=_UUID_1,
                             video_hash=_HASH_A,
                             sub_season=SubSeason.A,
@@ -1503,7 +1715,7 @@ async def test_list_clips_returns_batches_sorted_within_sub_group() -> None:
                             batch=1,
                             order=1,
                         ),
-                        ManifestEntry(
+                        _entry(
                             id=_UUID_3,
                             video_hash=_HASH_D,
                             sub_season=SubSeason.A,
@@ -1557,12 +1769,17 @@ async def test_list_clips_fails_on_corrupted_manifest() -> None:
 @pytest.mark.asyncio
 async def test_store_treats_existing_video_hash_as_duplicate(monkeypatch: pytest.MonkeyPatch) -> None:
     _patch_hashes(monkeypatch, {b'clip': _HASH_A})
+
+    async def _unexpected_frame_count(video_bytes: bytes) -> int:
+        raise AssertionError(f'frame count must not be computed for exact duplicate: {video_bytes!r}')
+
+    monkeypatch.setattr(clip_store_module, 'compute_video_frame_count', _unexpected_frame_count)
     manifest_key = _manifest_key(year=2024, season=Season.S1, universe=Universe.WEST)
     s3_client = _FakeS3Client(
         {
             manifest_key: _manifest_bytes(
                 [
-                    ManifestEntry(
+                    _entry(
                         id=_UUID_1,
                         video_hash=_HASH_A,
                         sub_season=SubSeason.A,
@@ -1585,6 +1802,454 @@ async def test_store_treats_existing_video_hash_as_duplicate(monkeypatch: pytest
     assert result.stored_count == 0
     assert result.duplicate_count == 1
     assert s3_client.put_calls == []
+
+
+@pytest.mark.asyncio
+async def test_store_deduplicates_perceptual_duplicate_with_different_video_hash(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_hashes(monkeypatch, {b'clip': _HASH_B})
+    _patch_perceptual_metadata(
+        monkeypatch,
+        {
+            b'clip': (_FRAME_COUNT, _SAMPLED_PHASHES),
+        },
+    )
+    manifest_key = _manifest_key(year=2024, season=Season.S1, universe=Universe.WEST)
+    s3_client = _FakeS3Client(
+        {
+            manifest_key: _manifest_bytes(
+                [
+                    _entry(
+                        id=_UUID_1,
+                        video_hash=_HASH_A,
+                        sub_season=SubSeason.A,
+                        scope=Scope.COLLECTION,
+                        batch=1,
+                        order=1,
+                    )
+                ]
+            )
+        }
+    )
+    store = _store(s3_client)
+
+    result = await store.store(
+        ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1),
+        ClipSubGroup(sub_season=SubSeason.A, scope=Scope.COLLECTION),
+        clips=[_mp4_file(b'clip')],
+    )
+
+    assert result == StoreResult(stored_count=0, duplicate_count=1)
+    assert s3_client.put_calls == []
+
+
+@pytest.mark.asyncio
+async def test_store_accepts_clip_when_perceptual_metadata_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_hashes(monkeypatch, {b'clip': _HASH_A})
+
+    async def _raise_unavailable(video_bytes: bytes) -> int:
+        del video_bytes
+        raise PerceptualMetadataUnavailableError('missing frame count')
+
+    monkeypatch.setattr(clip_store_module, 'compute_video_frame_count', _raise_unavailable)
+    _patch_uuid7(monkeypatch, _UUID_1)
+    manifest_key = _manifest_key(year=2024, season=Season.S1, universe=Universe.WEST)
+    s3_client = _FakeS3Client()
+    store = _store(s3_client)
+
+    result = await store.store(
+        ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1),
+        ClipSubGroup(sub_season=SubSeason.A, scope=Scope.COLLECTION),
+        clips=[_mp4_file(b'clip')],
+    )
+
+    assert result == StoreResult(stored_count=1, duplicate_count=0, clip_ids=(_UUID_1,))
+    assert json.loads(s3_client.objects[manifest_key].decode('utf-8')) == _manifest_payload(
+        [
+            _entry(
+                id=_UUID_1,
+                video_hash=_HASH_A,
+                frame_count=None,
+                sampled_phashes=None,
+                sub_season=SubSeason.A,
+                scope=Scope.COLLECTION,
+                batch=1,
+                order=1,
+            )
+        ]
+    )
+
+
+@pytest.mark.asyncio
+async def test_store_accepts_clip_when_sampled_phashes_are_unavailable_after_frame_count(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_hashes(monkeypatch, {b'clip': _HASH_A})
+
+    async def _compute_frame_count(video_bytes: bytes) -> int:
+        del video_bytes
+        return _FRAME_COUNT
+
+    async def _raise_unavailable(video_bytes: bytes, *, frame_count: int) -> tuple[int, ...]:
+        del video_bytes, frame_count
+        raise PerceptualMetadataUnavailableError('failed to extract sampled frames')
+
+    monkeypatch.setattr(clip_store_module, 'compute_video_frame_count', _compute_frame_count)
+    monkeypatch.setattr(clip_store_module, 'compute_video_sampled_phashes', _raise_unavailable)
+    _patch_uuid7(monkeypatch, _UUID_1)
+    manifest_key = _manifest_key(year=2024, season=Season.S1, universe=Universe.WEST)
+    s3_client = _FakeS3Client()
+    store = _store(s3_client)
+
+    result = await store.store(
+        ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1),
+        ClipSubGroup(sub_season=SubSeason.A, scope=Scope.COLLECTION),
+        clips=[_mp4_file(b'clip')],
+    )
+
+    assert result == StoreResult(stored_count=1, duplicate_count=0, clip_ids=(_UUID_1,))
+    assert json.loads(s3_client.objects[manifest_key].decode('utf-8')) == _manifest_payload(
+        [
+            _entry(
+                id=_UUID_1,
+                video_hash=_HASH_A,
+                frame_count=_FRAME_COUNT,
+                sampled_phashes=None,
+                sub_season=SubSeason.A,
+                scope=Scope.COLLECTION,
+                batch=1,
+                order=1,
+            )
+        ]
+    )
+
+
+@pytest.mark.asyncio
+async def test_store_perceptual_comparison_skips_persisted_null_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_hashes(monkeypatch, {b'clip': _HASH_B})
+    _patch_perceptual_metadata(monkeypatch, {b'clip': (_FRAME_COUNT, _SAMPLED_PHASHES)})
+    _patch_uuid7(monkeypatch, _UUID_2)
+    manifest_key = _manifest_key(year=2024, season=Season.S1, universe=Universe.WEST)
+    s3_client = _FakeS3Client(
+        {
+            manifest_key: _manifest_bytes(
+                [
+                    _entry(
+                        id=_UUID_1,
+                        video_hash=_HASH_A,
+                        frame_count=None,
+                        sampled_phashes=None,
+                        sub_season=SubSeason.A,
+                        scope=Scope.COLLECTION,
+                        batch=1,
+                        order=1,
+                    )
+                ]
+            )
+        }
+    )
+    store = _store(s3_client)
+
+    result = await store.store(
+        ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1),
+        ClipSubGroup(sub_season=SubSeason.A, scope=Scope.COLLECTION),
+        clips=[_mp4_file(b'clip')],
+    )
+
+    assert result == StoreResult(stored_count=1, duplicate_count=0, clip_ids=(_UUID_2,))
+
+
+@pytest.mark.asyncio
+async def test_store_computes_sampled_phashes_before_storing_without_same_frame_count_candidates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_hashes(monkeypatch, {b'clip': _HASH_A})
+    observed_calls: list[tuple[bytes, int]] = []
+
+    async def _compute_frame_count(video_bytes: bytes) -> int:
+        del video_bytes
+        return _FRAME_COUNT
+
+    async def _compute_sampled_phashes(video_bytes: bytes, *, frame_count: int) -> tuple[int, ...]:
+        observed_calls.append((video_bytes, frame_count))
+        return _SAMPLED_PHASHES
+
+    monkeypatch.setattr(clip_store_module, 'compute_video_frame_count', _compute_frame_count)
+    monkeypatch.setattr(clip_store_module, 'compute_video_sampled_phashes', _compute_sampled_phashes)
+    _patch_uuid7(monkeypatch, _UUID_1)
+    manifest_key = _manifest_key(year=2024, season=Season.S1, universe=Universe.WEST)
+    s3_client = _FakeS3Client()
+    store = _store(s3_client)
+
+    result = await store.store(
+        ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1),
+        ClipSubGroup(sub_season=SubSeason.A, scope=Scope.COLLECTION),
+        clips=[_mp4_file(b'clip')],
+    )
+
+    assert result == StoreResult(stored_count=1, duplicate_count=0, clip_ids=(_UUID_1,))
+    assert observed_calls == [(b'clip', _FRAME_COUNT)]
+    assert json.loads(s3_client.objects[manifest_key].decode('utf-8')) == _manifest_payload(
+        [
+            _entry(
+                id=_UUID_1,
+                video_hash=_HASH_A,
+                frame_count=_FRAME_COUNT,
+                sampled_phashes=_SAMPLED_PHASHES,
+                sub_season=SubSeason.A,
+                scope=Scope.COLLECTION,
+                batch=1,
+                order=1,
+            )
+        ]
+    )
+
+
+@pytest.mark.asyncio
+async def test_store_exact_video_hash_duplicate_still_dedupes_when_manifest_perceptual_fields_are_null(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_hashes(monkeypatch, {b'clip': _HASH_A})
+
+    async def _unexpected_frame_count(video_bytes: bytes) -> int:
+        raise AssertionError(f'frame count must not be computed for exact duplicate: {video_bytes!r}')
+
+    monkeypatch.setattr(clip_store_module, 'compute_video_frame_count', _unexpected_frame_count)
+    manifest_key = _manifest_key(year=2024, season=Season.S1, universe=Universe.WEST)
+    s3_client = _FakeS3Client(
+        {
+            manifest_key: _manifest_bytes(
+                [
+                    _entry(
+                        id=_UUID_1,
+                        video_hash=_HASH_A,
+                        frame_count=None,
+                        sampled_phashes=None,
+                        sub_season=SubSeason.A,
+                        scope=Scope.COLLECTION,
+                        batch=1,
+                        order=1,
+                    )
+                ]
+            )
+        }
+    )
+    store = _store(s3_client)
+
+    result = await store.store(
+        ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1),
+        ClipSubGroup(sub_season=SubSeason.A, scope=Scope.COLLECTION),
+        clips=[_mp4_file(b'clip')],
+    )
+
+    assert result == StoreResult(stored_count=0, duplicate_count=1)
+
+
+@pytest.mark.asyncio
+async def test_store_same_call_perceptual_comparison_skips_null_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_hashes(monkeypatch, {b'first': _HASH_A, b'second': _HASH_B})
+
+    async def _compute_frame_count(video_bytes: bytes) -> int:
+        if video_bytes == b'first':
+            raise PerceptualMetadataUnavailableError('missing frame count')
+        return _FRAME_COUNT
+
+    async def _compute_sampled_phashes(video_bytes: bytes, *, frame_count: int) -> tuple[int, ...]:
+        del frame_count
+        return _SAMPLED_PHASHES
+
+    monkeypatch.setattr(clip_store_module, 'compute_video_frame_count', _compute_frame_count)
+    monkeypatch.setattr(clip_store_module, 'compute_video_sampled_phashes', _compute_sampled_phashes)
+    _patch_uuid7(monkeypatch, _UUID_1, _UUID_2)
+    store = _store(_FakeS3Client())
+
+    result = await store.store(
+        ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1),
+        ClipSubGroup(sub_season=SubSeason.A, scope=Scope.COLLECTION),
+        clips=[_mp4_file(b'first'), _mp4_file(b'second')],
+    )
+
+    assert result == StoreResult(stored_count=2, duplicate_count=0, clip_ids=(_UUID_1, _UUID_2))
+
+
+@pytest.mark.asyncio
+async def test_store_perceptual_comparison_skips_same_frame_count_rows_without_hashes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_hashes(monkeypatch, {b'clip': _HASH_B})
+    observed_calls: list[tuple[bytes, int]] = []
+
+    async def _compute_frame_count(video_bytes: bytes) -> int:
+        del video_bytes
+        return _FRAME_COUNT
+
+    async def _compute_sampled_phashes(video_bytes: bytes, *, frame_count: int) -> tuple[int, ...]:
+        observed_calls.append((video_bytes, frame_count))
+        return _SAMPLED_PHASHES
+
+    monkeypatch.setattr(clip_store_module, 'compute_video_frame_count', _compute_frame_count)
+    monkeypatch.setattr(clip_store_module, 'compute_video_sampled_phashes', _compute_sampled_phashes)
+    _patch_uuid7(monkeypatch, _UUID_2)
+    manifest_key = _manifest_key(year=2024, season=Season.S1, universe=Universe.WEST)
+    s3_client = _FakeS3Client(
+        {
+            manifest_key: _manifest_bytes(
+                [
+                    _entry(
+                        id=_UUID_1,
+                        video_hash=_HASH_A,
+                        frame_count=_FRAME_COUNT,
+                        sampled_phashes=None,
+                        sub_season=SubSeason.A,
+                        scope=Scope.COLLECTION,
+                        batch=1,
+                        order=1,
+                    )
+                ]
+            )
+        }
+    )
+    store = _store(s3_client)
+
+    result = await store.store(
+        ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1),
+        ClipSubGroup(sub_season=SubSeason.A, scope=Scope.COLLECTION),
+        clips=[_mp4_file(b'clip')],
+    )
+
+    assert result == StoreResult(stored_count=1, duplicate_count=0, clip_ids=(_UUID_2,))
+    assert observed_calls == [(b'clip', _FRAME_COUNT)]
+
+
+@pytest.mark.asyncio
+async def test_store_skips_perceptual_duplicate_when_frame_count_differs(monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_hashes(monkeypatch, {b'clip': _HASH_B})
+    observed_calls: list[tuple[bytes, int]] = []
+
+    async def _compute_frame_count(video_bytes: bytes) -> int:
+        del video_bytes
+        return _FRAME_COUNT + 1
+
+    async def _compute_sampled_phashes(video_bytes: bytes, *, frame_count: int) -> tuple[int, ...]:
+        observed_calls.append((video_bytes, frame_count))
+        return _SAMPLED_PHASHES
+
+    monkeypatch.setattr(clip_store_module, 'compute_video_frame_count', _compute_frame_count)
+    monkeypatch.setattr(clip_store_module, 'compute_video_sampled_phashes', _compute_sampled_phashes)
+    _patch_uuid7(monkeypatch, _UUID_2)
+    manifest_key = _manifest_key(year=2024, season=Season.S1, universe=Universe.WEST)
+    s3_client = _FakeS3Client(
+        {
+            manifest_key: _manifest_bytes(
+                [
+                    _entry(
+                        id=_UUID_1,
+                        video_hash=_HASH_A,
+                        sub_season=SubSeason.A,
+                        scope=Scope.COLLECTION,
+                        batch=1,
+                        order=1,
+                    )
+                ]
+            )
+        }
+    )
+    store = _store(s3_client)
+
+    result = await store.store(
+        ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1),
+        ClipSubGroup(sub_season=SubSeason.A, scope=Scope.COLLECTION),
+        clips=[_mp4_file(b'clip')],
+    )
+
+    assert result == StoreResult(stored_count=1, duplicate_count=0, clip_ids=(_UUID_2,))
+    assert observed_calls == [(b'clip', _FRAME_COUNT + 1)]
+
+
+@pytest.mark.asyncio
+async def test_store_accepts_perceptual_non_duplicate_with_same_frame_count(monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_hashes(monkeypatch, {b'clip': _HASH_B})
+    _patch_perceptual_metadata(
+        monkeypatch,
+        {
+            b'clip': (_FRAME_COUNT, (1000, 2000, 3000)),
+        },
+    )
+    _patch_uuid7(monkeypatch, _UUID_2)
+    manifest_key = _manifest_key(year=2024, season=Season.S1, universe=Universe.WEST)
+    s3_client = _FakeS3Client(
+        {
+            manifest_key: _manifest_bytes(
+                [
+                    _entry(
+                        id=_UUID_1,
+                        video_hash=_HASH_A,
+                        sub_season=SubSeason.A,
+                        scope=Scope.COLLECTION,
+                        batch=1,
+                        order=1,
+                    )
+                ]
+            )
+        }
+    )
+    store = _store(s3_client)
+
+    result = await store.store(
+        ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1),
+        ClipSubGroup(sub_season=SubSeason.A, scope=Scope.COLLECTION),
+        clips=[_mp4_file(b'clip')],
+    )
+
+    assert result == StoreResult(stored_count=1, duplicate_count=0, clip_ids=(_UUID_2,))
+
+
+@pytest.mark.asyncio
+async def test_store_deduplicates_same_call_perceptual_duplicate(monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_hashes(monkeypatch, {b'first': _HASH_A, b'second': _HASH_B})
+    _patch_perceptual_metadata(
+        monkeypatch,
+        {
+            b'first': (_FRAME_COUNT, (1000, 2000, 3000)),
+            b'second': (_FRAME_COUNT, (1000, 2000, 3000)),
+        },
+    )
+    _patch_uuid7(monkeypatch, _UUID_4)
+    manifest_key = _manifest_key(year=2024, season=Season.S1, universe=Universe.WEST)
+    store = _store(
+        _FakeS3Client(
+            {
+                manifest_key: _manifest_bytes(
+                    [
+                        _entry(
+                            id=_UUID_1,
+                            video_hash=_HASH_C,
+                            sampled_phashes=(4000, 5000, 6000),
+                            sub_season=SubSeason.C,
+                            scope=Scope.SOURCE,
+                            batch=1,
+                            order=1,
+                        )
+                    ]
+                )
+            }
+        )
+    )
+
+    result = await store.store(
+        ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1),
+        ClipSubGroup(sub_season=SubSeason.C, scope=Scope.SOURCE),
+        clips=[_mp4_file(b'first'), _mp4_file(b'second')],
+    )
+
+    assert result == StoreResult(stored_count=1, duplicate_count=1, clip_ids=(_UUID_4,))
 
 
 @pytest.mark.asyncio
@@ -1646,17 +2311,19 @@ async def test_store_generates_new_ids_for_same_call_distinct_hashes(
     assert result.clip_ids == (_UUID_4, _UUID_2)
     assert json.loads(s3_client.objects[target_manifest_key].decode('utf-8')) == _manifest_payload(
         [
-            ManifestEntry(
+            _entry(
                 id=_UUID_4,
                 video_hash=_HASH_A,
+                sampled_phashes=_sampled_phashes_for(b'first'),
                 sub_season=SubSeason.A,
                 scope=Scope.COLLECTION,
                 batch=1,
                 order=1,
             ),
-            ManifestEntry(
+            _entry(
                 id=_UUID_2,
                 video_hash=_HASH_B,
+                sampled_phashes=_sampled_phashes_for(b'second'),
                 sub_season=SubSeason.A,
                 scope=Scope.COLLECTION,
                 batch=1,
@@ -1693,17 +2360,19 @@ async def test_store_deduplicates_same_call_by_video_hash_and_keeps_dense_order(
     )
     assert json.loads(s3_client.objects[manifest_key].decode('utf-8')) == _manifest_payload(
         [
-            ManifestEntry(
+            _entry(
                 id=_UUID_4,
                 video_hash=_HASH_C,
+                sampled_phashes=_sampled_phashes_for(b'first'),
                 sub_season=SubSeason.C,
                 scope=Scope.SOURCE,
                 batch=1,
                 order=1,
             ),
-            ManifestEntry(
+            _entry(
                 id=_UUID_5,
                 video_hash=_HASH_D,
+                sampled_phashes=_sampled_phashes_for(b'third'),
                 sub_season=SubSeason.C,
                 scope=Scope.SOURCE,
                 batch=1,
@@ -1756,25 +2425,28 @@ async def test_store_creates_new_batch_per_call_and_resets_order(monkeypatch: py
     )
     assert json.loads(s3_client.objects[manifest_key].decode('utf-8')) == _manifest_payload(
         [
-            ManifestEntry(
+            _entry(
                 id=_UUID_1,
                 video_hash=_HASH_A,
+                sampled_phashes=_sampled_phashes_for(b'first'),
                 sub_season=SubSeason.A,
                 scope=Scope.COLLECTION,
                 batch=1,
                 order=1,
             ),
-            ManifestEntry(
+            _entry(
                 id=_UUID_2,
                 video_hash=_HASH_B,
+                sampled_phashes=_sampled_phashes_for(b'second'),
                 sub_season=SubSeason.A,
                 scope=Scope.COLLECTION,
                 batch=1,
                 order=2,
             ),
-            ManifestEntry(
+            _entry(
                 id=_UUID_3,
                 video_hash=_HASH_C,
+                sampled_phashes=_sampled_phashes_for(b'third'),
                 sub_season=SubSeason.A,
                 scope=Scope.COLLECTION,
                 batch=2,
@@ -1789,7 +2461,7 @@ async def test_store_all_duplicates_do_not_create_new_batch(monkeypatch: pytest.
     _patch_hashes(monkeypatch, {b'clip': _HASH_A})
     manifest_key = _manifest_key(year=2024, season=Season.S1, universe=Universe.WEST)
     original_manifest = [
-        ManifestEntry(
+        _entry(
             id=_UUID_1,
             video_hash=_HASH_A,
             sub_season=SubSeason.A,
@@ -1823,7 +2495,7 @@ async def test_store_propagates_first_clip_upload_failure_without_sync_error(
     manifest_key = _manifest_key(year=2024, season=Season.S1, universe=Universe.WEST)
     clip_key = _clip_key(year=2024, season=Season.S1, universe=Universe.WEST, clip_id=_UUID_2)
     original_manifest = [
-        ManifestEntry(
+        _entry(
             id=_UUID_1,
             video_hash=_HASH_A,
             sub_season=SubSeason.A,
@@ -1868,7 +2540,7 @@ async def test_store_raises_sync_error_when_later_clip_upload_fails(
     first_clip_key = _clip_key(year=2024, season=Season.S1, universe=Universe.WEST, clip_id=_UUID_2)
     second_clip_key = _clip_key(year=2024, season=Season.S1, universe=Universe.WEST, clip_id=_UUID_3)
     original_manifest = [
-        ManifestEntry(
+        _entry(
             id=_UUID_1,
             video_hash=_HASH_A,
             sub_season=SubSeason.A,
@@ -2052,25 +2724,28 @@ async def test_store_uploads_all_clips_successfully_with_concurrent_uploads(
     )
     assert json.loads(s3_client.objects[manifest_key].decode('utf-8')) == _manifest_payload(
         [
-            ManifestEntry(
+            _entry(
                 id=_UUID_1,
                 video_hash=_HASH_A,
+                sampled_phashes=_sampled_phashes_for(b'first'),
                 sub_season=SubSeason.A,
                 scope=Scope.COLLECTION,
                 batch=1,
                 order=1,
             ),
-            ManifestEntry(
+            _entry(
                 id=_UUID_2,
                 video_hash=_HASH_B,
+                sampled_phashes=_sampled_phashes_for(b'second'),
                 sub_season=SubSeason.A,
                 scope=Scope.COLLECTION,
                 batch=1,
                 order=2,
             ),
-            ManifestEntry(
+            _entry(
                 id=_UUID_3,
                 video_hash=_HASH_C,
+                sampled_phashes=_sampled_phashes_for(b'third'),
                 sub_season=SubSeason.A,
                 scope=Scope.COLLECTION,
                 batch=1,
@@ -2092,7 +2767,7 @@ async def test_store_raises_sync_error_when_manifest_write_fails(
     first_clip_key = _clip_key(year=2024, season=Season.S1, universe=Universe.WEST, clip_id=_UUID_2)
     second_clip_key = _clip_key(year=2024, season=Season.S1, universe=Universe.WEST, clip_id=_UUID_3)
     original_manifest = [
-        ManifestEntry(
+        _entry(
             id=_UUID_1,
             video_hash=_HASH_A,
             sub_season=SubSeason.A,
@@ -2146,7 +2821,7 @@ async def test_reorder_rewrites_only_target_sub_group_batches() -> None:
         {
             manifest_key: _manifest_bytes(
                 [
-                    ManifestEntry(
+                    _entry(
                         id=_UUID_1,
                         video_hash=_HASH_A,
                         sub_season=SubSeason.A,
@@ -2154,7 +2829,7 @@ async def test_reorder_rewrites_only_target_sub_group_batches() -> None:
                         batch=3,
                         order=1,
                     ),
-                    ManifestEntry(
+                    _entry(
                         id=_UUID_2,
                         video_hash=_HASH_B,
                         sub_season=SubSeason.A,
@@ -2162,7 +2837,7 @@ async def test_reorder_rewrites_only_target_sub_group_batches() -> None:
                         batch=3,
                         order=2,
                     ),
-                    ManifestEntry(
+                    _entry(
                         id=_UUID_3,
                         video_hash=_HASH_C,
                         sub_season=SubSeason.NONE,
@@ -2187,7 +2862,7 @@ async def test_reorder_rewrites_only_target_sub_group_batches() -> None:
 
     assert json.loads(s3_client.objects[manifest_key].decode('utf-8')) == _manifest_payload(
         [
-            ManifestEntry(
+            _entry(
                 id=_UUID_1,
                 video_hash=_HASH_A,
                 sub_season=SubSeason.A,
@@ -2195,7 +2870,7 @@ async def test_reorder_rewrites_only_target_sub_group_batches() -> None:
                 batch=2,
                 order=1,
             ),
-            ManifestEntry(
+            _entry(
                 id=_UUID_2,
                 video_hash=_HASH_B,
                 sub_season=SubSeason.A,
@@ -2203,7 +2878,7 @@ async def test_reorder_rewrites_only_target_sub_group_batches() -> None:
                 batch=1,
                 order=1,
             ),
-            ManifestEntry(
+            _entry(
                 id=_UUID_3,
                 video_hash=_HASH_C,
                 sub_season=SubSeason.NONE,
@@ -2249,7 +2924,7 @@ async def test_reorder_rejects_duplicate_clip_ids() -> None:
             {
                 manifest_key: _manifest_bytes(
                     [
-                        ManifestEntry(
+                        _entry(
                             id=_UUID_1,
                             video_hash=_HASH_A,
                             sub_season=SubSeason.A,
@@ -2279,7 +2954,7 @@ async def test_reorder_rejects_unknown_clip_ids() -> None:
             {
                 manifest_key: _manifest_bytes(
                     [
-                        ManifestEntry(
+                        _entry(
                             id=_UUID_1,
                             video_hash=_HASH_A,
                             sub_season=SubSeason.A,
@@ -2309,7 +2984,7 @@ async def test_reorder_rejects_clip_ids_outside_target_sub_group() -> None:
             {
                 manifest_key: _manifest_bytes(
                     [
-                        ManifestEntry(
+                        _entry(
                             id=_UUID_1,
                             video_hash=_HASH_A,
                             sub_season=SubSeason.A,
@@ -2317,7 +2992,7 @@ async def test_reorder_rejects_clip_ids_outside_target_sub_group() -> None:
                             batch=1,
                             order=1,
                         ),
-                        ManifestEntry(
+                        _entry(
                             id=_UUID_2,
                             video_hash=_HASH_B,
                             sub_season=SubSeason.NONE,
@@ -2347,7 +3022,7 @@ async def test_reorder_rejects_non_exact_target_sub_group_coverage() -> None:
             {
                 manifest_key: _manifest_bytes(
                     [
-                        ManifestEntry(
+                        _entry(
                             id=_UUID_1,
                             video_hash=_HASH_A,
                             sub_season=SubSeason.A,
@@ -2355,7 +3030,7 @@ async def test_reorder_rejects_non_exact_target_sub_group_coverage() -> None:
                             batch=1,
                             order=1,
                         ),
-                        ManifestEntry(
+                        _entry(
                             id=_UUID_2,
                             video_hash=_HASH_B,
                             sub_season=SubSeason.A,
@@ -2392,7 +3067,7 @@ async def test_move_appends_batches_and_compacts_source_sub_groups() -> None:
         {
             manifest_key: _manifest_bytes(
                 [
-                    ManifestEntry(
+                    _entry(
                         id=_UUID_1,
                         video_hash=_HASH_A,
                         sub_season=SubSeason.A,
@@ -2400,7 +3075,7 @@ async def test_move_appends_batches_and_compacts_source_sub_groups() -> None:
                         batch=2,
                         order=1,
                     ),
-                    ManifestEntry(
+                    _entry(
                         id=_UUID_2,
                         video_hash=_HASH_B,
                         sub_season=SubSeason.NONE,
@@ -2408,7 +3083,7 @@ async def test_move_appends_batches_and_compacts_source_sub_groups() -> None:
                         batch=3,
                         order=1,
                     ),
-                    ManifestEntry(
+                    _entry(
                         id=_UUID_3,
                         video_hash=_HASH_C,
                         sub_season=SubSeason.NONE,
@@ -2416,7 +3091,7 @@ async def test_move_appends_batches_and_compacts_source_sub_groups() -> None:
                         batch=5,
                         order=1,
                     ),
-                    ManifestEntry(
+                    _entry(
                         id=_UUID_4,
                         video_hash=_HASH_D,
                         sub_season=SubSeason.B,
@@ -2424,7 +3099,7 @@ async def test_move_appends_batches_and_compacts_source_sub_groups() -> None:
                         batch=4,
                         order=1,
                     ),
-                    ManifestEntry(
+                    _entry(
                         id=_UUID_5,
                         video_hash=_HASH_E,
                         sub_season=SubSeason.B,
@@ -2451,7 +3126,7 @@ async def test_move_appends_batches_and_compacts_source_sub_groups() -> None:
 
     assert json.loads(s3_client.objects[manifest_key].decode('utf-8')) == _manifest_payload(
         [
-            ManifestEntry(
+            _entry(
                 id=_UUID_1,
                 video_hash=_HASH_A,
                 sub_season=SubSeason.A,
@@ -2459,7 +3134,7 @@ async def test_move_appends_batches_and_compacts_source_sub_groups() -> None:
                 batch=2,
                 order=1,
             ),
-            ManifestEntry(
+            _entry(
                 id=_UUID_2,
                 video_hash=_HASH_B,
                 sub_season=SubSeason.A,
@@ -2467,7 +3142,7 @@ async def test_move_appends_batches_and_compacts_source_sub_groups() -> None:
                 batch=3,
                 order=1,
             ),
-            ManifestEntry(
+            _entry(
                 id=_UUID_3,
                 video_hash=_HASH_C,
                 sub_season=SubSeason.A,
@@ -2475,7 +3150,7 @@ async def test_move_appends_batches_and_compacts_source_sub_groups() -> None:
                 batch=4,
                 order=1,
             ),
-            ManifestEntry(
+            _entry(
                 id=_UUID_4,
                 video_hash=_HASH_D,
                 sub_season=SubSeason.A,
@@ -2483,7 +3158,7 @@ async def test_move_appends_batches_and_compacts_source_sub_groups() -> None:
                 batch=3,
                 order=2,
             ),
-            ManifestEntry(
+            _entry(
                 id=_UUID_5,
                 video_hash=_HASH_E,
                 sub_season=SubSeason.B,
@@ -2529,7 +3204,7 @@ async def test_move_rejects_duplicate_clip_ids() -> None:
             {
                 manifest_key: _manifest_bytes(
                     [
-                        ManifestEntry(
+                        _entry(
                             id=_UUID_1,
                             video_hash=_HASH_A,
                             sub_season=SubSeason.NONE,
@@ -2572,7 +3247,7 @@ async def test_move_rejects_clip_ids_already_in_target_sub_group() -> None:
             {
                 manifest_key: _manifest_bytes(
                     [
-                        ManifestEntry(
+                        _entry(
                             id=_UUID_1,
                             video_hash=_HASH_A,
                             sub_season=SubSeason.A,
@@ -2580,7 +3255,7 @@ async def test_move_rejects_clip_ids_already_in_target_sub_group() -> None:
                             batch=1,
                             order=1,
                         ),
-                        ManifestEntry(
+                        _entry(
                             id=_UUID_2,
                             video_hash=_HASH_B,
                             sub_season=SubSeason.NONE,
@@ -2618,7 +3293,7 @@ async def test_remove_deletes_authoritative_objects_and_compacts_affected_sub_gr
         {
             manifest_key: _manifest_bytes(
                 [
-                    ManifestEntry(
+                    _entry(
                         id=_UUID_1,
                         video_hash=_HASH_A,
                         sub_season=SubSeason.A,
@@ -2627,7 +3302,7 @@ async def test_remove_deletes_authoritative_objects_and_compacts_affected_sub_gr
                         order=1,
                         audio_normalization=normalization,
                     ),
-                    ManifestEntry(
+                    _entry(
                         id=_UUID_2,
                         video_hash=_HASH_B,
                         sub_season=SubSeason.A,
@@ -2635,7 +3310,7 @@ async def test_remove_deletes_authoritative_objects_and_compacts_affected_sub_gr
                         batch=7,
                         order=1,
                     ),
-                    ManifestEntry(
+                    _entry(
                         id=_UUID_3,
                         video_hash=_HASH_C,
                         sub_season=SubSeason.NONE,
@@ -2643,7 +3318,7 @@ async def test_remove_deletes_authoritative_objects_and_compacts_affected_sub_gr
                         batch=2,
                         order=1,
                     ),
-                    ManifestEntry(
+                    _entry(
                         id=_UUID_4,
                         video_hash=_HASH_D,
                         sub_season=SubSeason.NONE,
@@ -2679,7 +3354,7 @@ async def test_remove_deletes_authoritative_objects_and_compacts_affected_sub_gr
     assert s3_client.deleted_keys == [clip_key_1, normalized_key_1, clip_key_3]
     assert json.loads(s3_client.objects[manifest_key].decode('utf-8')) == _manifest_payload(
         [
-            ManifestEntry(
+            _entry(
                 id=_UUID_2,
                 video_hash=_HASH_B,
                 sub_season=SubSeason.A,
@@ -2687,7 +3362,7 @@ async def test_remove_deletes_authoritative_objects_and_compacts_affected_sub_gr
                 batch=1,
                 order=1,
             ),
-            ManifestEntry(
+            _entry(
                 id=_UUID_4,
                 video_hash=_HASH_D,
                 sub_season=SubSeason.NONE,
@@ -2718,7 +3393,7 @@ async def test_remove_rejects_duplicate_clip_ids() -> None:
             {
                 manifest_key: _manifest_bytes(
                     [
-                        ManifestEntry(
+                        _entry(
                             id=_UUID_1,
                             video_hash=_HASH_A,
                             sub_season=SubSeason.A,
@@ -2757,7 +3432,7 @@ async def test_remove_raises_cleanup_error_when_raw_delete_fails_after_manifest_
     clip_key_1 = _clip_key(year=2024, season=Season.S1, universe=Universe.WEST, clip_id=_UUID_1)
     original_manifest = _manifest_bytes(
         [
-            ManifestEntry(
+            _entry(
                 id=_UUID_1,
                 video_hash=_HASH_A,
                 sub_season=SubSeason.A,
@@ -2813,7 +3488,7 @@ async def test_remove_raises_cleanup_error_when_normalized_delete_fails_after_ma
     normalization = AudioNormalization(loudness=-14, bitrate=128)
     original_manifest = _manifest_bytes(
         [
-            ManifestEntry(
+            _entry(
                 id=_UUID_1,
                 video_hash=_HASH_A,
                 sub_season=SubSeason.A,
@@ -2862,7 +3537,7 @@ async def test_remove_deletes_manifest_instead_of_writing_empty_manifest_for_las
         {
             manifest_key: _manifest_bytes(
                 [
-                    ManifestEntry(
+                    _entry(
                         id=_UUID_1,
                         video_hash=_HASH_A,
                         sub_season=SubSeason.A,
@@ -2908,7 +3583,7 @@ async def test_remove_raises_sync_error_when_manifest_delete_fails_before_cleanu
     clip_key_1 = _clip_key(year=2024, season=Season.S1, universe=Universe.WEST, clip_id=_UUID_1)
     original_manifest = _manifest_bytes(
         [
-            ManifestEntry(
+            _entry(
                 id=_UUID_1,
                 video_hash=_HASH_A,
                 sub_season=SubSeason.A,
@@ -2961,7 +3636,7 @@ async def test_remove_raises_sync_error_when_manifest_write_fails_before_cleanup
     normalization = AudioNormalization(loudness=-14, bitrate=128)
     original_manifest = _manifest_bytes(
         [
-            ManifestEntry(
+            _entry(
                 id=_UUID_1,
                 video_hash=_HASH_A,
                 sub_season=SubSeason.A,
@@ -2970,7 +3645,7 @@ async def test_remove_raises_sync_error_when_manifest_write_fails_before_cleanup
                 order=1,
                 audio_normalization=normalization,
             ),
-            ManifestEntry(
+            _entry(
                 id=_UUID_2,
                 video_hash=_HASH_B,
                 sub_season=SubSeason.A,
@@ -3020,7 +3695,7 @@ async def test_reconcile_reorders_and_rebatches_target_sub_group() -> None:
         {
             manifest_key: _manifest_bytes(
                 [
-                    ManifestEntry(
+                    _entry(
                         id=_UUID_1,
                         video_hash=_HASH_A,
                         sub_season=SubSeason.A,
@@ -3028,7 +3703,7 @@ async def test_reconcile_reorders_and_rebatches_target_sub_group() -> None:
                         batch=3,
                         order=1,
                     ),
-                    ManifestEntry(
+                    _entry(
                         id=_UUID_2,
                         video_hash=_HASH_B,
                         sub_season=SubSeason.A,
@@ -3036,7 +3711,7 @@ async def test_reconcile_reorders_and_rebatches_target_sub_group() -> None:
                         batch=3,
                         order=2,
                     ),
-                    ManifestEntry(
+                    _entry(
                         id=_UUID_3,
                         video_hash=_HASH_C,
                         sub_season=SubSeason.A,
@@ -3044,7 +3719,7 @@ async def test_reconcile_reorders_and_rebatches_target_sub_group() -> None:
                         batch=10,
                         order=1,
                     ),
-                    ManifestEntry(
+                    _entry(
                         id=_UUID_4,
                         video_hash=_HASH_D,
                         sub_season=SubSeason.NONE,
@@ -3074,7 +3749,7 @@ async def test_reconcile_reorders_and_rebatches_target_sub_group() -> None:
     assert result == ReconcileResult(updated=3, removed=0)
     assert json.loads(s3_client.objects[manifest_key].decode('utf-8')) == _manifest_payload(
         [
-            ManifestEntry(
+            _entry(
                 id=_UUID_4,
                 video_hash=_HASH_D,
                 sub_season=SubSeason.NONE,
@@ -3082,7 +3757,7 @@ async def test_reconcile_reorders_and_rebatches_target_sub_group() -> None:
                 batch=1,
                 order=1,
             ),
-            ManifestEntry(
+            _entry(
                 id=_UUID_3,
                 video_hash=_HASH_C,
                 sub_season=SubSeason.A,
@@ -3090,7 +3765,7 @@ async def test_reconcile_reorders_and_rebatches_target_sub_group() -> None:
                 batch=1,
                 order=1,
             ),
-            ManifestEntry(
+            _entry(
                 id=_UUID_1,
                 video_hash=_HASH_A,
                 sub_season=SubSeason.A,
@@ -3098,7 +3773,7 @@ async def test_reconcile_reorders_and_rebatches_target_sub_group() -> None:
                 batch=1,
                 order=2,
             ),
-            ManifestEntry(
+            _entry(
                 id=_UUID_2,
                 video_hash=_HASH_B,
                 sub_season=SubSeason.A,
@@ -3124,7 +3799,7 @@ async def test_reconcile_moves_from_other_sub_group_and_deletes_omitted_clip() -
         {
             manifest_key: _manifest_bytes(
                 [
-                    ManifestEntry(
+                    _entry(
                         id=_UUID_1,
                         video_hash=_HASH_A,
                         sub_season=SubSeason.A,
@@ -3133,7 +3808,7 @@ async def test_reconcile_moves_from_other_sub_group_and_deletes_omitted_clip() -
                         order=1,
                         audio_normalization=prior_normalization,
                     ),
-                    ManifestEntry(
+                    _entry(
                         id=_UUID_2,
                         video_hash=_HASH_B,
                         sub_season=SubSeason.A,
@@ -3141,7 +3816,7 @@ async def test_reconcile_moves_from_other_sub_group_and_deletes_omitted_clip() -
                         batch=1,
                         order=2,
                     ),
-                    ManifestEntry(
+                    _entry(
                         id=_UUID_3,
                         video_hash=_HASH_C,
                         sub_season=SubSeason.NONE,
@@ -3170,7 +3845,7 @@ async def test_reconcile_moves_from_other_sub_group_and_deletes_omitted_clip() -
     assert result == ReconcileResult(updated=2, removed=1)
     assert json.loads(s3_client.objects[manifest_key].decode('utf-8')) == _manifest_payload(
         [
-            ManifestEntry(
+            _entry(
                 id=_UUID_3,
                 video_hash=_HASH_C,
                 sub_season=SubSeason.A,
@@ -3178,7 +3853,7 @@ async def test_reconcile_moves_from_other_sub_group_and_deletes_omitted_clip() -
                 batch=1,
                 order=1,
             ),
-            ManifestEntry(
+            _entry(
                 id=_UUID_2,
                 video_hash=_HASH_B,
                 sub_season=SubSeason.A,
@@ -3201,7 +3876,7 @@ async def test_reconcile_rejects_duplicate_clip_ids() -> None:
             {
                 manifest_key: _manifest_bytes(
                     [
-                        ManifestEntry(
+                        _entry(
                             id=_UUID_1,
                             video_hash=_HASH_A,
                             sub_season=SubSeason.A,
@@ -3255,7 +3930,7 @@ async def test_reconcile_rejects_unknown_clip_ids() -> None:
             {
                 manifest_key: _manifest_bytes(
                     [
-                        ManifestEntry(
+                        _entry(
                             id=_UUID_1,
                             video_hash=_HASH_A,
                             sub_season=SubSeason.A,
@@ -3285,7 +3960,7 @@ async def test_reconcile_rejects_clip_ids_missing_from_provided_group_manifest()
             {
                 manifest_key: _manifest_bytes(
                     [
-                        ManifestEntry(
+                        _entry(
                             id=_UUID_1,
                             video_hash=_HASH_A,
                             sub_season=SubSeason.A,
@@ -3316,7 +3991,7 @@ async def test_reconcile_raises_cleanup_error_after_manifest_commit_and_updates_
         {
             manifest_key: _manifest_bytes(
                 [
-                    ManifestEntry(
+                    _entry(
                         id=_UUID_1,
                         video_hash=_HASH_A,
                         sub_season=SubSeason.A,
@@ -3324,7 +3999,7 @@ async def test_reconcile_raises_cleanup_error_after_manifest_commit_and_updates_
                         batch=1,
                         order=1,
                     ),
-                    ManifestEntry(
+                    _entry(
                         id=_UUID_2,
                         video_hash=_HASH_B,
                         sub_season=SubSeason.A,
@@ -3360,7 +4035,7 @@ async def test_reconcile_raises_cleanup_error_after_manifest_commit_and_updates_
     assert f"RuntimeError('boom deleting {clip_key_1}')" in str(excinfo.value)
     expected_manifest = _manifest_payload(
         [
-            ManifestEntry(
+            _entry(
                 id=_UUID_2,
                 video_hash=_HASH_B,
                 sub_season=SubSeason.A,
@@ -3383,7 +4058,7 @@ async def test_remove_stops_before_normalized_cleanup_when_raw_delete_fails() ->
         {
             manifest_key: _manifest_bytes(
                 [
-                    ManifestEntry(
+                    _entry(
                         id=_UUID_1,
                         video_hash=_HASH_A,
                         sub_season=SubSeason.A,
@@ -3451,7 +4126,7 @@ async def test_compact_fails_with_requested_sub_group_fields_when_sub_group_is_m
             {
                 manifest_key: _manifest_bytes(
                     [
-                        ManifestEntry(
+                        _entry(
                             id=_UUID_1,
                             video_hash=_HASH_A,
                             sub_season=SubSeason.B,
@@ -3487,7 +4162,7 @@ async def test_compact_ignores_missing_sub_group_when_require_exists_is_false() 
         {
             manifest_key: _manifest_bytes(
                 [
-                    ManifestEntry(
+                    _entry(
                         id=_UUID_1,
                         video_hash=_HASH_A,
                         sub_season=SubSeason.B,
@@ -3519,7 +4194,7 @@ async def test_compact_preserves_relative_order_while_rewriting_positions() -> N
         {
             manifest_key: _manifest_bytes(
                 [
-                    ManifestEntry(
+                    _entry(
                         id=_UUID_4,
                         video_hash=_HASH_D,
                         sub_season=SubSeason.A,
@@ -3528,7 +4203,7 @@ async def test_compact_preserves_relative_order_while_rewriting_positions() -> N
                         order=1,
                         audio_normalization=normalization,
                     ),
-                    ManifestEntry(
+                    _entry(
                         id=_UUID_5,
                         video_hash='e' * 64,
                         sub_season=SubSeason.NONE,
@@ -3536,7 +4211,7 @@ async def test_compact_preserves_relative_order_while_rewriting_positions() -> N
                         batch=1,
                         order=1,
                     ),
-                    ManifestEntry(
+                    _entry(
                         id=_UUID_2,
                         video_hash=_HASH_B,
                         sub_season=SubSeason.A,
@@ -3544,7 +4219,7 @@ async def test_compact_preserves_relative_order_while_rewriting_positions() -> N
                         batch=3,
                         order=1,
                     ),
-                    ManifestEntry(
+                    _entry(
                         id=_UUID_1,
                         video_hash=_HASH_A,
                         sub_season=SubSeason.A,
@@ -3552,7 +4227,7 @@ async def test_compact_preserves_relative_order_while_rewriting_positions() -> N
                         batch=1,
                         order=1,
                     ),
-                    ManifestEntry(
+                    _entry(
                         id=_UUID_3,
                         video_hash=_HASH_C,
                         sub_season=SubSeason.A,
@@ -3589,7 +4264,7 @@ async def test_compact_preserves_relative_order_while_rewriting_positions() -> N
 async def test_compact_only_affects_specified_sub_group_and_leaves_others_unchanged() -> None:
     manifest_key = _manifest_key(year=2024, season=Season.S1, universe=Universe.WEST)
     original_other_entries = [
-        ManifestEntry(
+        _entry(
             id=_UUID_4,
             video_hash=_HASH_D,
             sub_season=SubSeason.NONE,
@@ -3597,7 +4272,7 @@ async def test_compact_only_affects_specified_sub_group_and_leaves_others_unchan
             batch=7,
             order=1,
         ),
-        ManifestEntry(
+        _entry(
             id=_UUID_5,
             video_hash='e' * 64,
             sub_season=SubSeason.A,
@@ -3611,7 +4286,7 @@ async def test_compact_only_affects_specified_sub_group_and_leaves_others_unchan
             manifest_key: _manifest_bytes(
                 [
                     original_other_entries[0],
-                    ManifestEntry(
+                    _entry(
                         id=_UUID_1,
                         video_hash=_HASH_A,
                         sub_season=SubSeason.A,
@@ -3620,7 +4295,7 @@ async def test_compact_only_affects_specified_sub_group_and_leaves_others_unchan
                         order=1,
                     ),
                     original_other_entries[1],
-                    ManifestEntry(
+                    _entry(
                         id=_UUID_2,
                         video_hash=_HASH_B,
                         sub_season=SubSeason.A,
@@ -3657,7 +4332,7 @@ async def test_compact_does_not_upload_manifest_when_positions_do_not_change() -
         {
             manifest_key: _manifest_bytes(
                 [
-                    ManifestEntry(
+                    _entry(
                         id=_UUID_1,
                         video_hash=_HASH_A,
                         sub_season=SubSeason.A,
@@ -3665,7 +4340,7 @@ async def test_compact_does_not_upload_manifest_when_positions_do_not_change() -
                         batch=1,
                         order=1,
                     ),
-                    ManifestEntry(
+                    _entry(
                         id=_UUID_2,
                         video_hash=_HASH_B,
                         sub_season=SubSeason.A,
@@ -3692,7 +4367,7 @@ async def test_compact_does_not_upload_manifest_when_positions_do_not_change() -
 async def test_compact_updates_manifest_cache_consistently_after_rewrite() -> None:
     manifest_key = _manifest_key(year=2024, season=Season.S1, universe=Universe.WEST)
     original_manifest = [
-        ManifestEntry(
+        _entry(
             id=_UUID_1,
             video_hash=_HASH_A,
             sub_season=SubSeason.A,
@@ -3700,7 +4375,7 @@ async def test_compact_updates_manifest_cache_consistently_after_rewrite() -> No
             batch=1,
             order=1,
         ),
-        ManifestEntry(
+        _entry(
             id=_UUID_2,
             video_hash=_HASH_B,
             sub_season=SubSeason.A,
@@ -3750,7 +4425,7 @@ async def test_compact_is_manifest_only_and_does_not_touch_clip_objects() -> Non
         {
             manifest_key: _manifest_bytes(
                 [
-                    ManifestEntry(
+                    _entry(
                         id=_UUID_1,
                         video_hash=_HASH_A,
                         sub_season=SubSeason.A,
@@ -3758,7 +4433,7 @@ async def test_compact_is_manifest_only_and_does_not_touch_clip_objects() -> Non
                         batch=1,
                         order=1,
                     ),
-                    ManifestEntry(
+                    _entry(
                         id=_UUID_2,
                         video_hash=_HASH_B,
                         sub_season=SubSeason.A,
@@ -3818,17 +4493,19 @@ async def test_compact_can_pull_newly_stored_single_clip_into_previous_batch_whe
 
     assert json.loads(s3_client.objects[manifest_key].decode('utf-8')) == _manifest_payload(
         [
-            ManifestEntry(
+            _entry(
                 id=_UUID_1,
                 video_hash=_HASH_A,
+                sampled_phashes=_sampled_phashes_for(b'first'),
                 sub_season=SubSeason.NONE,
                 scope=Scope.EXTRA,
                 batch=1,
                 order=1,
             ),
-            ManifestEntry(
+            _entry(
                 id=_UUID_2,
                 video_hash=_HASH_B,
+                sampled_phashes=_sampled_phashes_for(b'second'),
                 sub_season=SubSeason.NONE,
                 scope=Scope.EXTRA,
                 batch=1,
@@ -3842,7 +4519,7 @@ async def test_compact_can_pull_newly_stored_single_clip_into_previous_batch_whe
 async def test_compact_with_batch_size_ten_creates_dense_batches_with_final_partial() -> None:
     manifest_key = _manifest_key(year=2024, season=Season.S1, universe=Universe.WEST)
     entries = [
-        ManifestEntry(
+        _entry(
             id=uuid.uuid7().hex,
             video_hash=f'{index + 1:064x}',
             sub_season=SubSeason.A,

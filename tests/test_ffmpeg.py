@@ -666,6 +666,163 @@ async def test_hash_video_content_raises_for_unsupported_codec(monkeypatch: pyte
 
 
 @pytest.mark.asyncio
+async def test_compute_video_frame_count_returns_frame_count() -> None:
+    assert await ffmpeg_module.compute_video_frame_count(_video_fixture('h264.mp4')) == 1
+
+
+@pytest.mark.asyncio
+async def test_compute_video_sampled_phashes_returns_hashes() -> None:
+    assert await ffmpeg_module.compute_video_sampled_phashes(_video_fixture('h264.mp4'), frame_count=1) == (
+        6846486214506547647,
+    )
+
+
+@pytest.mark.asyncio
+async def test_compute_video_perceptual_metadata_returns_frame_count_and_hashes() -> None:
+    frame_count, sampled_phashes = await ffmpeg_module.compute_video_perceptual_metadata(_video_fixture('h264.mp4'))
+
+    assert frame_count == 1
+    assert len(sampled_phashes) == 1
+    assert sampled_phashes == (6846486214506547647,)
+
+
+@pytest.mark.asyncio
+async def test_compute_video_perceptual_metadata_raises_unavailable_when_frame_count_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def _fake_probe(input_path: Path, *, timeout: timedelta) -> int:
+        del input_path, timeout
+        raise ffmpeg_module.PerceptualMetadataUnavailableError('ffprobe returned no primary video frame count')
+
+    monkeypatch.setattr(ffmpeg_module, '_probe_primary_video_frame_count', _fake_probe)
+
+    with pytest.raises(ffmpeg_module.PerceptualMetadataUnavailableError, match='no primary video frame count'):
+        await ffmpeg_module.compute_video_perceptual_metadata(_video_fixture('h264.mp4'))
+
+
+@pytest.mark.asyncio
+async def test_compute_video_perceptual_metadata_raises_unavailable_when_frame_probe_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def _fake_probe(input_path: Path, *, timeout: timedelta) -> int:
+        del input_path, timeout
+        raise RuntimeError('ffprobe failed')
+
+    monkeypatch.setattr(ffmpeg_module, '_probe_primary_video_frame_count', _fake_probe)
+
+    with pytest.raises(
+        ffmpeg_module.PerceptualMetadataUnavailableError,
+        match='ffprobe failed to provide perceptual metadata',
+    ):
+        await ffmpeg_module.compute_video_perceptual_metadata(_video_fixture('h264.mp4'))
+
+
+@pytest.mark.asyncio
+async def test_compute_video_sampled_phashes_rejects_non_positive_frame_count() -> None:
+    with pytest.raises(ValueError, match='frame_count must be >= 1'):
+        await ffmpeg_module.compute_video_sampled_phashes(_video_fixture('h264.mp4'), frame_count=0)
+
+
+@pytest.mark.asyncio
+async def test_compute_video_perceptual_metadata_extracts_sampled_frames_once(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    calls: list[tuple[Path, tuple[int, ...], Path, timedelta]] = []
+
+    async def _fake_probe(input_path: Path, *, timeout: timedelta) -> int:
+        del input_path, timeout
+        return 3
+
+    async def _fake_extract(
+        input_path: Path,
+        *,
+        frame_indices: tuple[int, ...],
+        output_dir: Path,
+        timeout: timedelta,
+    ) -> tuple[Path, ...]:
+        calls.append((input_path, frame_indices, output_dir, timeout))
+        return (tmp_path / 'frame-001.png', tmp_path / 'frame-002.png', tmp_path / 'frame-003.png')
+
+    class _FakeImage:
+        def convert(self, mode: str) -> object:
+            del mode
+            return object()
+
+    class _FakeImageContext:
+        def __enter__(self) -> _FakeImage:
+            return _FakeImage()
+
+        def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+            del exc_type, exc, traceback
+            return None
+
+    phashes = iter((11, 22, 33))
+
+    monkeypatch.setattr(ffmpeg_module, '_probe_primary_video_frame_count', _fake_probe)
+    monkeypatch.setattr(ffmpeg_module, '_extract_video_frames', _fake_extract)
+    monkeypatch.setattr(ffmpeg_module.Image, 'open', lambda path: _FakeImageContext())
+    monkeypatch.setattr(ffmpeg_module, '_perceptual_hash', lambda image: next(phashes))
+
+    frame_count, sampled_phashes = await ffmpeg_module.compute_video_perceptual_metadata(_video_fixture('h264.mp4'))
+
+    assert frame_count == 3
+    assert sampled_phashes == (11, 22, 33)
+    assert len(calls) == 1
+    assert calls[0][1] == (0, 1, 2)
+
+
+@pytest.mark.asyncio
+async def test_compute_video_perceptual_metadata_raises_unavailable_when_sampled_frame_decode_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _raise_decode_error(*args, **kwargs):
+        del args, kwargs
+        raise OSError('cannot decode frame')
+
+    monkeypatch.setattr(ffmpeg_module.Image, 'open', _raise_decode_error)
+
+    with pytest.raises(ffmpeg_module.PerceptualMetadataUnavailableError, match='failed to decode sampled frame'):
+        await ffmpeg_module.compute_video_perceptual_metadata(_video_fixture('h264.mp4'))
+
+
+@pytest.mark.asyncio
+async def test_compute_video_perceptual_metadata_raises_unavailable_when_frame_extract_times_out(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def _fake_extract(
+        input_path: Path,
+        *,
+        frame_indices: tuple[int, ...],
+        output_dir: Path,
+        timeout: timedelta,
+    ) -> tuple[Path, ...]:
+        del input_path, frame_indices, output_dir, timeout
+        raise ffmpeg_module.PerceptualMetadataUnavailableError('ffmpeg failed to extract sampled perceptual frames')
+
+    monkeypatch.setattr(ffmpeg_module, '_extract_video_frames', _fake_extract)
+
+    with pytest.raises(
+        ffmpeg_module.PerceptualMetadataUnavailableError,
+        match='failed to extract sampled perceptual frames',
+    ):
+        await ffmpeg_module.compute_video_perceptual_metadata(_video_fixture('h264.mp4'))
+
+
+def test_sampled_phash_mean_distance_returns_zero_for_identical_sequences() -> None:
+    assert ffmpeg_module.sampled_phash_mean_distance((0b1010, 0b0101), (0b1010, 0b0101)) == 0.0
+
+
+def test_sampled_phash_mean_distance_returns_fractional_mean() -> None:
+    assert ffmpeg_module.sampled_phash_mean_distance((0b0000, 0b1111), (0b0011, 0b1100)) == 2.0
+
+
+def test_sampled_phash_mean_distance_rejects_mismatched_lengths() -> None:
+    with pytest.raises(ValueError, match='equal length'):
+        ffmpeg_module.sampled_phash_mean_distance((1,), (1, 2))
+
+
+@pytest.mark.asyncio
 async def test_probe_audio_sample_rate_rejects_empty_input() -> None:
     with pytest.raises(ValueError, match='audio_bytes must not be empty'):
         await ffmpeg_module.probe_audio_sample_rate(b'')

@@ -7,10 +7,29 @@ import tempfile
 import time
 from datetime import timedelta
 from pathlib import Path
+from statistics import median
 from typing import Any, Literal
+
+from PIL import Image, ImageOps
 
 _HASH_READ_SIZE = 64 * 1024
 _SUPPORTED_VIDEO_CODECS = ('h264', 'hevc')
+SAMPLED_PHASH_SAMPLE_COUNT = 25
+_PHASH_IMAGE_SIZE = 32
+_PHASH_DCT_BLOCK_SIZE = 8
+_PHASH_MAX_VALUE = 2**63
+
+
+def _dct_matrix(size: int) -> list[list[float]]:
+    matrix: list[list[float]] = []
+    factor = math.pi / (2.0 * size)
+    for u in range(size):
+        row = [math.cos((2 * x + 1) * u * factor) for x in range(size)]
+        matrix.append(row)
+    return matrix
+
+
+_DCT_32 = _dct_matrix(_PHASH_IMAGE_SIZE)
 
 
 class UnsupportedVideoCodecError(ValueError):
@@ -20,6 +39,10 @@ class UnsupportedVideoCodecError(ValueError):
         self.codec = codec
         self.supported_codecs = supported_codecs
         super().__init__(f'unsupported video codec: {codec!r}; supported codecs: {supported_codecs}')
+
+
+class PerceptualMetadataUnavailableError(RuntimeError):
+    """Raised when perceptual video metadata cannot be computed reliably."""
 
 
 async def to_opus(
@@ -397,6 +420,32 @@ async def _probe_primary_video_codec(
     return codec
 
 
+async def _probe_primary_video_frame_count(
+    input_path: Path,
+    *,
+    timeout: timedelta,
+) -> int:
+    frame_count_text = await _run_ffprobe_text(
+        input_path,
+        timeout,
+        select_streams='v:0',
+        show_entries='stream=nb_frames',
+    )
+    if not frame_count_text:
+        raise PerceptualMetadataUnavailableError('ffprobe returned no primary video frame count')
+    try:
+        frame_count = int(frame_count_text)
+    except ValueError as error:
+        raise PerceptualMetadataUnavailableError(
+            f'ffprobe returned invalid primary video frame count: {frame_count_text!r}'
+        ) from error
+    if frame_count <= 0:
+        raise PerceptualMetadataUnavailableError(
+            f'ffprobe returned non-positive primary video frame count: {frame_count}'
+        )
+    return frame_count
+
+
 async def normalize_video_audio_loudness(
     video_bytes: bytes,
     *,
@@ -569,6 +618,101 @@ async def hash_video_content(
         input_path.unlink(missing_ok=True)
 
 
+async def compute_video_perceptual_metadata(
+    video_bytes: bytes,
+    *,
+    timeout: timedelta = timedelta(seconds=30),
+) -> tuple[int, tuple[int, ...]]:
+    """Return sampled perceptual metadata for video deduplication.
+
+    Raises:
+        PerceptualMetadataUnavailableError: If reliable frame-count or sampled
+            frame decoding cannot be obtained for perceptual comparison.
+    """
+    frame_count = await compute_video_frame_count(video_bytes, timeout=timeout)
+    sampled_phashes = await compute_video_sampled_phashes(video_bytes, frame_count=frame_count, timeout=timeout)
+    return frame_count, sampled_phashes
+
+
+async def compute_video_frame_count(
+    video_bytes: bytes,
+    *,
+    timeout: timedelta = timedelta(seconds=30),
+) -> int:
+    """Return the primary video stream frame count for perceptual deduplication."""
+    input_fd, input_name = tempfile.mkstemp(suffix='.mp4')
+    os.close(input_fd)
+    input_path = Path(input_name)
+
+    try:
+        input_path.write_bytes(video_bytes)
+        deadline = time.monotonic() + timeout.total_seconds()
+        try:
+            return await _probe_primary_video_frame_count(
+                input_path,
+                timeout=_remaining_timeout(deadline),
+            )
+        except PerceptualMetadataUnavailableError:
+            raise
+        except (RuntimeError, asyncio.TimeoutError) as error:
+            raise PerceptualMetadataUnavailableError('ffprobe failed to provide perceptual metadata') from error
+    finally:
+        input_path.unlink(missing_ok=True)
+
+
+async def compute_video_sampled_phashes(
+    video_bytes: bytes,
+    *,
+    frame_count: int,
+    timeout: timedelta = timedelta(seconds=30),
+) -> tuple[int, ...]:
+    """Return sampled perceptual hashes for a known positive frame count."""
+    if frame_count <= 0:
+        raise ValueError('frame_count must be >= 1')
+
+    input_fd, input_name = tempfile.mkstemp(suffix='.mp4')
+    os.close(input_fd)
+    input_path = Path(input_name)
+
+    try:
+        input_path.write_bytes(video_bytes)
+        deadline = time.monotonic() + timeout.total_seconds()
+        frame_indices = _sample_frame_indices(frame_count, sample_count=SAMPLED_PHASH_SAMPLE_COUNT)
+        sampled_phashes: list[int] = []
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_dir_path = Path(temp_dir)
+            frame_paths = await _extract_video_frames(
+                input_path,
+                frame_indices=frame_indices,
+                output_dir=temp_dir_path,
+                timeout=_remaining_timeout(deadline),
+            )
+            for frame_index, frame_path in zip(frame_indices, frame_paths, strict=True):
+                try:
+                    with Image.open(frame_path) as image:
+                        sampled_phashes.append(_perceptual_hash(image.convert('RGB')))
+                except OSError as error:
+                    raise PerceptualMetadataUnavailableError(f'failed to decode sampled frame {frame_index}') from error
+
+        if not sampled_phashes:
+            raise PerceptualMetadataUnavailableError('ffmpeg produced no sampled perceptual frames')
+
+        return tuple(sampled_phashes)
+    finally:
+        input_path.unlink(missing_ok=True)
+
+
+def sampled_phash_mean_distance(left: tuple[int, ...], right: tuple[int, ...]) -> float:
+    """Return the mean Hamming distance across sampled perceptual hashes."""
+    if not left or not right:
+        raise ValueError('sampled pHash sequences must be non-empty')
+    if len(left) != len(right):
+        raise ValueError('sampled pHash sequences must have equal length')
+    return sum((left_hash ^ right_hash).bit_count() for left_hash, right_hash in zip(left, right, strict=True)) / len(
+        left
+    )
+
+
 async def _run_ffmpeg(
     cmd: tuple[str, ...],
     timeout: timedelta,
@@ -712,3 +856,87 @@ def _remaining_timeout(deadline: float) -> timedelta:
 async def _hash_stream(stream: asyncio.StreamReader, hasher: Any) -> None:
     while chunk := await stream.read(_HASH_READ_SIZE):
         hasher.update(chunk)
+
+
+def _sample_frame_indices(frame_count: int, *, sample_count: int) -> tuple[int, ...]:
+    if frame_count <= 0:
+        return ()
+    if frame_count <= sample_count:
+        return tuple(range(frame_count))
+    step = (frame_count - 1) / (sample_count - 1)
+    return tuple(sorted({round(index * step) for index in range(sample_count)}))
+
+
+async def _extract_video_frames(
+    input_path: Path,
+    *,
+    frame_indices: tuple[int, ...],
+    output_dir: Path,
+    timeout: timedelta,
+) -> tuple[Path, ...]:
+    if not frame_indices:
+        raise PerceptualMetadataUnavailableError('ffmpeg received no sampled perceptual frames to extract')
+
+    output_pattern = output_dir / 'frame-%03d.png'
+    select_terms = '+'.join(f'eq(n\\,{frame_index})' for frame_index in frame_indices)
+    try:
+        await _run_ffmpeg(
+            (
+                'ffmpeg',
+                '-hide_banner',
+                '-loglevel',
+                'error',
+                '-nostats',
+                '-nostdin',
+                '-y',
+                '-threads',
+                '1',
+                '-i',
+                str(input_path),
+                '-vf',
+                f'select={select_terms}',
+                '-vsync',
+                '0',
+                str(output_pattern),
+            ),
+            timeout,
+            capture='none',
+        )
+    except (RuntimeError, asyncio.TimeoutError) as error:
+        raise PerceptualMetadataUnavailableError('ffmpeg failed to extract sampled perceptual frames') from error
+
+    frame_paths = tuple(sorted(output_dir.glob('frame-*.png')))
+    if len(frame_paths) != len(frame_indices):
+        raise PerceptualMetadataUnavailableError(
+            f'ffmpeg extracted {len(frame_paths)} sampled perceptual frames, expected {len(frame_indices)}'
+        )
+    return frame_paths
+
+
+def _perceptual_hash(image: Image.Image, *, size: int = _PHASH_IMAGE_SIZE, block: int = _PHASH_DCT_BLOCK_SIZE) -> int:
+    gray = ImageOps.grayscale(image).resize((size, size), Image.Resampling.LANCZOS)
+    pixels = list(gray.tobytes())
+    rows = [pixels[index : index + size] for index in range(0, len(pixels), size)]
+
+    coeffs: list[list[float]] = [[0.0 for _ in range(block)] for _ in range(block)]
+    scale = [1.0 / math.sqrt(2.0)] + [1.0 for _ in range(size - 1)]
+    for u in range(block):
+        for v in range(block):
+            total = 0.0
+            row_cos = _DCT_32[u]
+            col_cos = _DCT_32[v]
+            for x in range(size):
+                row = rows[x]
+                row_cos_x = row_cos[x]
+                for y in range(size):
+                    total += row[y] * row_cos_x * col_cos[y]
+            coeffs[u][v] = (2.0 / size) * scale[u] * scale[v] * total
+
+    values = [coeffs[u][v] for u in range(block) for v in range(block) if not (u == 0 and v == 0)]
+    threshold = median(values)
+    value = 0
+    for coefficient in values:
+        value <<= 1
+        if coefficient >= threshold:
+            value |= 1
+    return value

@@ -1,3 +1,4 @@
+import math
 import tomllib
 from datetime import timedelta
 from pathlib import Path
@@ -79,6 +80,7 @@ class _FileClipsConfig(BaseModel):
     namespace: str = Field(min_length=1)
     normalization_loudness: float
     normalization_bitrate: int = Field(gt=0)
+    sampled_phash_mean_threshold: float = Field(gt=0, le=63)
 
     model_config = ConfigDict(
         frozen=True,
@@ -90,6 +92,7 @@ class _FileClipsOverrides(BaseModel):
     namespace: str | None = Field(default=None, min_length=1)
     normalization_loudness: float | None = None
     normalization_bitrate: int | None = Field(default=None, gt=0)
+    sampled_phash_mean_threshold: float | None = Field(default=None, gt=0, le=63)
 
     model_config = ConfigDict(
         frozen=True,
@@ -162,6 +165,7 @@ class Settings(BaseModel):
     clip_namespace: str
     normalization_loudness: float
     normalization_bitrate: int
+    sampled_phash_mean_threshold: float
 
     track_namespace: str
     variant_max_duration: timedelta
@@ -190,6 +194,7 @@ class Settings(BaseModel):
             clip_namespace=file_settings.clips.namespace,
             normalization_loudness=file_settings.clips.normalization_loudness,
             normalization_bitrate=file_settings.clips.normalization_bitrate,
+            sampled_phash_mean_threshold=file_settings.clips.sampled_phash_mean_threshold,
             track_namespace=file_settings.tracks.namespace,
             variant_max_duration=timedelta(minutes=file_settings.tracks.variant_max_duration_minutes),
             slowest_variant_speed=file_settings.tracks.slowest_variant_speed,
@@ -208,6 +213,8 @@ class Settings(BaseModel):
             raise ValueError('slowest_variant_speed must satisfy 0 < slowest_variant_speed <= 1')
         if self.media_group_max_size <= 0:
             raise ValueError('media_group_max_size must be > 0')
+        if not math.isfinite(self.sampled_phash_mean_threshold):
+            raise ValueError('sampled_phash_mean_threshold must be finite')
         return self
 
 

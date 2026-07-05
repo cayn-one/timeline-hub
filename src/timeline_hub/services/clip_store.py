@@ -11,7 +11,15 @@ from typing import Any, Self, TypeVar
 
 from loguru import logger
 
-from timeline_hub.infra.ffmpeg import hash_video_content, normalize_video_audio_loudness
+from timeline_hub.infra.ffmpeg import (
+    SAMPLED_PHASH_SAMPLE_COUNT,
+    PerceptualMetadataUnavailableError,
+    compute_video_frame_count,
+    compute_video_sampled_phashes,
+    hash_video_content,
+    normalize_video_audio_loudness,
+    sampled_phash_mean_distance,
+)
 from timeline_hub.infra.s3 import Key, Prefix, S3Client, S3ContentType, S3ObjectNotFoundError
 from timeline_hub.types import Extension, FileBytes, InvalidExtensionError
 
@@ -164,10 +172,19 @@ class ManifestEntry:
     parameters for this clip. `None` means no normalized clip is tracked in
     authoritative state, even if an untracked stale normalized object still
     exists in storage after a failed cache write.
+
+    `sampled_phashes` stores notebook-compatible 63-bit perceptual hashes for
+    evenly sampled decoded frames from the raw clip bytes when perceptual
+    metadata is available. `frame_count` is `None` when perceptual metadata
+    could not be computed reliably at all. `sampled_phashes` is `None` either
+    when perceptual metadata was unavailable or when no same-frame-count
+    perceptual comparison target existed during ingest.
     """
 
     id: ClipId
     video_hash: str
+    frame_count: int | None
+    sampled_phashes: tuple[int, ...] | None
     sub_season: SubSeason
     scope: Scope
     batch: int
@@ -220,6 +237,8 @@ class Manifest:
                 {
                     'id': entry.id,
                     'video_hash': entry.video_hash,
+                    'frame_count': entry.frame_count,
+                    'sampled_phashes': None if entry.sampled_phashes is None else list(entry.sampled_phashes),
                     'audio_normalization': (
                         None
                         if entry.audio_normalization is None
@@ -267,6 +286,8 @@ class Manifest:
             if set(raw_entry) != {
                 'id',
                 'video_hash',
+                'frame_count',
+                'sampled_phashes',
                 'audio_normalization',
                 'sub_season',
                 'scope',
@@ -277,6 +298,10 @@ class Manifest:
 
             clip_id = _parse_uuid7(_expect_str(raw_entry['id'], field='id'), field='id')
             video_hash = _parse_sha256_hex(_expect_str(raw_entry['video_hash'], field='video_hash'))
+            frame_count, sampled_phashes = _parse_manifest_perceptual_metadata(
+                raw_entry['frame_count'],
+                raw_entry['sampled_phashes'],
+            )
             audio_normalization = _parse_audio_normalization(raw_entry['audio_normalization'])
             sub_season = _parse_sub_season(raw_entry['sub_season'])
             scope = _parse_enum(raw_entry['scope'], Scope, field='scope')
@@ -312,6 +337,8 @@ class Manifest:
                 ManifestEntry(
                     id=clip_id,
                     video_hash=video_hash,
+                    frame_count=frame_count,
+                    sampled_phashes=sampled_phashes,
                     audio_normalization=audio_normalization,
                     sub_season=sub_season,
                     scope=scope,
@@ -572,10 +599,11 @@ class ClipStore:
     internal processing byte-based. All returned clip files are MP4.
     """
 
-    def __init__(self, s3_client: S3Client, *, namespace: Prefix) -> None:
+    def __init__(self, s3_client: S3Client, *, namespace: Prefix, sampled_phash_mean_threshold: float) -> None:
         """Initialize the store with an opened generic S3 client."""
         self._s3_client = s3_client
         self._namespace = namespace
+        self._sampled_phash_mean_threshold = sampled_phash_mean_threshold
         self._manifest_cache: dict[Prefix, Manifest] = {}
 
     async def list_groups(self) -> list[ClipGroup]:
@@ -788,7 +816,7 @@ class ClipStore:
         seen_hashes: set[str] = set()
         seen_ids: set[ClipId] = set()
         duplicate_count = 0
-        accepted_clips: list[tuple[ClipId, str, bytes]] = []
+        accepted_clips: list[tuple[ClipId, str, int | None, tuple[int, ...] | None, bytes]] = []
         uploaded_keys: list[Key] = []
         for clip_file in clips:
             if not isinstance(clip_file, FileBytes):
@@ -797,11 +825,51 @@ class ClipStore:
             clip_bytes = clip_file.data
             video_hash = await hash_video_content(clip_bytes)
             if manifest.has_video_hash(video_hash) or video_hash in seen_hashes:
+                seen_hashes.add(video_hash)
                 duplicate_count += 1
                 continue
 
+            try:
+                frame_count = await compute_video_frame_count(clip_bytes)
+            except PerceptualMetadataUnavailableError:
+                frame_count = None
+                sampled_phashes = None
+            else:
+                sampled_phashes = None
+                if self._has_perceptual_candidate_frame_count(
+                    manifest=manifest,
+                    accepted_clips=accepted_clips,
+                    frame_count=frame_count,
+                ):
+                    try:
+                        sampled_phashes = await compute_video_sampled_phashes(
+                            clip_bytes,
+                            frame_count=frame_count,
+                        )
+                    except PerceptualMetadataUnavailableError:
+                        sampled_phashes = None
+                    else:
+                        if self._has_perceptual_duplicate(
+                            manifest=manifest,
+                            accepted_clips=accepted_clips,
+                            frame_count=frame_count,
+                            sampled_phashes=sampled_phashes,
+                        ):
+                            seen_hashes.add(video_hash)
+                            duplicate_count += 1
+                            continue
+
+                if sampled_phashes is None:
+                    try:
+                        sampled_phashes = await compute_video_sampled_phashes(
+                            clip_bytes,
+                            frame_count=frame_count,
+                        )
+                    except PerceptualMetadataUnavailableError:
+                        sampled_phashes = None
+
             clip_id = self._new_clip_id(manifest=manifest, seen_ids=seen_ids)
-            accepted_clips.append((clip_id, video_hash, clip_bytes))
+            accepted_clips.append((clip_id, video_hash, frame_count, sampled_phashes, clip_bytes))
             seen_ids.add(clip_id)
             seen_hashes.add(video_hash)
 
@@ -813,10 +881,14 @@ class ClipStore:
             scope=sub_group.scope,
         )
         new_entries: list[tuple[ManifestEntry, bytes]] = []
-        for order, (clip_id, video_hash, clip_bytes) in enumerate(accepted_clips, start=1):
+        for order, (clip_id, video_hash, frame_count, sampled_phashes, clip_bytes) in enumerate(
+            accepted_clips, start=1
+        ):
             entry = ManifestEntry(
                 id=clip_id,
                 video_hash=video_hash,
+                frame_count=frame_count,
+                sampled_phashes=sampled_phashes,
                 audio_normalization=None,
                 sub_season=sub_group.sub_season,
                 scope=sub_group.scope,
@@ -967,6 +1039,8 @@ class ClipStore:
                     ManifestEntry(
                         id=entry.id,
                         video_hash=entry.video_hash,
+                        frame_count=entry.frame_count,
+                        sampled_phashes=entry.sampled_phashes,
                         audio_normalization=entry.audio_normalization,
                         sub_season=entry.sub_season,
                         scope=entry.scope,
@@ -1192,6 +1266,8 @@ class ClipStore:
                     ManifestEntry(
                         id=clip_id,
                         video_hash=existing_entry.video_hash,
+                        frame_count=existing_entry.frame_count,
+                        sampled_phashes=existing_entry.sampled_phashes,
                         audio_normalization=existing_entry.audio_normalization,
                         sub_season=sub_group.sub_season,
                         scope=sub_group.scope,
@@ -1595,6 +1671,55 @@ class ClipStore:
             if not manifest.has_id(clip_id) and clip_id not in seen_ids:
                 return clip_id
 
+    def _has_perceptual_candidate_frame_count(
+        self,
+        *,
+        manifest: Manifest,
+        accepted_clips: Sequence[tuple[ClipId, str, int | None, tuple[int, ...] | None, bytes]],
+        frame_count: int,
+    ) -> bool:
+        for entry in manifest:
+            if entry.frame_count == frame_count and entry.sampled_phashes is not None:
+                return True
+
+        for _, _, accepted_frame_count, accepted_sampled_phashes, _ in accepted_clips:
+            if accepted_frame_count == frame_count and accepted_sampled_phashes is not None:
+                return True
+
+        return False
+
+    def _has_perceptual_duplicate(
+        self,
+        *,
+        manifest: Manifest,
+        accepted_clips: Sequence[tuple[ClipId, str, int | None, tuple[int, ...] | None, bytes]],
+        frame_count: int,
+        sampled_phashes: tuple[int, ...],
+    ) -> bool:
+        for entry in manifest:
+            if entry.frame_count is None or entry.sampled_phashes is None:
+                continue
+            if entry.frame_count != frame_count:
+                continue
+            if (
+                sampled_phash_mean_distance(entry.sampled_phashes, sampled_phashes)
+                <= self._sampled_phash_mean_threshold
+            ):
+                return True
+
+        for _, _, accepted_frame_count, accepted_sampled_phashes, _ in accepted_clips:
+            if accepted_frame_count is None or accepted_sampled_phashes is None:
+                continue
+            if accepted_frame_count != frame_count:
+                continue
+            if (
+                sampled_phash_mean_distance(accepted_sampled_phashes, sampled_phashes)
+                <= self._sampled_phash_mean_threshold
+            ):
+                return True
+
+        return False
+
     async def _load_manifest_for_store(self, clip_group_prefix: Prefix) -> Manifest:
         if (cached_manifest := self._manifest_cache.get(clip_group_prefix)) is not None:
             return cached_manifest.copy()
@@ -1672,6 +1797,8 @@ class ClipStore:
                         rewritten_entries[entry.id] = ManifestEntry(
                             id=entry.id,
                             video_hash=entry.video_hash,
+                            frame_count=entry.frame_count,
+                            sampled_phashes=entry.sampled_phashes,
                             audio_normalization=audio_normalization,
                             sub_season=entry.sub_season,
                             scope=entry.scope,
@@ -1695,6 +1822,8 @@ class ClipStore:
                 rewritten_entries[entry.id] = ManifestEntry(
                     id=entry.id,
                     video_hash=entry.video_hash,
+                    frame_count=entry.frame_count,
+                    sampled_phashes=entry.sampled_phashes,
                     audio_normalization=audio_normalization,
                     sub_season=entry.sub_season,
                     scope=entry.scope,
@@ -1807,6 +1936,65 @@ def _parse_sha256_hex(value: str) -> str:
     except ValueError as error:
         raise ValueError('manifest `video_hash` must be hexadecimal') from error
     return value
+
+
+def _parse_positive_manifest_int(value: object, *, field: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f'manifest `{field}` must be an integer')
+    if value < 1:
+        raise ValueError(f'manifest `{field}` must be >= 1')
+    return value
+
+
+def _parse_optional_positive_manifest_int(value: object, *, field: str) -> int | None:
+    if value is None:
+        return None
+    return _parse_positive_manifest_int(value, field=field)
+
+
+def _parse_sampled_phashes(value: object) -> tuple[int, ...]:
+    if not isinstance(value, list):
+        raise ValueError('manifest `sampled_phashes` must be a list')
+    if not value:
+        raise ValueError('manifest `sampled_phashes` must not be empty')
+    if len(value) > SAMPLED_PHASH_SAMPLE_COUNT:
+        raise ValueError(f'manifest `sampled_phashes` must contain at most {SAMPLED_PHASH_SAMPLE_COUNT} values')
+
+    parsed: list[int] = []
+    for phash in value:
+        if isinstance(phash, bool) or not isinstance(phash, int):
+            raise ValueError('manifest `sampled_phashes` entries must be integers')
+        if phash < 0:
+            raise ValueError('manifest `sampled_phashes` entries must be >= 0')
+        if phash >= 2**63:
+            raise ValueError('manifest `sampled_phashes` entries must be < 2**63')
+        parsed.append(phash)
+    return tuple(parsed)
+
+
+def _parse_optional_sampled_phashes(value: object) -> tuple[int, ...] | None:
+    if value is None:
+        return None
+    return _parse_sampled_phashes(value)
+
+
+def _parse_manifest_perceptual_metadata(
+    frame_count_value: object,
+    sampled_phashes_value: object,
+) -> tuple[int | None, tuple[int, ...] | None]:
+    frame_count = _parse_optional_positive_manifest_int(frame_count_value, field='frame_count')
+    sampled_phashes = _parse_optional_sampled_phashes(sampled_phashes_value)
+    if frame_count is None and sampled_phashes is None:
+        return None, None
+    if frame_count is None:
+        raise ValueError('manifest `frame_count` must be present when `sampled_phashes` are present')
+    if sampled_phashes is None:
+        return frame_count, None
+
+    expected_sampled_phash_count = min(frame_count, SAMPLED_PHASH_SAMPLE_COUNT)
+    if len(sampled_phashes) != expected_sampled_phash_count:
+        raise ValueError(f'manifest `sampled_phashes` length must equal min(frame_count, {SAMPLED_PHASH_SAMPLE_COUNT})')
+    return frame_count, sampled_phashes
 
 
 def _parse_enum(value: object, enum_type: type[_ClipStrEnum], *, field: str) -> _ClipStrEnum:
