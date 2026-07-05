@@ -13,4 +13,4 @@ __pycache__/
 .env
 
 # Local project folders
-dev/
+scratch/
