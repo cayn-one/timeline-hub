@@ -91,6 +91,26 @@ def test_season_from_month_uses_exact_mapping() -> None:
     assert Season.from_month(12) is Season.S5
 
 
+def test_previous_clip_group_rolls_over_to_prior_year_s5() -> None:
+    store = _store(_FakeS3Client())
+
+    assert store._previous_clip_group(ClipGroup(universe=Universe.WEST, year=2026, season=Season.S1)) == ClipGroup(
+        universe=Universe.WEST,
+        year=2025,
+        season=Season.S5,
+    )
+
+
+def test_next_clip_group_rolls_over_to_next_year_s1() -> None:
+    store = _store(_FakeS3Client())
+
+    assert store._next_clip_group(ClipGroup(universe=Universe.EAST, year=2025, season=Season.S5)) == ClipGroup(
+        universe=Universe.EAST,
+        year=2026,
+        season=Season.S1,
+    )
+
+
 def test_sub_season_exists_property() -> None:
     assert SubSeason.NONE.exists is False
     assert SubSeason.A.exists is True
@@ -1763,6 +1783,29 @@ async def test_list_clips_fails_on_corrupted_manifest() -> None:
 
 
 @pytest.mark.asyncio
+async def test_store_logs_and_raises_for_corrupt_current_manifest(monkeypatch: pytest.MonkeyPatch) -> None:
+    errors: list[tuple[object, ...]] = []
+
+    def log_error(*args: object) -> None:
+        errors.append(args)
+
+    monkeypatch.setattr(clip_store_module.logger, 'error', log_error)
+    manifest_key = _manifest_key(year=2024, season=Season.S1, universe=Universe.WEST)
+    store = _store(_FakeS3Client({manifest_key: b'{"clips": []}'}))
+
+    with pytest.raises(ManifestCorruptedError):
+        await store.store(
+            ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1),
+            ClipSubGroup(sub_season=SubSeason.A, scope=Scope.COLLECTION),
+            clips=[_mp4_file(b'clip')],
+        )
+
+    assert len(errors) == 1
+    assert 'failed to load current clip-group manifest for store' in str(errors[0][0])
+    assert manifest_key in str(errors[0])
+
+
+@pytest.mark.asyncio
 async def test_store_treats_existing_video_hash_as_duplicate(monkeypatch: pytest.MonkeyPatch) -> None:
     _patch_hashes(monkeypatch, {b'clip': _HASH_A})
 
@@ -1798,6 +1841,80 @@ async def test_store_treats_existing_video_hash_as_duplicate(monkeypatch: pytest
     assert result.stored_count == 0
     assert result.duplicate_count == 1
     assert s3_client.put_calls == []
+
+
+@pytest.mark.asyncio
+async def test_store_treats_previous_group_video_hash_as_duplicate(monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_hashes(monkeypatch, {b'clip': _HASH_A})
+
+    async def _unexpected_frame_count(video_bytes: bytes) -> int:
+        raise AssertionError(f'frame count must not be computed for exact duplicate: {video_bytes!r}')
+
+    monkeypatch.setattr(clip_store_module, 'compute_video_frame_count', _unexpected_frame_count)
+    previous_manifest_key = _manifest_key(year=2023, season=Season.S5, universe=Universe.WEST)
+    store = _store(
+        _FakeS3Client(
+            {
+                previous_manifest_key: _manifest_bytes(
+                    [
+                        _entry(
+                            id=_UUID_1,
+                            video_hash=_HASH_A,
+                            sub_season=SubSeason.A,
+                            scope=Scope.COLLECTION,
+                            batch=1,
+                            order=1,
+                        )
+                    ]
+                )
+            }
+        )
+    )
+
+    result = await store.store(
+        ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1),
+        ClipSubGroup(sub_season=SubSeason.A, scope=Scope.COLLECTION),
+        clips=[_mp4_file(b'clip')],
+    )
+
+    assert result == StoreResult(stored_count=0, duplicate_count=1)
+
+
+@pytest.mark.asyncio
+async def test_store_treats_next_group_video_hash_as_duplicate(monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_hashes(monkeypatch, {b'clip': _HASH_A})
+
+    async def _unexpected_frame_count(video_bytes: bytes) -> int:
+        raise AssertionError(f'frame count must not be computed for exact duplicate: {video_bytes!r}')
+
+    monkeypatch.setattr(clip_store_module, 'compute_video_frame_count', _unexpected_frame_count)
+    next_manifest_key = _manifest_key(year=2024, season=Season.S2, universe=Universe.WEST)
+    store = _store(
+        _FakeS3Client(
+            {
+                next_manifest_key: _manifest_bytes(
+                    [
+                        _entry(
+                            id=_UUID_1,
+                            video_hash=_HASH_A,
+                            sub_season=SubSeason.A,
+                            scope=Scope.COLLECTION,
+                            batch=1,
+                            order=1,
+                        )
+                    ]
+                )
+            }
+        )
+    )
+
+    result = await store.store(
+        ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1),
+        ClipSubGroup(sub_season=SubSeason.A, scope=Scope.COLLECTION),
+        clips=[_mp4_file(b'clip')],
+    )
+
+    assert result == StoreResult(stored_count=0, duplicate_count=1)
 
 
 @pytest.mark.asyncio
@@ -1838,6 +1955,72 @@ async def test_store_deduplicates_perceptual_duplicate_with_different_video_hash
 
     assert result == StoreResult(stored_count=0, duplicate_count=1)
     assert s3_client.put_calls == []
+
+
+@pytest.mark.asyncio
+async def test_store_deduplicates_perceptual_duplicate_in_previous_group(monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_hashes(monkeypatch, {b'clip': _HASH_B})
+    _patch_perceptual_metadata(monkeypatch, {b'clip': (_FRAME_COUNT, _SAMPLED_PHASHES)})
+    previous_manifest_key = _manifest_key(year=2023, season=Season.S5, universe=Universe.WEST)
+    store = _store(
+        _FakeS3Client(
+            {
+                previous_manifest_key: _manifest_bytes(
+                    [
+                        _entry(
+                            id=_UUID_1,
+                            video_hash=_HASH_A,
+                            sub_season=SubSeason.A,
+                            scope=Scope.COLLECTION,
+                            batch=1,
+                            order=1,
+                        )
+                    ]
+                )
+            }
+        )
+    )
+
+    result = await store.store(
+        ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1),
+        ClipSubGroup(sub_season=SubSeason.A, scope=Scope.COLLECTION),
+        clips=[_mp4_file(b'clip')],
+    )
+
+    assert result == StoreResult(stored_count=0, duplicate_count=1)
+
+
+@pytest.mark.asyncio
+async def test_store_deduplicates_perceptual_duplicate_in_next_group(monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_hashes(monkeypatch, {b'clip': _HASH_B})
+    _patch_perceptual_metadata(monkeypatch, {b'clip': (_FRAME_COUNT, _SAMPLED_PHASHES)})
+    next_manifest_key = _manifest_key(year=2024, season=Season.S2, universe=Universe.WEST)
+    store = _store(
+        _FakeS3Client(
+            {
+                next_manifest_key: _manifest_bytes(
+                    [
+                        _entry(
+                            id=_UUID_1,
+                            video_hash=_HASH_A,
+                            sub_season=SubSeason.A,
+                            scope=Scope.COLLECTION,
+                            batch=1,
+                            order=1,
+                        )
+                    ]
+                )
+            }
+        )
+    )
+
+    result = await store.store(
+        ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1),
+        ClipSubGroup(sub_season=SubSeason.A, scope=Scope.COLLECTION),
+        clips=[_mp4_file(b'clip')],
+    )
+
+    assert result == StoreResult(stored_count=0, duplicate_count=1)
 
 
 @pytest.mark.asyncio
@@ -1958,6 +2141,132 @@ async def test_store_perceptual_comparison_skips_persisted_null_metadata(
     )
 
     assert result == StoreResult(stored_count=1, duplicate_count=0, clip_ids=(_UUID_2,))
+
+
+@pytest.mark.asyncio
+async def test_store_ignores_missing_previous_neighbor_manifest(monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_hashes(monkeypatch, {b'clip': _HASH_A})
+    _patch_uuid7(monkeypatch, _UUID_1)
+    next_manifest_key = _manifest_key(year=2024, season=Season.S2, universe=Universe.WEST)
+    target_manifest_key = _manifest_key(year=2024, season=Season.S1, universe=Universe.WEST)
+    store = _store(
+        _FakeS3Client(
+            {
+                next_manifest_key: _manifest_bytes(
+                    [
+                        _entry(
+                            id=_UUID_2,
+                            video_hash=_HASH_B,
+                            sub_season=SubSeason.A,
+                            scope=Scope.COLLECTION,
+                            batch=1,
+                            order=1,
+                        )
+                    ]
+                )
+            }
+        )
+    )
+
+    result = await store.store(
+        ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1),
+        ClipSubGroup(sub_season=SubSeason.A, scope=Scope.COLLECTION),
+        clips=[_mp4_file(b'clip')],
+    )
+
+    assert result == StoreResult(stored_count=1, duplicate_count=0, clip_ids=(_UUID_1,))
+    assert target_manifest_key in store._s3_client.objects
+
+
+@pytest.mark.asyncio
+async def test_store_ignores_missing_next_neighbor_manifest(monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_hashes(monkeypatch, {b'clip': _HASH_A})
+    _patch_uuid7(monkeypatch, _UUID_1)
+    previous_manifest_key = _manifest_key(year=2023, season=Season.S5, universe=Universe.WEST)
+    target_manifest_key = _manifest_key(year=2024, season=Season.S1, universe=Universe.WEST)
+    store = _store(
+        _FakeS3Client(
+            {
+                previous_manifest_key: _manifest_bytes(
+                    [
+                        _entry(
+                            id=_UUID_2,
+                            video_hash=_HASH_B,
+                            sub_season=SubSeason.A,
+                            scope=Scope.COLLECTION,
+                            batch=1,
+                            order=1,
+                        )
+                    ]
+                )
+            }
+        )
+    )
+
+    result = await store.store(
+        ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1),
+        ClipSubGroup(sub_season=SubSeason.A, scope=Scope.COLLECTION),
+        clips=[_mp4_file(b'clip')],
+    )
+
+    assert result == StoreResult(stored_count=1, duplicate_count=0, clip_ids=(_UUID_1,))
+    assert target_manifest_key in store._s3_client.objects
+
+
+@pytest.mark.asyncio
+async def test_store_skips_corrupt_previous_neighbor_manifest_and_warns(monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_hashes(monkeypatch, {b'clip': _HASH_A})
+    _patch_uuid7(monkeypatch, _UUID_1)
+    warnings: list[tuple[object, ...]] = []
+
+    def log_warning(*args: object) -> None:
+        warnings.append(args)
+
+    monkeypatch.setattr(clip_store_module.logger, 'warning', log_warning)
+    previous_manifest_key = _manifest_key(year=2023, season=Season.S5, universe=Universe.WEST)
+    target_manifest_key = _manifest_key(year=2024, season=Season.S1, universe=Universe.WEST)
+    store = _store(_FakeS3Client({previous_manifest_key: b'{"clips": []}'}))
+
+    result = await store.store(
+        ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1),
+        ClipSubGroup(sub_season=SubSeason.A, scope=Scope.COLLECTION),
+        clips=[_mp4_file(b'clip')],
+    )
+
+    assert result == StoreResult(stored_count=1, duplicate_count=0, clip_ids=(_UUID_1,))
+    assert target_manifest_key in store._s3_client.objects
+    assert len(warnings) == 1
+    assert 'skipping neighbor manifest during dedup' in str(warnings[0][0])
+    assert '2023' in str(warnings[0])
+    assert previous_manifest_key in str(warnings[0])
+
+
+@pytest.mark.asyncio
+async def test_store_skips_corrupt_next_neighbor_manifest_and_warns(monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_hashes(monkeypatch, {b'clip': _HASH_A})
+    _patch_uuid7(monkeypatch, _UUID_1)
+    warnings: list[tuple[object, ...]] = []
+
+    def log_warning(*args: object) -> None:
+        warnings.append(args)
+
+    monkeypatch.setattr(clip_store_module.logger, 'warning', log_warning)
+    next_manifest_key = _manifest_key(year=2024, season=Season.S2, universe=Universe.WEST)
+    target_manifest_key = _manifest_key(year=2024, season=Season.S1, universe=Universe.WEST)
+    store = _store(_FakeS3Client({next_manifest_key: b'{"clips": []}'}))
+
+    result = await store.store(
+        ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1),
+        ClipSubGroup(sub_season=SubSeason.A, scope=Scope.COLLECTION),
+        clips=[_mp4_file(b'clip')],
+    )
+
+    assert result == StoreResult(stored_count=1, duplicate_count=0, clip_ids=(_UUID_1,))
+    assert target_manifest_key in store._s3_client.objects
+    assert len(warnings) == 1
+    assert 'skipping neighbor manifest during dedup' in str(warnings[0][0])
+    assert '2024' in str(warnings[0])
+    assert next_manifest_key in str(warnings[0])
 
 
 @pytest.mark.asyncio
@@ -2113,6 +2422,54 @@ async def test_store_perceptual_comparison_skips_same_frame_count_rows_without_h
         }
     )
     store = _store(s3_client)
+
+    result = await store.store(
+        ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1),
+        ClipSubGroup(sub_season=SubSeason.A, scope=Scope.COLLECTION),
+        clips=[_mp4_file(b'clip')],
+    )
+
+    assert result == StoreResult(stored_count=1, duplicate_count=0, clip_ids=(_UUID_2,))
+    assert observed_calls == [(b'clip', _FRAME_COUNT)]
+
+
+@pytest.mark.asyncio
+async def test_store_neighbor_same_frame_count_without_hashes_does_not_reject(monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_hashes(monkeypatch, {b'clip': _HASH_B})
+    observed_calls: list[tuple[bytes, int]] = []
+
+    async def _compute_frame_count(video_bytes: bytes) -> int:
+        del video_bytes
+        return _FRAME_COUNT
+
+    async def _compute_sampled_phashes(video_bytes: bytes, *, frame_count: int) -> tuple[int, ...]:
+        observed_calls.append((video_bytes, frame_count))
+        return _SAMPLED_PHASHES
+
+    monkeypatch.setattr(clip_store_module, 'compute_video_frame_count', _compute_frame_count)
+    monkeypatch.setattr(clip_store_module, 'compute_video_sampled_phashes', _compute_sampled_phashes)
+    _patch_uuid7(monkeypatch, _UUID_2)
+    previous_manifest_key = _manifest_key(year=2023, season=Season.S5, universe=Universe.WEST)
+    store = _store(
+        _FakeS3Client(
+            {
+                previous_manifest_key: _manifest_bytes(
+                    [
+                        _entry(
+                            id=_UUID_1,
+                            video_hash=_HASH_A,
+                            frame_count=_FRAME_COUNT,
+                            sampled_phashes=None,
+                            sub_season=SubSeason.A,
+                            scope=Scope.COLLECTION,
+                            batch=1,
+                            order=1,
+                        )
+                    ]
+                )
+            }
+        )
+    )
 
     result = await store.store(
         ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1),
@@ -2450,6 +2807,53 @@ async def test_store_creates_new_batch_per_call_and_resets_order(monkeypatch: py
             ),
         ]
     )
+
+
+@pytest.mark.asyncio
+async def test_store_reuses_cached_neighbor_manifests_across_repeated_stores(monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_hashes(monkeypatch, {b'first': _HASH_A, b'second': _HASH_B})
+    _patch_uuid7(monkeypatch, _UUID_1, _UUID_2)
+    target_manifest_key = _manifest_key(year=2024, season=Season.S1, universe=Universe.WEST)
+    previous_manifest_key = _manifest_key(year=2023, season=Season.S5, universe=Universe.WEST)
+    next_manifest_key = _manifest_key(year=2024, season=Season.S2, universe=Universe.WEST)
+    s3_client = _FakeS3Client(
+        {
+            previous_manifest_key: _manifest_bytes(
+                [
+                    _entry(
+                        id=_UUID_3,
+                        video_hash=_HASH_C,
+                        sub_season=SubSeason.A,
+                        scope=Scope.COLLECTION,
+                        batch=1,
+                        order=1,
+                    )
+                ]
+            ),
+            next_manifest_key: _manifest_bytes(
+                [
+                    _entry(
+                        id=_UUID_4,
+                        video_hash=_HASH_D,
+                        sub_season=SubSeason.A,
+                        scope=Scope.COLLECTION,
+                        batch=1,
+                        order=1,
+                    )
+                ]
+            ),
+        }
+    )
+    store = _store(s3_client)
+    clip_group = ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1)
+    clip_sub_group = ClipSubGroup(sub_season=SubSeason.A, scope=Scope.COLLECTION)
+
+    first_result = await store.store(clip_group, clip_sub_group, clips=[_mp4_file(b'first')])
+    second_result = await store.store(clip_group, clip_sub_group, clips=[_mp4_file(b'second')])
+
+    assert first_result == StoreResult(stored_count=1, duplicate_count=0, clip_ids=(_UUID_1,))
+    assert second_result == StoreResult(stored_count=1, duplicate_count=0, clip_ids=(_UUID_2,))
+    assert s3_client.get_calls == [target_manifest_key, previous_manifest_key, next_manifest_key]
 
 
 @pytest.mark.asyncio

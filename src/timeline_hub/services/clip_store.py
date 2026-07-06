@@ -574,9 +574,9 @@ class ClipStore:
     keep their dense 1-based order. Batch numbers only define relative
     ordering; they do not need to be contiguous.
 
-    Deduplication is enforced only within a single clip group. Newly stored
-    objects always receive a fresh UUIDv7 hex `id`, whose embedded timestamp
-    reflects object creation time.
+    Deduplication is enforced during ingest from manifest state loaded by this
+    store instance. Newly stored objects always receive a fresh UUIDv7 hex
+    `id`, whose embedded timestamp reflects object creation time.
 
     The manifest is the authoritative index for each clip group and is
     validated on load. Clip-group listing is prefix-based, while sub-group
@@ -593,6 +593,14 @@ class ClipStore:
     normalized clip is tracked for a clip id; untracked normalized objects may
     still exist in storage temporarily after failed cache writes and are
     treated as stale cache.
+
+    `ClipStore` assumes one active writer and sequential ingestion across all
+    clip groups that participate in online deduplication. Concurrent manifest
+    mutation by multiple `ClipStore` instances is unsupported, including
+    adjacent-group ingest and offline maintenance or rewrite tooling. Manifest
+    cache coherence and adjacent-group deduplication rely on that single-writer
+    operating model and are not intended to remain correct under concurrent
+    external manifest updates.
 
     Clips are stored as `.mp4` objects with MIME type `video/mp4`.
     `ClipStore` validates MP4 `FileBytes` at the public boundary, then keeps
@@ -791,9 +799,12 @@ class ClipStore:
         callers are expected to use the exception's attached context to clean
         up manually when needed.
 
-        Writes to the same `ClipGroup` are assumed to be sequential
-        (single-writer). Concurrent writes are not supported and may lead to
-        manifest overwrite and orphaned clips.
+        `store()` assumes one active writer and sequential ingestion across the
+        target clip group and its structural neighbors used for adjacent-group
+        deduplication. Concurrent writes from multiple `ClipStore` instances,
+        as well as concurrent offline maintenance that rewrites manifests, are
+        unsupported and may cause dedup misses, manifest overwrite, stale-cache
+        reads, and orphaned clips.
 
         `clips` must contain MP4 `FileBytes`. `store()` validates the
         explicit extension at the boundary, then unwraps to raw bytes for the
@@ -813,6 +824,7 @@ class ClipStore:
             season=group.season,
         )
         manifest = await self._load_manifest_for_store(clip_group_prefix)
+        comparison_manifests = (manifest, *await self._load_neighbor_manifests_for_dedup(group))
         seen_hashes: set[str] = set()
         seen_ids: set[ClipId] = set()
         duplicate_count = 0
@@ -824,7 +836,10 @@ class ClipStore:
             _require_extension(clip_file, Extension.MP4, 'clips entries')
             clip_bytes = clip_file.data
             video_hash = await hash_video_content(clip_bytes)
-            if manifest.has_video_hash(video_hash) or video_hash in seen_hashes:
+            if (
+                any(candidate_manifest.has_video_hash(video_hash) for candidate_manifest in comparison_manifests)
+                or video_hash in seen_hashes
+            ):
                 seen_hashes.add(video_hash)
                 duplicate_count += 1
                 continue
@@ -837,7 +852,7 @@ class ClipStore:
             else:
                 sampled_phashes = None
                 if self._has_perceptual_candidate_frame_count(
-                    manifest=manifest,
+                    manifests=comparison_manifests,
                     accepted_clips=accepted_clips,
                     frame_count=frame_count,
                 ):
@@ -850,7 +865,7 @@ class ClipStore:
                         sampled_phashes = None
                     else:
                         if self._has_perceptual_duplicate(
-                            manifest=manifest,
+                            manifests=comparison_manifests,
                             accepted_clips=accepted_clips,
                             frame_count=frame_count,
                             sampled_phashes=sampled_phashes,
@@ -1674,13 +1689,14 @@ class ClipStore:
     def _has_perceptual_candidate_frame_count(
         self,
         *,
-        manifest: Manifest,
+        manifests: Sequence[Manifest],
         accepted_clips: Sequence[tuple[ClipId, str, int | None, tuple[int, ...] | None, bytes]],
         frame_count: int,
     ) -> bool:
-        for entry in manifest:
-            if entry.frame_count == frame_count and entry.sampled_phashes is not None:
-                return True
+        for manifest in manifests:
+            for entry in manifest:
+                if entry.frame_count == frame_count and entry.sampled_phashes is not None:
+                    return True
 
         for _, _, accepted_frame_count, accepted_sampled_phashes, _ in accepted_clips:
             if accepted_frame_count == frame_count and accepted_sampled_phashes is not None:
@@ -1691,21 +1707,22 @@ class ClipStore:
     def _has_perceptual_duplicate(
         self,
         *,
-        manifest: Manifest,
+        manifests: Sequence[Manifest],
         accepted_clips: Sequence[tuple[ClipId, str, int | None, tuple[int, ...] | None, bytes]],
         frame_count: int,
         sampled_phashes: tuple[int, ...],
     ) -> bool:
-        for entry in manifest:
-            if entry.frame_count is None or entry.sampled_phashes is None:
-                continue
-            if entry.frame_count != frame_count:
-                continue
-            if (
-                sampled_phash_mean_distance(entry.sampled_phashes, sampled_phashes)
-                <= self._sampled_phash_mean_threshold
-            ):
-                return True
+        for manifest in manifests:
+            for entry in manifest:
+                if entry.frame_count is None or entry.sampled_phashes is None:
+                    continue
+                if entry.frame_count != frame_count:
+                    continue
+                if (
+                    sampled_phash_mean_distance(entry.sampled_phashes, sampled_phashes)
+                    <= self._sampled_phash_mean_threshold
+                ):
+                    return True
 
         for _, _, accepted_frame_count, accepted_sampled_phashes, _ in accepted_clips:
             if accepted_frame_count is None or accepted_sampled_phashes is None:
@@ -1720,6 +1737,58 @@ class ClipStore:
 
         return False
 
+    @staticmethod
+    def _previous_clip_group(group: ClipGroup) -> ClipGroup:
+        if group.season is Season.S1:
+            return ClipGroup(universe=group.universe, year=group.year - 1, season=Season.S5)
+        return ClipGroup(universe=group.universe, year=group.year, season=Season(int(group.season) - 1))
+
+    @staticmethod
+    def _next_clip_group(group: ClipGroup) -> ClipGroup:
+        if group.season is Season.S5:
+            return ClipGroup(universe=group.universe, year=group.year + 1, season=Season.S1)
+        return ClipGroup(universe=group.universe, year=group.year, season=Season(int(group.season) + 1))
+
+    def _neighbor_clip_groups(self, group: ClipGroup) -> tuple[ClipGroup, ClipGroup]:
+        return (self._previous_clip_group(group), self._next_clip_group(group))
+
+    async def _load_neighbor_manifests_for_dedup(self, group: ClipGroup) -> tuple[Manifest, ...]:
+        """Return best-effort neighbor manifests for bounded adjacent dedup.
+
+        This helper relies on the store's single-writer operating model.
+        Neighbor manifests are read from the in-memory manifest cache when
+        available, and no refresh or coherence protocol is attempted for
+        concurrent external manifest mutations.
+        """
+        manifests: list[Manifest] = []
+        target_clip_group_prefix = self._clip_group_prefix(
+            universe=group.universe,
+            year=group.year,
+            season=group.season,
+        )
+        for neighbor_group in self._neighbor_clip_groups(group):
+            neighbor_prefix = self._clip_group_prefix(
+                universe=neighbor_group.universe,
+                year=neighbor_group.year,
+                season=neighbor_group.season,
+            )
+            try:
+                manifests.append(await self._load_manifest_for_read(neighbor_prefix))
+            except S3ObjectNotFoundError:
+                continue
+            except ManifestCorruptedError as error:
+                logger.warning(
+                    'skipping neighbor manifest during dedup for target group {} and neighbor group {}; '
+                    'target prefix: {}; neighbor prefix: {}; neighbor manifest key: {}; error: {!r}',
+                    group,
+                    neighbor_group,
+                    target_clip_group_prefix,
+                    neighbor_prefix,
+                    self._manifest_key(neighbor_prefix),
+                    error,
+                )
+        return tuple(manifests)
+
     async def _load_manifest_for_store(self, clip_group_prefix: Prefix) -> Manifest:
         if (cached_manifest := self._manifest_cache.get(clip_group_prefix)) is not None:
             return cached_manifest.copy()
@@ -1728,6 +1797,15 @@ class ClipStore:
             manifest = await self._fetch_manifest(clip_group_prefix)
         except S3ObjectNotFoundError:
             return Manifest()
+        except ManifestCorruptedError as error:
+            logger.error(
+                'failed to load current clip-group manifest for store; '
+                'clip-group prefix: {}; manifest key: {}; error: {!r}',
+                clip_group_prefix,
+                self._manifest_key(clip_group_prefix),
+                error,
+            )
+            raise
 
         self._manifest_cache[clip_group_prefix] = manifest
         return manifest.copy()
