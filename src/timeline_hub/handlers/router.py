@@ -32,6 +32,7 @@ async def on_start_send_menu(message: Message) -> None:
         keyboard=[
             [KeyboardButton(text='Clips'), KeyboardButton(text='Tracks')],
         ],
+        is_persistent=True,
         resize_keyboard=True,
         input_field_placeholder='Choose an option...',
     )
