@@ -5,10 +5,10 @@ import sys
 
 from aiogram import Bot, Dispatcher
 from aiogram.fsm.storage.memory import MemoryStorage
+from async_s3 import S3Client, S3Config
 from loguru import logger
 
 from timeline_hub.handlers.router import router as handlers_router
-from timeline_hub.infra.s3 import S3Client, S3Config
 from timeline_hub.infra.tasks import TaskFailure, TaskScheduler, TaskSupervisor
 from timeline_hub.middleware import AllowlistMiddleware, TelegramRetryAfterMiddleware
 from timeline_hub.services.clip_store import ClipStore

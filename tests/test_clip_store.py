@@ -4,10 +4,10 @@ import re
 import uuid
 
 import pytest
+from async_s3 import S3Client, S3ObjectNotFoundError
 
 import timeline_hub.services.clip_store as clip_store_module
 from timeline_hub.infra.ffmpeg import PerceptualMetadataUnavailableError, UnsupportedVideoCodecError
-from timeline_hub.infra.s3 import S3Client, S3ObjectNotFoundError
 from timeline_hub.services.clip_store import (
     AudioNormalization,
     ClipGroup,
@@ -182,19 +182,15 @@ class _FakeS3Client:
         except KeyError as error:
             raise S3ObjectNotFoundError(key) from error
 
-    async def list_subprefixes(self, prefix: str | None = None) -> list[str]:
-        if prefix is None:
-            return list(self.prefixes)
-
+    async def list_prefixes(self, prefix: str = '') -> list[str]:
+        if prefix == '':
+            return [candidate.removesuffix('/') for candidate in self.prefixes]
         expected_parts = S3Client.split(prefix)
         return [
-            candidate
+            candidate.removesuffix('/')
             for candidate in self.prefixes
             if S3Client.split(candidate)[: len(expected_parts)] == expected_parts
         ]
-
-    async def list_prefixes(self, prefix: str | None = None) -> list[str]:
-        return await self.list_subprefixes(prefix)
 
     async def delete_key(self, key: str) -> None:
         if key in self.delete_failures:

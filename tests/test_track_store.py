@@ -6,10 +6,10 @@ from datetime import timedelta
 from unittest.mock import AsyncMock
 
 import pytest
+from async_s3 import S3BatchDeleteError, S3Client, S3ObjectNotFoundError
 from pytest import approx
 
 import timeline_hub.services.track_store as track_store_module
-from timeline_hub.infra.s3 import S3BatchDeleteError, S3Client, S3ObjectNotFoundError
 from timeline_hub.services.track_store import (
     AppliedPreset,
     FetchedVariant,
@@ -67,7 +67,7 @@ class _FakeS3Client:
         self.delete_failures = set(delete_failures or set())
         self.put_calls: list[tuple[str, bytes, str | None]] = []
         self.get_calls: list[str] = []
-        self.list_subprefixes_calls: list[str | None] = []
+        self.list_prefixes_calls: list[str] = []
         self.deleted_keys: list[str] = []
         self.delete_keys_calls: list[tuple[str, ...]] = []
 
@@ -84,14 +84,13 @@ class _FakeS3Client:
         except KeyError as error:
             raise S3ObjectNotFoundError(key) from error
 
-    async def list_subprefixes(self, prefix: str | None = None) -> list[str]:
-        self.list_subprefixes_calls.append(prefix)
-        if prefix is None:
-            return list(self.prefixes)
-
+    async def list_prefixes(self, prefix: str = '') -> list[str]:
+        self.list_prefixes_calls.append(prefix)
+        if prefix == '':
+            return [candidate.removesuffix('/') for candidate in self.prefixes]
         expected_parts = S3Client.split(prefix)
         return [
-            candidate
+            candidate.removesuffix('/')
             for candidate in self.prefixes
             if S3Client.split(candidate)[: len(expected_parts)] == expected_parts
         ]

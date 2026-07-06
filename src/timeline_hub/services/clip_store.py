@@ -9,6 +9,7 @@ from dataclasses import replace as dataclass_replace
 from enum import IntEnum, StrEnum
 from typing import Any, Self, TypeVar
 
+from async_s3 import Key, Prefix, S3Client, S3ContentType, S3ObjectNotFoundError
 from loguru import logger
 
 from timeline_hub.infra.ffmpeg import (
@@ -20,7 +21,6 @@ from timeline_hub.infra.ffmpeg import (
     normalize_video_audio_loudness,
     sampled_phash_mean_distance,
 )
-from timeline_hub.infra.s3 import Key, Prefix, S3Client, S3ContentType, S3ObjectNotFoundError
 from timeline_hub.types import Extension, FileBytes, InvalidExtensionError
 
 _MANIFEST_FILENAME = 'manifest.json'
@@ -613,7 +613,7 @@ class ClipStore:
         existence check. After failed first writes, orphaned prefixes may
         appear temporarily until manual cleanup removes them.
         """
-        clip_group_prefixes = await self._s3_client.list_subprefixes(prefix=self._namespace)
+        clip_group_prefixes = await self._s3_client.list_prefixes(prefix=self._namespace)
         clip_groups = [self._parse_clip_group_prefix(prefix) for prefix in clip_group_prefixes]
         return sorted(clip_groups, key=lambda group: (group.universe.order(), group.year, int(group.season)))
 

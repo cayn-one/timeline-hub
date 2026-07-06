@@ -9,8 +9,9 @@ from datetime import timedelta
 from enum import IntEnum, StrEnum
 from typing import Literal, Self, TypeVar
 
+from async_s3 import Key, Prefix, S3BatchDeleteError, S3Client, S3ContentType, S3ObjectNotFoundError
+
 from timeline_hub.infra.ffmpeg import clip_mp3, create_audio_variant, probe_audio_sample_rate
-from timeline_hub.infra.s3 import Key, Prefix, S3BatchDeleteError, S3Client, S3ContentType, S3ObjectNotFoundError
 from timeline_hub.types import Extension, FileBytes, InvalidExtensionError
 
 _PRESETS_FILENAME = 'presets.json'
@@ -1173,12 +1174,12 @@ class TrackStore:
     async def list_groups(self) -> list[TrackGroup]:
         """List all discovered track groups from stored S3 prefixes.
 
-        This method relies on `S3Client.list_subprefixes(namespace)` returning
+        This method relies on `S3Client.list_prefixes(namespace)` returning
         only immediate prefixes and not ordinary files. That means
         the preset-registry object is not part of the returned collection and no
         file-specific ignore list is needed here.
         """
-        track_group_prefixes = await self._s3_client.list_subprefixes(prefix=self._namespace)
+        track_group_prefixes = await self._s3_client.list_prefixes(prefix=self._namespace)
         track_groups = [self._parse_track_group_prefix(prefix) for prefix in track_group_prefixes]
         return sorted(track_groups, key=lambda group: (group.universe.order(), group.year, int(group.season)))
 
