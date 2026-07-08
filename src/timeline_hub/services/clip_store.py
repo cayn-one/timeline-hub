@@ -380,6 +380,24 @@ class StoreResult:
 
 
 @dataclass(frozen=True, slots=True)
+class TransferClipRef:
+    """Reference to one already-ingested clip that may be transferred."""
+
+    source_group: ClipGroup
+    clip_id: ClipId
+
+
+@dataclass(frozen=True, slots=True)
+class TransferResult:
+    """Result summary for a `transfer()` call."""
+
+    transferred_count: int
+    already_in_destination_group_count: int
+    duplicate_blocked_count: int
+    affected_sub_groups: tuple[tuple[ClipGroup, ClipSubGroup], ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
 class ReconcileResult:
     """Result summary for a `reconcile()` call."""
 
@@ -563,6 +581,47 @@ class ClipRemoveManifestSyncError(RuntimeError):
             f'touched/failed keys: {list(self.touched_keys)}{detail_suffix}. '
             'Manual cleanup or inspection may be required for the listed keys.'
         )
+
+
+class ClipTransferSyncError(RuntimeError):
+    """Raised when transfer moves and manifest state cannot be synchronized."""
+
+    def __init__(
+        self,
+        *,
+        stage: str,
+        moved_keys: Sequence[Key],
+        affected_clip_ids: Sequence[ClipId],
+        manifest_keys: Sequence[Key],
+        logical_state: str,
+        failure_detail: str | None = None,
+    ) -> None:
+        self.stage = stage
+        self.moved_keys = tuple(moved_keys)
+        self.affected_clip_ids = tuple(affected_clip_ids)
+        self.manifest_keys = tuple(manifest_keys)
+        self.logical_state = logical_state
+        self.failure_detail = failure_detail
+        detail_suffix = f'; original error: {self.failure_detail}' if self.failure_detail is not None else ''
+        super().__init__(
+            f'Clip transfer failed at stage={self.stage} for clip ids {list(self.affected_clip_ids)}; '
+            f'moved keys: {list(self.moved_keys)}; manifest keys: {list(self.manifest_keys)}; '
+            f'{self.logical_state}{detail_suffix}. Manual cleanup or inspection may be required.'
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _ComparisonManifest:
+    group: ClipGroup
+    manifest: Manifest
+
+
+@dataclass(frozen=True, slots=True)
+class _DedupCandidate:
+    identity: tuple[ClipGroup, ClipId] | None
+    video_hash: str
+    frame_count: int | None
+    sampled_phashes: tuple[int, ...] | None
 
 
 class ClipStore:
@@ -824,10 +883,14 @@ class ClipStore:
             season=group.season,
         )
         manifest = await self._load_manifest_for_store(clip_group_prefix)
-        comparison_manifests = (manifest, *await self._load_neighbor_manifests_for_dedup(group))
-        seen_hashes: set[str] = set()
+        comparison_manifests = (
+            _ComparisonManifest(group=group, manifest=manifest),
+            *await self._load_neighbor_manifests_for_dedup(group),
+        )
+        seen_video_hashes: set[str] = set()
         seen_ids: set[ClipId] = set()
         duplicate_count = 0
+        accepted_candidates: list[_DedupCandidate] = []
         accepted_clips: list[tuple[ClipId, str, int | None, tuple[int, ...] | None, bytes]] = []
         uploaded_keys: list[Key] = []
         for clip_file in clips:
@@ -836,11 +899,14 @@ class ClipStore:
             _require_extension(clip_file, Extension.MP4, 'clips entries')
             clip_bytes = clip_file.data
             video_hash = await hash_video_content(clip_bytes)
-            if (
-                any(candidate_manifest.has_video_hash(video_hash) for candidate_manifest in comparison_manifests)
-                or video_hash in seen_hashes
+            if self._has_video_hash_duplicate(
+                comparison_manifests=comparison_manifests,
+                accepted_candidates=accepted_candidates,
+                video_hash=video_hash,
+                excluded_identities=set(),
+                seen_video_hashes=seen_video_hashes,
             ):
-                seen_hashes.add(video_hash)
+                seen_video_hashes.add(video_hash)
                 duplicate_count += 1
                 continue
 
@@ -850,43 +916,37 @@ class ClipStore:
                 frame_count = None
                 sampled_phashes = None
             else:
-                sampled_phashes = None
-                if self._has_perceptual_candidate_frame_count(
-                    manifests=comparison_manifests,
-                    accepted_clips=accepted_clips,
+                sampled_phashes = await self._compute_store_candidate_sampled_phashes(
+                    clip_bytes=clip_bytes,
+                    comparison_manifests=comparison_manifests,
+                    accepted_candidates=accepted_candidates,
                     frame_count=frame_count,
-                ):
-                    try:
-                        sampled_phashes = await compute_video_sampled_phashes(
-                            clip_bytes,
-                            frame_count=frame_count,
-                        )
-                    except PerceptualMetadataUnavailableError:
-                        sampled_phashes = None
-                    else:
-                        if self._has_perceptual_duplicate(
-                            manifests=comparison_manifests,
-                            accepted_clips=accepted_clips,
-                            frame_count=frame_count,
-                            sampled_phashes=sampled_phashes,
-                        ):
-                            seen_hashes.add(video_hash)
-                            duplicate_count += 1
-                            continue
+                )
 
-                if sampled_phashes is None:
-                    try:
-                        sampled_phashes = await compute_video_sampled_phashes(
-                            clip_bytes,
-                            frame_count=frame_count,
-                        )
-                    except PerceptualMetadataUnavailableError:
-                        sampled_phashes = None
+            if self._is_duplicate_candidate(
+                video_hash=video_hash,
+                frame_count=frame_count,
+                sampled_phashes=sampled_phashes,
+                comparison_manifests=comparison_manifests,
+                accepted_candidates=accepted_candidates,
+                seen_video_hashes=seen_video_hashes,
+            ):
+                seen_video_hashes.add(video_hash)
+                duplicate_count += 1
+                continue
 
             clip_id = self._new_clip_id(manifest=manifest, seen_ids=seen_ids)
+            accepted_candidates.append(
+                _DedupCandidate(
+                    identity=None,
+                    video_hash=video_hash,
+                    frame_count=frame_count,
+                    sampled_phashes=sampled_phashes,
+                )
+            )
             accepted_clips.append((clip_id, video_hash, frame_count, sampled_phashes, clip_bytes))
+            seen_video_hashes.add(video_hash)
             seen_ids.add(clip_id)
-            seen_hashes.add(video_hash)
 
         if not accepted_clips:
             return StoreResult(stored_count=0, duplicate_count=duplicate_count)
@@ -977,6 +1037,214 @@ class ClipStore:
             stored_count=len(new_entries),
             duplicate_count=duplicate_count,
             clip_ids=tuple(entry.id for entry, _ in new_entries),
+        )
+
+    async def transfer(
+        self,
+        *,
+        destination_group: ClipGroup,
+        clips: Sequence[TransferClipRef],
+    ) -> TransferResult:
+        """Transfer existing clips to another physical clip group."""
+        if not clips:
+            raise ValueError('transfer() requires at least one clip')
+
+        seen_clip_refs: set[tuple[ClipGroup, ClipId]] = set()
+        for clip in clips:
+            clip_identity = (clip.source_group, clip.clip_id)
+            if clip_identity in seen_clip_refs:
+                raise DuplicateClipIdsError(clip_ids=[candidate.clip_id for candidate in clips])
+            seen_clip_refs.add(clip_identity)
+
+        source_manifests: dict[ClipGroup, Manifest] = {}
+        resolved_candidates: list[tuple[TransferClipRef, ManifestEntry]] = []
+        for clip in clips:
+            source_prefix = self._clip_group_prefix(
+                universe=clip.source_group.universe,
+                year=clip.source_group.year,
+                season=clip.source_group.season,
+            )
+            try:
+                source_manifest = source_manifests.get(clip.source_group)
+                if source_manifest is None:
+                    source_manifest = await self._load_manifest_for_read(source_prefix)
+                    source_manifests[clip.source_group] = source_manifest
+            except S3ObjectNotFoundError as error:
+                raise ClipGroupNotFoundError(
+                    universe=clip.source_group.universe,
+                    year=clip.source_group.year,
+                    season=clip.source_group.season,
+                    sub_season=None,
+                    scope=None,
+                ) from error
+            entry = next((candidate for candidate in source_manifest if candidate.id == clip.clip_id), None)
+            if entry is None:
+                raise UnknownClipsError(clip_ids=[clip.clip_id])
+            resolved_candidates.append((clip, entry))
+
+        already_in_destination_group_count = 0
+        moved_candidate_refs: list[tuple[TransferClipRef, ManifestEntry]] = []
+        for clip, entry in resolved_candidates:
+            if clip.source_group == destination_group:
+                already_in_destination_group_count += 1
+                continue
+            moved_candidate_refs.append((clip, entry))
+
+        if not moved_candidate_refs:
+            return TransferResult(
+                transferred_count=0,
+                already_in_destination_group_count=already_in_destination_group_count,
+                duplicate_blocked_count=0,
+            )
+
+        destination_prefix = self._clip_group_prefix(
+            universe=destination_group.universe,
+            year=destination_group.year,
+            season=destination_group.season,
+        )
+        destination_manifest = await self._load_manifest_for_store(destination_prefix)
+        comparison_manifests = (
+            _ComparisonManifest(group=destination_group, manifest=destination_manifest),
+            *await self._load_neighbor_manifests_for_dedup(destination_group),
+        )
+        destination_manifest_ids = {entry.id for entry in destination_manifest}
+        planned_destination_clip_ids: set[ClipId] = set()
+        excluded_source_identities = {(clip.source_group, clip.clip_id) for clip, _entry in moved_candidate_refs}
+        for clip, _entry in moved_candidate_refs:
+            if clip.clip_id in destination_manifest_ids:
+                raise RuntimeError(
+                    f'Transfer destination manifest already contains clip id {clip.clip_id} '
+                    f'for group {destination_group}'
+                )
+            if clip.clip_id in planned_destination_clip_ids:
+                raise RuntimeError(
+                    f'Transfer would create duplicate destination clip id {clip.clip_id} for group {destination_group}'
+                )
+            planned_destination_clip_ids.add(clip.clip_id)
+
+        active_candidates: dict[tuple[ClipGroup, ClipId], tuple[TransferClipRef, ManifestEntry]] = {
+            (clip.source_group, clip.clip_id): (clip, entry) for clip, entry in moved_candidate_refs
+        }
+        duplicate_blocked_count = 0
+        while True:
+            excluded_source_identities = set(active_candidates)
+            deduplicated_identities = {
+                identity
+                for identity, (_clip, entry) in active_candidates.items()
+                if self._is_duplicate_candidate(
+                    video_hash=entry.video_hash,
+                    frame_count=entry.frame_count,
+                    sampled_phashes=entry.sampled_phashes,
+                    comparison_manifests=comparison_manifests,
+                    accepted_candidates=(),
+                    excluded_identities=excluded_source_identities,
+                )
+            }
+            if deduplicated_identities:
+                duplicate_blocked_count += len(deduplicated_identities)
+                for identity in deduplicated_identities:
+                    active_candidates.pop(identity)
+                continue
+
+            denied_identities = self._find_internal_transfer_conflicts(
+                destination_group=destination_group,
+                candidates=tuple(active_candidates.values()),
+            )
+            if denied_identities:
+                duplicate_blocked_count += len(denied_identities)
+                for identity in denied_identities:
+                    active_candidates.pop(identity)
+                continue
+            break
+
+        moved_candidates = list(active_candidates.values())
+
+        if not moved_candidates:
+            return TransferResult(
+                transferred_count=0,
+                already_in_destination_group_count=already_in_destination_group_count,
+                duplicate_blocked_count=duplicate_blocked_count,
+            )
+
+        destination_entries = self._build_transfer_destination_entries(
+            destination_manifest=destination_manifest,
+            moved_candidates=moved_candidates,
+        )
+        rewritten_destination_manifest = Manifest([*destination_manifest, *destination_entries.values()])
+        rewritten_source_manifests = self._build_transfer_source_manifests(
+            source_manifests=source_manifests,
+            moved_candidates=moved_candidates,
+        )
+        moved_keys: list[Key] = []
+        moved_clip_ids = [clip.clip_id for clip, _entry in moved_candidates]
+
+        try:
+            for clip, entry in moved_candidates:
+                source_prefix = self._clip_group_prefix(
+                    universe=clip.source_group.universe,
+                    year=clip.source_group.year,
+                    season=clip.source_group.season,
+                )
+                source_key = self._clip_key(source_prefix, clip.clip_id)
+                destination_key = self._clip_key(destination_prefix, clip.clip_id)
+                await self._s3_client.move(source_key, destination_key)
+                moved_keys.append(destination_key)
+
+                if entry.audio_normalization is None:
+                    continue
+
+                normalized_source_key = self._normalized_clip_key(source_prefix, clip.clip_id)
+                if not await self._s3_client.exists(normalized_source_key):
+                    continue
+
+                normalized_destination_key = self._normalized_clip_key(destination_prefix, clip.clip_id)
+                await self._s3_client.move(normalized_source_key, normalized_destination_key)
+                moved_keys.append(normalized_destination_key)
+        except Exception as error:
+            raise ClipTransferSyncError(
+                stage='clip_move',
+                moved_keys=moved_keys,
+                affected_clip_ids=moved_clip_ids,
+                manifest_keys=[self._manifest_key(destination_prefix)],
+                logical_state='Manifest state remains unchanged because transfer commit did not start.',
+                failure_detail=repr(error),
+            ) from error
+
+        manifest_keys = [self._manifest_key(destination_prefix)]
+        try:
+            await self._write_manifest_and_update_cache(
+                clip_group_prefix=destination_prefix,
+                manifest=rewritten_destination_manifest,
+            )
+            for group, manifest in rewritten_source_manifests.items():
+                source_prefix = self._clip_group_prefix(
+                    universe=group.universe,
+                    year=group.year,
+                    season=group.season,
+                )
+                manifest_keys.append(self._manifest_key(source_prefix))
+                await self._commit_manifest_state(
+                    clip_group_prefix=source_prefix,
+                    manifest=manifest,
+                )
+        except Exception as error:
+            raise ClipTransferSyncError(
+                stage='manifest_write',
+                moved_keys=moved_keys,
+                affected_clip_ids=moved_clip_ids,
+                manifest_keys=manifest_keys,
+                logical_state='One or more clip objects already moved, but manifest state did not fully synchronize.',
+                failure_detail=repr(error),
+            ) from error
+
+        return TransferResult(
+            transferred_count=len(moved_candidates),
+            already_in_destination_group_count=already_in_destination_group_count,
+            duplicate_blocked_count=duplicate_blocked_count,
+            affected_sub_groups=self._transfer_affected_sub_groups(
+                destination_group=destination_group,
+                moved_candidates=moved_candidates,
+            ),
         )
 
     async def compact(
@@ -1634,6 +1902,94 @@ class ClipStore:
         return rewritten_entries
 
     @staticmethod
+    def _build_transfer_destination_entries(
+        *,
+        destination_manifest: Manifest,
+        moved_candidates: Sequence[tuple[TransferClipRef, ManifestEntry]],
+    ) -> dict[ClipId, ManifestEntry]:
+        next_batch_by_sub_group: dict[ClipSubGroup, int] = {}
+        grouped_entries: dict[ClipSubGroup, list[tuple[TransferClipRef, ManifestEntry]]] = {}
+        for clip, entry in moved_candidates:
+            sub_group = ClipSubGroup(sub_season=entry.sub_season, scope=entry.scope)
+            if sub_group not in next_batch_by_sub_group:
+                next_batch_by_sub_group[sub_group] = destination_manifest.next_batch(
+                    sub_season=sub_group.sub_season,
+                    scope=sub_group.scope,
+                )
+            grouped_entries.setdefault(sub_group, []).append((clip, entry))
+
+        destination_entries: dict[ClipId, ManifestEntry] = {}
+        for clip, entry in moved_candidates:
+            sub_group = ClipSubGroup(sub_season=entry.sub_season, scope=entry.scope)
+            batch = next_batch_by_sub_group[sub_group]
+            order = next(
+                index
+                for index, (candidate_clip, _candidate_entry) in enumerate(grouped_entries[sub_group], start=1)
+                if candidate_clip == clip
+            )
+            destination_entries[clip.clip_id] = dataclass_replace(
+                entry,
+                batch=batch,
+                order=order,
+            )
+        return destination_entries
+
+    def _build_transfer_source_manifests(
+        self,
+        *,
+        source_manifests: dict[ClipGroup, Manifest],
+        moved_candidates: Sequence[tuple[TransferClipRef, ManifestEntry]],
+    ) -> dict[ClipGroup, Manifest]:
+        moved_ids_by_group: dict[ClipGroup, set[ClipId]] = {}
+        affected_sub_groups_by_group: dict[ClipGroup, set[ClipSubGroup]] = {}
+        for clip, entry in moved_candidates:
+            moved_ids_by_group.setdefault(clip.source_group, set()).add(clip.clip_id)
+            affected_sub_groups_by_group.setdefault(clip.source_group, set()).add(
+                ClipSubGroup(sub_season=entry.sub_season, scope=entry.scope)
+            )
+
+        rewritten_manifests: dict[ClipGroup, Manifest] = {}
+        for group, manifest in source_manifests.items():
+            moved_ids = moved_ids_by_group.get(group)
+            if not moved_ids:
+                continue
+            remaining_entries = [entry for entry in manifest if entry.id not in moved_ids]
+            remaining_manifest = Manifest(remaining_entries)
+            rewritten_entries_by_id: dict[ClipId, ManifestEntry] = {}
+            for sub_group in affected_sub_groups_by_group[group]:
+                rewritten_entries_by_id.update(
+                    self._build_dense_sub_group_entries(self._sorted_sub_group_entries(remaining_manifest, sub_group))
+                )
+            rewritten_manifests[group] = Manifest(
+                [rewritten_entries_by_id.get(entry.id, entry) for entry in remaining_entries]
+            )
+        return rewritten_manifests
+
+    @staticmethod
+    def _transfer_affected_sub_groups(
+        *,
+        destination_group: ClipGroup,
+        moved_candidates: Sequence[tuple[TransferClipRef, ManifestEntry]],
+    ) -> tuple[tuple[ClipGroup, ClipSubGroup], ...]:
+        affected: set[tuple[ClipGroup, ClipSubGroup]] = set()
+        for clip, entry in moved_candidates:
+            sub_group = ClipSubGroup(sub_season=entry.sub_season, scope=entry.scope)
+            affected.add((clip.source_group, sub_group))
+            affected.add((destination_group, sub_group))
+        return tuple(
+            sorted(
+                affected,
+                key=lambda item: (
+                    item[0].universe.order(),
+                    item[0].year,
+                    int(item[0].season),
+                    item[1].sub_season.order(),
+                    item[1].scope.value,
+                ),
+            )
+        )
+
+    @staticmethod
     def _build_remove_sync_error(
         error: Exception,
         *,
@@ -1686,20 +2042,107 @@ class ClipStore:
             if not manifest.has_id(clip_id) and clip_id not in seen_ids:
                 return clip_id
 
+    async def _compute_store_candidate_sampled_phashes(
+        self,
+        *,
+        clip_bytes: bytes,
+        comparison_manifests: Sequence[_ComparisonManifest],
+        accepted_candidates: Sequence[_DedupCandidate],
+        frame_count: int,
+    ) -> tuple[int, ...] | None:
+        sampled_phashes: tuple[int, ...] | None = None
+        if self._has_perceptual_candidate_frame_count(
+            comparison_manifests=comparison_manifests,
+            accepted_candidates=accepted_candidates,
+            frame_count=frame_count,
+        ):
+            try:
+                sampled_phashes = await compute_video_sampled_phashes(
+                    clip_bytes,
+                    frame_count=frame_count,
+                )
+            except PerceptualMetadataUnavailableError:
+                sampled_phashes = None
+
+        if sampled_phashes is None:
+            try:
+                sampled_phashes = await compute_video_sampled_phashes(
+                    clip_bytes,
+                    frame_count=frame_count,
+                )
+            except PerceptualMetadataUnavailableError:
+                sampled_phashes = None
+        return sampled_phashes
+
+    def _is_duplicate_candidate(
+        self,
+        *,
+        video_hash: str,
+        frame_count: int | None,
+        sampled_phashes: tuple[int, ...] | None,
+        comparison_manifests: Sequence[_ComparisonManifest],
+        accepted_candidates: Sequence[_DedupCandidate],
+        excluded_identities: set[tuple[ClipGroup, ClipId]] | None = None,
+        seen_video_hashes: set[str] | None = None,
+    ) -> bool:
+        excluded = excluded_identities or set()
+        if self._has_video_hash_duplicate(
+            comparison_manifests=comparison_manifests,
+            accepted_candidates=accepted_candidates,
+            video_hash=video_hash,
+            excluded_identities=excluded,
+            seen_video_hashes=seen_video_hashes,
+        ):
+            return True
+        if frame_count is None or sampled_phashes is None:
+            return False
+        return self._has_perceptual_duplicate(
+            comparison_manifests=comparison_manifests,
+            accepted_candidates=accepted_candidates,
+            frame_count=frame_count,
+            sampled_phashes=sampled_phashes,
+            excluded_identities=excluded,
+        )
+
+    def _has_video_hash_duplicate(
+        self,
+        *,
+        comparison_manifests: Sequence[_ComparisonManifest],
+        accepted_candidates: Sequence[_DedupCandidate],
+        video_hash: str,
+        excluded_identities: set[tuple[ClipGroup, ClipId]],
+        seen_video_hashes: set[str] | None = None,
+    ) -> bool:
+        for comparison_manifest in comparison_manifests:
+            for entry in comparison_manifest.manifest:
+                if entry.video_hash != video_hash:
+                    continue
+                if self._is_excluded_manifest_entry(
+                    group=comparison_manifest.group,
+                    entry=entry,
+                    excluded_identities=excluded_identities,
+                ):
+                    continue
+                return True
+
+        if seen_video_hashes is not None and video_hash in seen_video_hashes:
+            return True
+        return any(candidate.video_hash == video_hash for candidate in accepted_candidates)
+
     def _has_perceptual_candidate_frame_count(
         self,
         *,
-        manifests: Sequence[Manifest],
-        accepted_clips: Sequence[tuple[ClipId, str, int | None, tuple[int, ...] | None, bytes]],
+        comparison_manifests: Sequence[_ComparisonManifest],
+        accepted_candidates: Sequence[_DedupCandidate],
         frame_count: int,
     ) -> bool:
-        for manifest in manifests:
-            for entry in manifest:
+        for comparison_manifest in comparison_manifests:
+            for entry in comparison_manifest.manifest:
                 if entry.frame_count == frame_count and entry.sampled_phashes is not None:
                     return True
 
-        for _, _, accepted_frame_count, accepted_sampled_phashes, _ in accepted_clips:
-            if accepted_frame_count == frame_count and accepted_sampled_phashes is not None:
+        for candidate in accepted_candidates:
+            if candidate.frame_count == frame_count and candidate.sampled_phashes is not None:
                 return True
 
         return False
@@ -1707,16 +2150,24 @@ class ClipStore:
     def _has_perceptual_duplicate(
         self,
         *,
-        manifests: Sequence[Manifest],
-        accepted_clips: Sequence[tuple[ClipId, str, int | None, tuple[int, ...] | None, bytes]],
+        comparison_manifests: Sequence[_ComparisonManifest],
+        accepted_candidates: Sequence[_DedupCandidate],
         frame_count: int,
         sampled_phashes: tuple[int, ...],
+        excluded_identities: set[tuple[ClipGroup, ClipId]] | None = None,
     ) -> bool:
-        for manifest in manifests:
-            for entry in manifest:
+        excluded = excluded_identities or set()
+        for comparison_manifest in comparison_manifests:
+            for entry in comparison_manifest.manifest:
                 if entry.frame_count is None or entry.sampled_phashes is None:
                     continue
                 if entry.frame_count != frame_count:
+                    continue
+                if self._is_excluded_manifest_entry(
+                    group=comparison_manifest.group,
+                    entry=entry,
+                    excluded_identities=excluded,
+                ):
                     continue
                 if (
                     sampled_phash_mean_distance(entry.sampled_phashes, sampled_phashes)
@@ -1724,18 +2175,76 @@ class ClipStore:
                 ):
                     return True
 
-        for _, _, accepted_frame_count, accepted_sampled_phashes, _ in accepted_clips:
-            if accepted_frame_count is None or accepted_sampled_phashes is None:
+        for candidate in accepted_candidates:
+            if candidate.frame_count is None or candidate.sampled_phashes is None:
                 continue
-            if accepted_frame_count != frame_count:
+            if candidate.frame_count != frame_count:
                 continue
             if (
-                sampled_phash_mean_distance(accepted_sampled_phashes, sampled_phashes)
+                sampled_phash_mean_distance(candidate.sampled_phashes, sampled_phashes)
                 <= self._sampled_phash_mean_threshold
             ):
                 return True
 
         return False
+
+    @staticmethod
+    def _is_excluded_manifest_entry(
+        *,
+        group: ClipGroup,
+        entry: ManifestEntry,
+        excluded_identities: set[tuple[ClipGroup, ClipId]],
+    ) -> bool:
+        return (group, entry.id) in excluded_identities
+
+    def _find_internal_transfer_conflicts(
+        self,
+        *,
+        destination_group: ClipGroup,
+        candidates: Sequence[tuple[TransferClipRef, ManifestEntry]],
+    ) -> set[tuple[ClipGroup, ClipId]]:
+        denied_identities: set[tuple[ClipGroup, ClipId]] = set()
+        scoped_groups = {
+            destination_group,
+            *self._neighbor_clip_groups(destination_group),
+        }
+        dedup_candidates = [
+            _DedupCandidate(
+                identity=(clip.source_group, clip.clip_id),
+                video_hash=entry.video_hash,
+                frame_count=entry.frame_count,
+                sampled_phashes=entry.sampled_phashes,
+            )
+            for clip, entry in candidates
+            if clip.source_group in scoped_groups
+        ]
+        for index, candidate in enumerate(dedup_candidates):
+            for other in dedup_candidates[index + 1 :]:
+                if not self._dedup_candidates_conflict(candidate, other):
+                    continue
+                assert candidate.identity is not None
+                assert other.identity is not None
+                denied_identities.add(candidate.identity)
+                denied_identities.add(other.identity)
+        return denied_identities
+
+    def _dedup_candidates_conflict(
+        self,
+        first: _DedupCandidate,
+        second: _DedupCandidate,
+    ) -> bool:
+        if first.video_hash == second.video_hash:
+            return True
+        if first.frame_count is None or second.frame_count is None:
+            return False
+        if first.sampled_phashes is None or second.sampled_phashes is None:
+            return False
+        if first.frame_count != second.frame_count:
+            return False
+        return (
+            sampled_phash_mean_distance(first.sampled_phashes, second.sampled_phashes)
+            <= self._sampled_phash_mean_threshold
+        )
 
     @staticmethod
     def _previous_clip_group(group: ClipGroup) -> ClipGroup:
@@ -1752,7 +2261,7 @@ class ClipStore:
     def _neighbor_clip_groups(self, group: ClipGroup) -> tuple[ClipGroup, ClipGroup]:
         return (self._previous_clip_group(group), self._next_clip_group(group))
 
-    async def _load_neighbor_manifests_for_dedup(self, group: ClipGroup) -> tuple[Manifest, ...]:
+    async def _load_neighbor_manifests_for_dedup(self, group: ClipGroup) -> tuple[_ComparisonManifest, ...]:
         """Return best-effort neighbor manifests for bounded adjacent dedup.
 
         This helper relies on the store's single-writer operating model.
@@ -1760,7 +2269,7 @@ class ClipStore:
         available, and no refresh or coherence protocol is attempted for
         concurrent external manifest mutations.
         """
-        manifests: list[Manifest] = []
+        manifests: list[_ComparisonManifest] = []
         target_clip_group_prefix = self._clip_group_prefix(
             universe=group.universe,
             year=group.year,
@@ -1773,7 +2282,12 @@ class ClipStore:
                 season=neighbor_group.season,
             )
             try:
-                manifests.append(await self._load_manifest_for_read(neighbor_prefix))
+                manifests.append(
+                    _ComparisonManifest(
+                        group=neighbor_group,
+                        manifest=await self._load_manifest_for_read(neighbor_prefix),
+                    )
+                )
             except S3ObjectNotFoundError:
                 continue
             except ManifestCorruptedError as error:

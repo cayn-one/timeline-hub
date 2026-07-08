@@ -115,6 +115,7 @@ from timeline_hub.infra.ytdlp import DownloadedAudio, TrackMetadata, YtDlpMetada
 from timeline_hub.services.clip_store import (
     AudioNormalization,
     ClipGroup,
+    ClipGroupNotFoundError,
     ClipInfo,
     ClipRemoveManifestSyncError,
     ClipStore,
@@ -125,7 +126,9 @@ from timeline_hub.services.clip_store import (
     Season,
     StoreResult,
     SubSeason,
+    TransferResult,
     Universe,
+    UnknownClipsError,
 )
 from timeline_hub.services.container import Services
 from timeline_hub.services.message_buffer import ChatMessageBuffer
@@ -735,6 +738,18 @@ def test_route_progress_kwargs_preserves_arrow_path_rendering_without_route_labe
     assert 'Selected:' not in actual['text']
     assert '·' not in actual['text']
     assert '\n\n' not in actual['text']
+
+
+def _transfer_progress_kwargs(*routes: tuple[str, ...]) -> dict[str, object]:
+    parts: list[object] = ['Transferring...']
+    for route in routes:
+        line_parts: list[object] = ['→ ']
+        for index, value in enumerate(route):
+            if index > 0:
+                line_parts.append(' → ')
+            line_parts.append(Bold(value))
+        parts.extend(['\n', Text(*line_parts)])
+    return Text(*parts).as_kwargs()
 
 
 def test_handlers_package_router_imports_cleanly() -> None:
@@ -3120,6 +3135,192 @@ async def test_document_mp4_only_batch_dispatches_to_clip_menu() -> None:
     reply_markup = message.answer.await_args.kwargs['reply_markup']
     _assert_three_rows(reply_markup)
     assert _keyboard_rows(reply_markup) == [['Route'], ['Produce'], ['Cancel']]
+
+
+@pytest.mark.asyncio
+async def test_standalone_text_and_video_clip_dispatch_to_text_aware_clip_menu() -> None:
+    scheduler = _FakeScheduler()
+    buffer = ChatMessageBuffer()
+    services = _services(clip_store=SimpleNamespace(), scheduler=scheduler, buffer=buffer)
+    settings = _settings()
+    first_message = _fake_message(chat_id=42, message_id=1, text='w251')
+    message = _fake_message(chat_id=42, message_id=2, video=_fake_video(file_id='video-1', file_name='clip.mp4'))
+
+    await on_buffered_relevant_message(first_message, services, settings)
+    await on_buffered_relevant_message(message, services, settings)
+    assert scheduler.job is not None
+
+    await scheduler.job()
+
+    expected = Text(
+        create_padding_line(settings.message_width),
+        '\n',
+        Text('Messages: ', Bold('2')),
+        '. Select action:',
+    ).as_kwargs()
+    _assert_format_kwargs(message.answer.await_args.kwargs, expected)
+    reply_markup = message.answer.await_args.kwargs['reply_markup']
+    _assert_three_rows(reply_markup)
+    assert _keyboard_rows(reply_markup) == [['Route'], ['Transfer'], ['Cancel']]
+
+
+@pytest.mark.asyncio
+async def test_standalone_text_and_mp4_document_dispatch_to_text_aware_clip_menu() -> None:
+    scheduler = _FakeScheduler()
+    buffer = ChatMessageBuffer()
+    services = _services(clip_store=SimpleNamespace(), scheduler=scheduler, buffer=buffer)
+    settings = _settings()
+    first_message = _fake_message(chat_id=42, message_id=1, text='w251')
+    message = _fake_message(
+        chat_id=42,
+        message_id=2,
+        document=_fake_document(file_id='document-1', file_name='clip.mp4'),
+    )
+
+    await on_buffered_relevant_message(first_message, services, settings)
+    await on_buffered_relevant_message(message, services, settings)
+    assert scheduler.job is not None
+
+    await scheduler.job()
+
+    expected = Text(
+        create_padding_line(settings.message_width),
+        '\n',
+        Text('Messages: ', Bold('2')),
+        '. Select action:',
+    ).as_kwargs()
+    _assert_format_kwargs(message.answer.await_args.kwargs, expected)
+    reply_markup = message.answer.await_args.kwargs['reply_markup']
+    _assert_three_rows(reply_markup)
+    assert _keyboard_rows(reply_markup) == [['Route'], ['Transfer'], ['Cancel']]
+
+
+@pytest.mark.asyncio
+async def test_caption_only_video_clip_does_not_trigger_text_aware_clip_menu() -> None:
+    scheduler = _FakeScheduler()
+    buffer = ChatMessageBuffer()
+    services = _services(clip_store=SimpleNamespace(), scheduler=scheduler, buffer=buffer)
+    settings = _settings()
+    message = _fake_message(
+        chat_id=42,
+        message_id=1,
+        caption='w251',
+        video=_fake_video(file_id='video-1', file_name='clip.mp4'),
+    )
+
+    await on_buffered_relevant_message(message, services, settings)
+    assert scheduler.job is not None
+
+    await scheduler.job()
+
+    expected = Text(
+        create_padding_line(settings.message_width),
+        '\n',
+        Text('Messages: ', Bold('1')),
+        '. Select action:',
+    ).as_kwargs()
+    _assert_format_kwargs(message.answer.await_args.kwargs, expected)
+    reply_markup = message.answer.await_args.kwargs['reply_markup']
+    _assert_three_rows(reply_markup)
+    assert _keyboard_rows(reply_markup) == [
+        ['Produce', 'Remove', 'Reorder'],
+        ['Reconcile', 'Route', 'Compact'],
+        ['Cancel'],
+    ]
+
+
+@pytest.mark.asyncio
+async def test_caption_only_document_clip_does_not_trigger_text_aware_clip_menu() -> None:
+    scheduler = _FakeScheduler()
+    buffer = ChatMessageBuffer()
+    services = _services(clip_store=SimpleNamespace(), scheduler=scheduler, buffer=buffer)
+    settings = _settings()
+    message = _fake_message(
+        chat_id=42,
+        message_id=1,
+        caption='w251',
+        document=_fake_document(file_id='document-1', file_name='clip.mp4'),
+    )
+
+    await on_buffered_relevant_message(message, services, settings)
+    assert scheduler.job is not None
+
+    await scheduler.job()
+
+    expected = Text(
+        create_padding_line(settings.message_width),
+        '\n',
+        Text('Messages: ', Bold('1')),
+        '. Select action:',
+    ).as_kwargs()
+    _assert_format_kwargs(message.answer.await_args.kwargs, expected)
+    reply_markup = message.answer.await_args.kwargs['reply_markup']
+    _assert_three_rows(reply_markup)
+    assert _keyboard_rows(reply_markup) == [['Route'], ['Produce'], ['Cancel']]
+
+
+@pytest.mark.asyncio
+async def test_mixed_video_document_and_standalone_text_dispatch_to_text_aware_clip_menu() -> None:
+    scheduler = _FakeScheduler()
+    buffer = ChatMessageBuffer()
+    services = _services(clip_store=SimpleNamespace(), scheduler=scheduler, buffer=buffer)
+    settings = _settings()
+
+    await on_buffered_relevant_message(_fake_message(chat_id=42, message_id=1, text='w251'), services, settings)
+    await on_buffered_relevant_message(
+        _fake_message(chat_id=42, message_id=2, video=_fake_video(file_id='video-1', file_name='clip.mp4')),
+        services,
+        settings,
+    )
+    message = _fake_message(
+        chat_id=42,
+        message_id=3,
+        document=_fake_document(file_id='document-1', file_name='clip.mp4'),
+    )
+    await on_buffered_relevant_message(message, services, settings)
+    assert scheduler.job is not None
+
+    await scheduler.job()
+
+    expected = Text(
+        create_padding_line(settings.message_width),
+        '\n',
+        Text('Messages: ', Bold('3')),
+        '. Select action:',
+    ).as_kwargs()
+    _assert_format_kwargs(message.answer.await_args.kwargs, expected)
+    reply_markup = message.answer.await_args.kwargs['reply_markup']
+    _assert_three_rows(reply_markup)
+    assert _keyboard_rows(reply_markup) == [['Route'], ['Transfer'], ['Cancel']]
+
+
+@pytest.mark.asyncio
+async def test_whitespace_only_text_and_clip_does_not_trigger_text_aware_clip_menu() -> None:
+    scheduler = _FakeScheduler()
+    buffer = ChatMessageBuffer()
+    services = _services(clip_store=SimpleNamespace(), scheduler=scheduler, buffer=buffer)
+    settings = _settings()
+    await on_buffered_relevant_message(_fake_message(chat_id=42, message_id=1, text=' \n\t '), services, settings)
+    message = _fake_message(chat_id=42, message_id=2, video=_fake_video(file_id='video-1', file_name='clip.mp4'))
+    await on_buffered_relevant_message(message, services, settings)
+    assert scheduler.job is not None
+
+    await scheduler.job()
+
+    expected = Text(
+        create_padding_line(settings.message_width),
+        '\n',
+        Text('Messages: ', Bold('2')),
+        '. Select action:',
+    ).as_kwargs()
+    _assert_format_kwargs(message.answer.await_args.kwargs, expected)
+    reply_markup = message.answer.await_args.kwargs['reply_markup']
+    _assert_three_rows(reply_markup)
+    assert _keyboard_rows(reply_markup) == [
+        ['Produce', 'Remove', 'Reorder'],
+        ['Reconcile', 'Route', 'Compact'],
+        ['Cancel'],
+    ]
 
 
 @pytest.mark.asyncio
@@ -15464,6 +15665,306 @@ async def test_route_action_rejects_season_not_allowed_for_current_year_before_e
     clip_store.compact.assert_not_awaited()
     bot.get_file.assert_not_awaited()
     bot.download_file.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_transfer_action_uses_text_destinations_and_ignores_clip_captions() -> None:
+    message = _fake_message(text='Select action:', chat_id=77, message_id=79)
+    callback = _fake_callback(message)
+    state = _FakeState()
+    buffer = ChatMessageBuffer()
+    destination_group = ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1)
+    source_group = ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1)
+    source_sub_group = ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.EXTRA)
+    buffer.append(_fake_message(chat_id=77, message_id=1, text='w251'), chat_id=77)
+    buffer.append(
+        _fake_message(
+            chat_id=77,
+            message_id=2,
+            caption='e242',
+            video=_fake_video(file_id='f1', file_name=_stored_filename(source_group, source_sub_group, _CLIP_ID_1)),
+        ),
+        chat_id=77,
+    )
+    clip_store = SimpleNamespace(
+        transfer=AsyncMock(
+            return_value=TransferResult(
+                transferred_count=1,
+                already_in_destination_group_count=0,
+                duplicate_blocked_count=0,
+                affected_sub_groups=((source_group, source_sub_group), (destination_group, source_sub_group)),
+            )
+        ),
+        compact=AsyncMock(),
+    )
+    services = _services(clip_store=clip_store, buffer=buffer)
+
+    await on_intake_action(
+        callback,
+        SimpleNamespace(action=IntakeAction.TRANSFER),
+        AsyncMock(),
+        services,
+        _settings(),
+        state,
+    )
+
+    clip_store.transfer.assert_awaited_once()
+    assert clip_store.transfer.await_args.kwargs['destination_group'] == destination_group
+    assert clip_store.transfer.await_args.kwargs['clips'][0].source_group == source_group
+    assert clip_store.transfer.await_args.kwargs['clips'][0].clip_id == _CLIP_ID_1
+    assert message.edit_text.await_args_list[0] == call('Transferring...', reply_markup=None)
+    _assert_format_kwargs(
+        message.edit_text.await_args_list[1].kwargs,
+        {**_transfer_progress_kwargs(('West', '2025', '1')), 'reply_markup': None},
+    )
+    message.answer.assert_awaited_once_with(**Text('Transferred: ', Bold('1')).as_kwargs())
+    assert clip_store.compact.await_args_list == [
+        call(
+            source_group,
+            source_sub_group,
+            batch_size=intake_module._TELEGRAM_MEDIA_GROUP_LIMIT,
+            require_exists=False,
+        ),
+        call(
+            destination_group,
+            source_sub_group,
+            batch_size=intake_module._TELEGRAM_MEDIA_GROUP_LIMIT,
+            require_exists=False,
+        ),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_transfer_action_accepts_stored_mp4_documents() -> None:
+    message = _fake_message(text='Select action:', chat_id=77, message_id=82)
+    callback = _fake_callback(message)
+    state = _FakeState()
+    buffer = ChatMessageBuffer()
+    destination_group = ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1)
+    source_group = ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1)
+    source_sub_group = ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.EXTRA)
+    buffer.append(_fake_message(chat_id=77, message_id=1, text='w251'), chat_id=77)
+    buffer.append(
+        _fake_message(
+            chat_id=77,
+            message_id=2,
+            caption='ignored',
+            document=_fake_document(
+                file_id='f1',
+                file_name=_stored_filename(source_group, source_sub_group, _CLIP_ID_1),
+            ),
+        ),
+        chat_id=77,
+    )
+    clip_store = SimpleNamespace(
+        transfer=AsyncMock(
+            return_value=TransferResult(
+                transferred_count=1,
+                already_in_destination_group_count=0,
+                duplicate_blocked_count=0,
+            )
+        ),
+        compact=AsyncMock(),
+    )
+    services = _services(clip_store=clip_store, buffer=buffer)
+
+    await on_intake_action(
+        callback,
+        SimpleNamespace(action=IntakeAction.TRANSFER),
+        AsyncMock(),
+        services,
+        _settings(),
+        state,
+    )
+
+    clip_store.transfer.assert_awaited_once()
+    assert clip_store.transfer.await_args.kwargs['destination_group'] == destination_group
+    assert clip_store.transfer.await_args.kwargs['clips'] == [
+        intake_module.TransferClipRef(source_group=source_group, clip_id=_CLIP_ID_1)
+    ]
+    message.answer.assert_awaited_once_with(**Text('Transferred: ', Bold('1')).as_kwargs())
+
+
+@pytest.mark.asyncio
+async def test_transfer_action_reports_already_in_destination_and_duplicate_blocked_counts() -> None:
+    message = _fake_message(text='Select action:', chat_id=77, message_id=80)
+    callback = _fake_callback(message)
+    state = _FakeState()
+    buffer = ChatMessageBuffer()
+    source_group = ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1)
+    source_sub_group = ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.COLLECTION)
+    buffer.append(_fake_message(chat_id=77, message_id=1, text='w251'), chat_id=77)
+    buffer.append(
+        _fake_message(
+            chat_id=77,
+            message_id=2,
+            video=_fake_video(file_id='f1', file_name=_stored_filename(source_group, source_sub_group, _CLIP_ID_1)),
+        ),
+        chat_id=77,
+    )
+    clip_store = SimpleNamespace(
+        transfer=AsyncMock(
+            return_value=TransferResult(
+                transferred_count=2,
+                already_in_destination_group_count=1,
+                duplicate_blocked_count=7,
+            )
+        ),
+        compact=AsyncMock(),
+    )
+    services = _services(clip_store=clip_store, buffer=buffer)
+
+    await on_intake_action(
+        callback,
+        SimpleNamespace(action=IntakeAction.TRANSFER),
+        AsyncMock(),
+        services,
+        _settings(),
+        state,
+    )
+
+    message.answer.assert_awaited_once_with(
+        **Text(
+            'Transferred: ',
+            Bold('2'),
+            '\n',
+            'Already in destination group: ',
+            Bold('1'),
+            '\n',
+            'Duplicates exist: ',
+            Bold('7'),
+        ).as_kwargs()
+    )
+    clip_store.compact.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_transfer_action_rejects_fresh_clip_identity_input() -> None:
+    message = _fake_message(text='Select action:', chat_id=77, message_id=81)
+    callback = _fake_callback(message)
+    state = _FakeState()
+    buffer = ChatMessageBuffer()
+    buffer.append(_fake_message(chat_id=77, message_id=1, text='w251'), chat_id=77)
+    buffer.append(
+        _fake_message(
+            chat_id=77,
+            message_id=2,
+            video=_fake_video(file_id='f1', file_name='fresh-upload.mp4'),
+        ),
+        chat_id=77,
+    )
+    clip_store = SimpleNamespace(transfer=AsyncMock(), compact=AsyncMock())
+    services = _services(clip_store=clip_store, buffer=buffer)
+
+    await on_intake_action(
+        callback,
+        SimpleNamespace(action=IntakeAction.TRANSFER),
+        AsyncMock(),
+        services,
+        _settings(),
+        state,
+    )
+
+    clip_store.transfer.assert_not_awaited()
+    message.edit_text.assert_awaited_once_with('External clip(s)', reply_markup=None)
+    assert services.chat_message_buffer.peek_raw(77) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'transfer_error',
+    [
+        UnknownClipsError(clip_ids=[_CLIP_ID_1]),
+        ClipGroupNotFoundError(
+            universe=Universe.WEST,
+            year=2024,
+            season=Season.S1,
+            sub_season=None,
+            scope=None,
+        ),
+    ],
+)
+async def test_transfer_action_surfaces_stale_stored_references_as_external_clips(
+    transfer_error: Exception,
+) -> None:
+    message = _fake_message(text='Select action:', chat_id=77, message_id=83)
+    callback = _fake_callback(message)
+    state = _FakeState()
+    buffer = ChatMessageBuffer()
+    source_group = ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1)
+    source_sub_group = ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.EXTRA)
+    buffer.append(_fake_message(chat_id=77, message_id=1, text='w251'), chat_id=77)
+    buffer.append(
+        _fake_message(
+            chat_id=77,
+            message_id=2,
+            video=_fake_video(file_id='f1', file_name=_stored_filename(source_group, source_sub_group, _CLIP_ID_1)),
+        ),
+        chat_id=77,
+    )
+    clip_store = SimpleNamespace(
+        transfer=AsyncMock(side_effect=transfer_error),
+        compact=AsyncMock(),
+    )
+    services = _services(clip_store=clip_store, buffer=buffer)
+
+    await on_intake_action(
+        callback,
+        SimpleNamespace(action=IntakeAction.TRANSFER),
+        AsyncMock(),
+        services,
+        _settings(),
+        state,
+    )
+
+    assert message.edit_text.await_args_list == [
+        call('Transferring...', reply_markup=None),
+        call('External clip(s)', reply_markup=None),
+    ]
+    message.answer.assert_not_awaited()
+    clip_store.compact.assert_not_awaited()
+    assert services.chat_message_buffer.peek_raw(77) == []
+
+
+@pytest.mark.asyncio
+async def test_transfer_action_surfaces_stale_same_group_reference_as_external_clip() -> None:
+    message = _fake_message(text='Select action:', chat_id=77, message_id=84)
+    callback = _fake_callback(message)
+    state = _FakeState()
+    buffer = ChatMessageBuffer()
+    source_group = ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1)
+    source_sub_group = ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.EXTRA)
+    buffer.append(_fake_message(chat_id=77, message_id=1, text='w251'), chat_id=77)
+    buffer.append(
+        _fake_message(
+            chat_id=77,
+            message_id=2,
+            video=_fake_video(file_id='f1', file_name=_stored_filename(source_group, source_sub_group, _CLIP_ID_1)),
+        ),
+        chat_id=77,
+    )
+    clip_store = SimpleNamespace(
+        transfer=AsyncMock(side_effect=UnknownClipsError(clip_ids=[_CLIP_ID_1])),
+        compact=AsyncMock(),
+    )
+    services = _services(clip_store=clip_store, buffer=buffer)
+
+    await on_intake_action(
+        callback,
+        SimpleNamespace(action=IntakeAction.TRANSFER),
+        AsyncMock(),
+        services,
+        _settings(),
+        state,
+    )
+
+    assert message.edit_text.await_args_list == [
+        call('Transferring...', reply_markup=None),
+        call('External clip(s)', reply_markup=None),
+    ]
+    message.answer.assert_not_awaited()
+    clip_store.compact.assert_not_awaited()
+    assert services.chat_message_buffer.peek_raw(77) == []
 
 
 @pytest.mark.asyncio

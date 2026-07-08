@@ -81,6 +81,14 @@ def plan_route_batches(
 
 
 def parse_route_text(text: str) -> tuple[ClipGroup, SubSeason] | None:
+    return parse_group_selector_text(text, allow_sub_season_suffix=True)
+
+
+def parse_group_selector_text(
+    text: str,
+    *,
+    allow_sub_season_suffix: bool,
+) -> tuple[ClipGroup, SubSeason] | None:
     normalized = text.strip()
     if len(normalized) < 3:
         return None
@@ -91,7 +99,8 @@ def parse_route_text(text: str) -> tuple[ClipGroup, SubSeason] | None:
         universe = Universe.WEST if normalized[0].lower() == 'w' else Universe.EAST
         route_text = normalized[1:]
 
-    if len(route_text) not in {3, 4}:
+    expected_lengths = {3, 4} if allow_sub_season_suffix else {3}
+    if len(route_text) not in expected_lengths:
         return None
 
     year_suffix = route_text[0:2]

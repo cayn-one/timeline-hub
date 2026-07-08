@@ -31,6 +31,8 @@ from timeline_hub.services.clip_store import (
     Season,
     StoreResult,
     SubSeason,
+    TransferClipRef,
+    TransferResult,
     Universe,
     UnknownClipsError,
 )
@@ -178,16 +180,19 @@ class _FakeS3Client:
         objects: dict[str, bytes] | None = None,
         *,
         delete_failures: set[str] | None = None,
+        move_failures: set[tuple[str, str]] | None = None,
         put_failures: set[str] | None = None,
         prefixes: list[str] | None = None,
     ) -> None:
         self.objects = dict(objects or {})
         self.delete_failures = set(delete_failures or set())
+        self.move_failures = set(move_failures or set())
         self.put_failures = set(put_failures or set())
         self.prefixes = list(prefixes or [])
         self.get_calls: list[str] = []
         self.put_calls: list[tuple[str, bytes, str | None]] = []
         self.deleted_keys: list[str] = []
+        self.moved_keys: list[tuple[str, str]] = []
 
     async def put_bytes(self, key: str, data: bytes, *, content_type: str | None = None) -> None:
         if key in self.put_failures:
@@ -217,6 +222,21 @@ class _FakeS3Client:
             raise RuntimeError(f'boom deleting {key}')
         self.deleted_keys.append(key)
         self.objects.pop(key, None)
+
+    async def exists(self, key: str) -> bool:
+        return key in self.objects
+
+    async def move(self, source_key: str, target_key: str, *, overwrite: bool = False) -> None:
+        del overwrite
+        if (source_key, target_key) in self.move_failures:
+            raise RuntimeError(f'boom moving {source_key} -> {target_key}')
+        try:
+            payload = self.objects[source_key]
+        except KeyError as error:
+            raise S3ObjectNotFoundError(source_key) from error
+        self.objects[target_key] = payload
+        self.objects.pop(source_key, None)
+        self.moved_keys.append((source_key, target_key))
 
 
 def _clip_key(*, year: int, season: Season, universe: Universe, clip_id: str) -> str:
@@ -2606,6 +2626,54 @@ async def test_store_deduplicates_same_call_perceptual_duplicate(monkeypatch: py
 
 
 @pytest.mark.asyncio
+async def test_store_reuses_rejected_duplicate_hashes_for_later_same_call_dedup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_hashes(monkeypatch, {b'first': _HASH_B, b'second': _HASH_B})
+
+    async def _compute_frame_count(video_bytes: bytes) -> int:
+        if video_bytes == b'first':
+            return _FRAME_COUNT
+        raise AssertionError('later duplicate hash must short-circuit before frame counting')
+
+    async def _compute_sampled_phashes(video_bytes: bytes, *, frame_count: int) -> tuple[int, ...]:
+        assert video_bytes == b'first'
+        assert frame_count == _FRAME_COUNT
+        return _SAMPLED_PHASHES
+
+    monkeypatch.setattr(clip_store_module, 'compute_video_frame_count', _compute_frame_count)
+    monkeypatch.setattr(clip_store_module, 'compute_video_sampled_phashes', _compute_sampled_phashes)
+    manifest_key = _manifest_key(year=2024, season=Season.S1, universe=Universe.WEST)
+    store = _store(
+        _FakeS3Client(
+            {
+                manifest_key: _manifest_bytes(
+                    [
+                        _entry(
+                            id=_UUID_1,
+                            video_hash=_HASH_A,
+                            sampled_phashes=_SAMPLED_PHASHES,
+                            sub_season=SubSeason.C,
+                            scope=Scope.SOURCE,
+                            batch=1,
+                            order=1,
+                        )
+                    ]
+                )
+            }
+        )
+    )
+
+    result = await store.store(
+        ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1),
+        ClipSubGroup(sub_season=SubSeason.C, scope=Scope.SOURCE),
+        clips=[_mp4_file(b'first'), _mp4_file(b'second')],
+    )
+
+    assert result == StoreResult(stored_count=0, duplicate_count=2)
+
+
+@pytest.mark.asyncio
 async def test_store_rejects_non_mp4_filebytes() -> None:
     store = _store(_FakeS3Client())
 
@@ -3678,6 +3746,508 @@ async def test_move_rejects_clip_ids_already_in_target_sub_group() -> None:
             target_sub_group=ClipSubGroup(sub_season=SubSeason.A, scope=Scope.COLLECTION),
             clip_id_batches=[[_UUID_2, _UUID_1]],
         )
+
+
+@pytest.mark.asyncio
+async def test_transfer_ignores_same_group_clip_without_touching_storage() -> None:
+    source_group = ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1)
+    source_sub_group = ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.EXTRA)
+    manifest_key = _manifest_key(year=2024, season=Season.S1, universe=Universe.WEST)
+    clip_key = _clip_key(year=2024, season=Season.S1, universe=Universe.WEST, clip_id=_UUID_1)
+    s3_client = _FakeS3Client(
+        {
+            manifest_key: _manifest_bytes(
+                [
+                    _entry(
+                        id=_UUID_1,
+                        video_hash=_HASH_A,
+                        sub_season=source_sub_group.sub_season,
+                        scope=source_sub_group.scope,
+                        batch=1,
+                        order=1,
+                    )
+                ]
+            ),
+            clip_key: b'one',
+        }
+    )
+    store = _store(s3_client)
+
+    result = await store.transfer(
+        destination_group=source_group,
+        clips=[TransferClipRef(source_group=source_group, clip_id=_UUID_1)],
+    )
+
+    assert result == TransferResult(
+        transferred_count=0,
+        already_in_destination_group_count=1,
+        duplicate_blocked_count=0,
+    )
+    assert s3_client.moved_keys == []
+    assert s3_client.put_calls == []
+    assert json.loads(s3_client.objects[manifest_key].decode('utf-8')) == _manifest_payload(
+        [
+            _entry(
+                id=_UUID_1,
+                video_hash=_HASH_A,
+                sub_season=source_sub_group.sub_season,
+                scope=source_sub_group.scope,
+                batch=1,
+                order=1,
+            )
+        ]
+    )
+
+
+@pytest.mark.asyncio
+async def test_transfer_same_group_requires_existing_manifest_entry() -> None:
+    source_group = ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1)
+    manifest_key = _manifest_key(year=2024, season=Season.S1, universe=Universe.WEST)
+    s3_client = _FakeS3Client({manifest_key: _manifest_bytes([])})
+    store = _store(s3_client)
+
+    with pytest.raises(UnknownClipsError, match=_UUID_1):
+        await store.transfer(
+            destination_group=source_group,
+            clips=[TransferClipRef(source_group=source_group, clip_id=_UUID_1)],
+        )
+
+
+@pytest.mark.asyncio
+async def test_transfer_moves_clip_to_destination_and_rewrites_manifests() -> None:
+    source_group = ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1)
+    destination_group = ClipGroup(universe=Universe.WEST, year=2024, season=Season.S2)
+    source_sub_group = ClipSubGroup(sub_season=SubSeason.B, scope=Scope.SOURCE)
+    source_manifest_key = _manifest_key(year=2024, season=Season.S1, universe=Universe.WEST)
+    destination_manifest_key = _manifest_key(year=2024, season=Season.S2, universe=Universe.WEST)
+    source_clip_key = _clip_key(year=2024, season=Season.S1, universe=Universe.WEST, clip_id=_UUID_1)
+    destination_clip_key = _clip_key(year=2024, season=Season.S2, universe=Universe.WEST, clip_id=_UUID_1)
+    source_normalized_key = _normalized_clip_key(year=2024, season=Season.S1, universe=Universe.WEST, clip_id=_UUID_1)
+    destination_normalized_key = _normalized_clip_key(
+        year=2024,
+        season=Season.S2,
+        universe=Universe.WEST,
+        clip_id=_UUID_1,
+    )
+    normalization = AudioNormalization(loudness=-14, bitrate=128)
+    s3_client = _FakeS3Client(
+        {
+            source_manifest_key: _manifest_bytes(
+                [
+                    _entry(
+                        id=_UUID_1,
+                        video_hash=_HASH_A,
+                        sub_season=source_sub_group.sub_season,
+                        scope=source_sub_group.scope,
+                        batch=3,
+                        order=1,
+                        audio_normalization=normalization,
+                    )
+                ]
+            ),
+            source_clip_key: b'one',
+            source_normalized_key: b'normalized-one',
+        }
+    )
+    store = _store(s3_client)
+
+    result = await store.transfer(
+        destination_group=destination_group,
+        clips=[TransferClipRef(source_group=source_group, clip_id=_UUID_1)],
+    )
+
+    assert result == TransferResult(
+        transferred_count=1,
+        already_in_destination_group_count=0,
+        duplicate_blocked_count=0,
+        affected_sub_groups=(
+            (source_group, source_sub_group),
+            (destination_group, source_sub_group),
+        ),
+    )
+    assert s3_client.moved_keys == [
+        (source_clip_key, destination_clip_key),
+        (source_normalized_key, destination_normalized_key),
+    ]
+    assert source_manifest_key not in s3_client.objects
+    assert json.loads(s3_client.objects[destination_manifest_key].decode('utf-8')) == _manifest_payload(
+        [
+            _entry(
+                id=_UUID_1,
+                video_hash=_HASH_A,
+                sub_season=source_sub_group.sub_season,
+                scope=source_sub_group.scope,
+                batch=1,
+                order=1,
+                audio_normalization=normalization,
+            )
+        ]
+    )
+
+
+@pytest.mark.asyncio
+async def test_transfer_deduplicates_against_destination_without_moving_source() -> None:
+    source_group = ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1)
+    destination_group = ClipGroup(universe=Universe.WEST, year=2024, season=Season.S2)
+    source_manifest_key = _manifest_key(year=2024, season=Season.S1, universe=Universe.WEST)
+    destination_manifest_key = _manifest_key(year=2024, season=Season.S2, universe=Universe.WEST)
+    source_clip_key = _clip_key(year=2024, season=Season.S1, universe=Universe.WEST, clip_id=_UUID_1)
+    s3_client = _FakeS3Client(
+        {
+            source_manifest_key: _manifest_bytes(
+                [
+                    _entry(
+                        id=_UUID_1,
+                        video_hash=_HASH_A,
+                        sub_season=SubSeason.NONE,
+                        scope=Scope.EXTRA,
+                        batch=1,
+                        order=1,
+                    )
+                ]
+            ),
+            destination_manifest_key: _manifest_bytes(
+                [
+                    _entry(
+                        id=_UUID_2,
+                        video_hash=_HASH_A,
+                        sub_season=SubSeason.NONE,
+                        scope=Scope.EXTRA,
+                        batch=1,
+                        order=1,
+                    )
+                ]
+            ),
+            source_clip_key: b'one',
+        }
+    )
+    store = _store(s3_client)
+
+    result = await store.transfer(
+        destination_group=destination_group,
+        clips=[TransferClipRef(source_group=source_group, clip_id=_UUID_1)],
+    )
+
+    assert result == TransferResult(
+        transferred_count=0,
+        already_in_destination_group_count=0,
+        duplicate_blocked_count=1,
+    )
+    assert source_clip_key in s3_client.objects
+    assert s3_client.moved_keys == []
+    assert json.loads(s3_client.objects[source_manifest_key].decode('utf-8')) == _manifest_payload(
+        [
+            _entry(
+                id=_UUID_1,
+                video_hash=_HASH_A,
+                sub_season=SubSeason.NONE,
+                scope=Scope.EXTRA,
+                batch=1,
+                order=1,
+            )
+        ]
+    )
+
+
+@pytest.mark.asyncio
+async def test_transfer_excludes_source_identity_from_neighbor_dedup() -> None:
+    source_group = ClipGroup(universe=Universe.WEST, year=2025, season=Season.S5)
+    destination_group = ClipGroup(universe=Universe.WEST, year=2026, season=Season.S1)
+    source_manifest_key = _manifest_key(year=2025, season=Season.S5, universe=Universe.WEST)
+    destination_clip_key = _clip_key(year=2026, season=Season.S1, universe=Universe.WEST, clip_id=_UUID_1)
+    source_clip_key = _clip_key(year=2025, season=Season.S5, universe=Universe.WEST, clip_id=_UUID_1)
+    s3_client = _FakeS3Client(
+        {
+            source_manifest_key: _manifest_bytes(
+                [
+                    _entry(
+                        id=_UUID_1,
+                        video_hash=_HASH_A,
+                        sub_season=SubSeason.NONE,
+                        scope=Scope.EXTRA,
+                        batch=1,
+                        order=1,
+                    )
+                ]
+            ),
+            source_clip_key: b'one',
+        }
+    )
+    store = _store(s3_client)
+
+    result = await store.transfer(
+        destination_group=destination_group,
+        clips=[TransferClipRef(source_group=source_group, clip_id=_UUID_1)],
+    )
+
+    assert result.transferred_count == 1
+    assert result.duplicate_blocked_count == 0
+    assert s3_client.moved_keys == [(source_clip_key, destination_clip_key)]
+
+
+@pytest.mark.asyncio
+async def test_transfer_excludes_all_transferred_neighbor_clips_from_destination_dedup() -> None:
+    previous_group = ClipGroup(universe=Universe.WEST, year=2025, season=Season.S5)
+    destination_group = ClipGroup(universe=Universe.WEST, year=2026, season=Season.S1)
+    next_group = ClipGroup(universe=Universe.WEST, year=2026, season=Season.S2)
+    previous_manifest_key = _manifest_key(year=2025, season=Season.S5, universe=Universe.WEST)
+    destination_manifest_key = _manifest_key(year=2026, season=Season.S1, universe=Universe.WEST)
+    next_manifest_key = _manifest_key(year=2026, season=Season.S2, universe=Universe.WEST)
+    previous_clip_key = _clip_key(year=2025, season=Season.S5, universe=Universe.WEST, clip_id=_UUID_1)
+    next_clip_key = _clip_key(year=2026, season=Season.S2, universe=Universe.WEST, clip_id=_UUID_2)
+    s3_client = _FakeS3Client(
+        {
+            previous_manifest_key: _manifest_bytes(
+                [
+                    _entry(
+                        id=_UUID_1,
+                        video_hash=_HASH_A,
+                        sub_season=SubSeason.NONE,
+                        scope=Scope.EXTRA,
+                        batch=1,
+                        order=1,
+                    )
+                ]
+            ),
+            destination_manifest_key: _manifest_bytes([]),
+            next_manifest_key: _manifest_bytes(
+                [
+                    _entry(
+                        id=_UUID_2,
+                        video_hash=_HASH_A,
+                        sub_season=SubSeason.NONE,
+                        scope=Scope.EXTRA,
+                        batch=1,
+                        order=1,
+                    )
+                ]
+            ),
+            previous_clip_key: b'one',
+            next_clip_key: b'two',
+        }
+    )
+    store = _store(s3_client)
+
+    result = await store.transfer(
+        destination_group=destination_group,
+        clips=[
+            TransferClipRef(source_group=previous_group, clip_id=_UUID_1),
+            TransferClipRef(source_group=next_group, clip_id=_UUID_2),
+        ],
+    )
+
+    assert result == TransferResult(
+        transferred_count=0,
+        already_in_destination_group_count=0,
+        duplicate_blocked_count=2,
+    )
+    assert s3_client.moved_keys == []
+    assert json.loads(s3_client.objects[previous_manifest_key].decode('utf-8')) == _manifest_payload(
+        [
+            _entry(
+                id=_UUID_1,
+                video_hash=_HASH_A,
+                sub_season=SubSeason.NONE,
+                scope=Scope.EXTRA,
+                batch=1,
+                order=1,
+            )
+        ]
+    )
+    assert next_clip_key in s3_client.objects
+    assert json.loads(s3_client.objects[next_manifest_key].decode('utf-8')) == _manifest_payload(
+        [
+            _entry(
+                id=_UUID_2,
+                video_hash=_HASH_A,
+                sub_season=SubSeason.NONE,
+                scope=Scope.EXTRA,
+                batch=1,
+                order=1,
+            )
+        ]
+    )
+    assert json.loads(s3_client.objects[destination_manifest_key].decode('utf-8')) == _manifest_payload([])
+
+
+@pytest.mark.asyncio
+async def test_transfer_does_not_deny_duplicate_far_source_outside_destination_neighbor_scope() -> None:
+    previous_group = ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1)
+    destination_group = ClipGroup(universe=Universe.WEST, year=2025, season=Season.S2)
+    far_group = ClipGroup(universe=Universe.WEST, year=2025, season=Season.S4)
+    previous_manifest_key = _manifest_key(year=2025, season=Season.S1, universe=Universe.WEST)
+    destination_manifest_key = _manifest_key(year=2025, season=Season.S2, universe=Universe.WEST)
+    far_manifest_key = _manifest_key(year=2025, season=Season.S4, universe=Universe.WEST)
+    previous_clip_key = _clip_key(year=2025, season=Season.S1, universe=Universe.WEST, clip_id=_UUID_1)
+    far_clip_key = _clip_key(year=2025, season=Season.S4, universe=Universe.WEST, clip_id=_UUID_2)
+    destination_clip_key_1 = _clip_key(year=2025, season=Season.S2, universe=Universe.WEST, clip_id=_UUID_1)
+    destination_clip_key_2 = _clip_key(year=2025, season=Season.S2, universe=Universe.WEST, clip_id=_UUID_2)
+    s3_client = _FakeS3Client(
+        {
+            previous_manifest_key: _manifest_bytes(
+                [
+                    _entry(
+                        id=_UUID_1,
+                        video_hash=_HASH_A,
+                        sub_season=SubSeason.NONE,
+                        scope=Scope.EXTRA,
+                        batch=1,
+                        order=1,
+                    )
+                ]
+            ),
+            destination_manifest_key: _manifest_bytes([]),
+            far_manifest_key: _manifest_bytes(
+                [
+                    _entry(
+                        id=_UUID_2,
+                        video_hash=_HASH_A,
+                        sub_season=SubSeason.NONE,
+                        scope=Scope.EXTRA,
+                        batch=1,
+                        order=1,
+                    )
+                ]
+            ),
+            previous_clip_key: b'one',
+            far_clip_key: b'two',
+        }
+    )
+    store = _store(s3_client)
+
+    result = await store.transfer(
+        destination_group=destination_group,
+        clips=[
+            TransferClipRef(source_group=previous_group, clip_id=_UUID_1),
+            TransferClipRef(source_group=far_group, clip_id=_UUID_2),
+        ],
+    )
+
+    assert result == TransferResult(
+        transferred_count=2,
+        already_in_destination_group_count=0,
+        duplicate_blocked_count=0,
+        affected_sub_groups=(
+            (previous_group, ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.EXTRA)),
+            (destination_group, ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.EXTRA)),
+            (far_group, ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.EXTRA)),
+        ),
+    )
+    assert s3_client.moved_keys == [
+        (previous_clip_key, destination_clip_key_1),
+        (far_clip_key, destination_clip_key_2),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_transfer_denies_same_year_previous_and_next_neighbor_conflict() -> None:
+    previous_group = ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1)
+    destination_group = ClipGroup(universe=Universe.WEST, year=2025, season=Season.S2)
+    next_group = ClipGroup(universe=Universe.WEST, year=2025, season=Season.S3)
+    previous_manifest_key = _manifest_key(year=2025, season=Season.S1, universe=Universe.WEST)
+    destination_manifest_key = _manifest_key(year=2025, season=Season.S2, universe=Universe.WEST)
+    next_manifest_key = _manifest_key(year=2025, season=Season.S3, universe=Universe.WEST)
+    previous_clip_key = _clip_key(year=2025, season=Season.S1, universe=Universe.WEST, clip_id=_UUID_1)
+    next_clip_key = _clip_key(year=2025, season=Season.S3, universe=Universe.WEST, clip_id=_UUID_2)
+    s3_client = _FakeS3Client(
+        {
+            previous_manifest_key: _manifest_bytes(
+                [
+                    _entry(
+                        id=_UUID_1,
+                        video_hash=_HASH_A,
+                        sub_season=SubSeason.NONE,
+                        scope=Scope.EXTRA,
+                        batch=1,
+                        order=1,
+                    )
+                ]
+            ),
+            destination_manifest_key: _manifest_bytes([]),
+            next_manifest_key: _manifest_bytes(
+                [
+                    _entry(
+                        id=_UUID_2,
+                        video_hash=_HASH_A,
+                        sub_season=SubSeason.NONE,
+                        scope=Scope.EXTRA,
+                        batch=1,
+                        order=1,
+                    )
+                ]
+            ),
+            previous_clip_key: b'one',
+            next_clip_key: b'two',
+        }
+    )
+    store = _store(s3_client)
+
+    result = await store.transfer(
+        destination_group=destination_group,
+        clips=[
+            TransferClipRef(source_group=previous_group, clip_id=_UUID_1),
+            TransferClipRef(source_group=next_group, clip_id=_UUID_2),
+        ],
+    )
+
+    assert result == TransferResult(
+        transferred_count=0,
+        already_in_destination_group_count=0,
+        duplicate_blocked_count=2,
+    )
+    assert s3_client.moved_keys == []
+    assert json.loads(s3_client.objects[destination_manifest_key].decode('utf-8')) == _manifest_payload([])
+
+
+@pytest.mark.asyncio
+async def test_transfer_fails_loudly_when_destination_already_contains_clip_id() -> None:
+    source_group = ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1)
+    destination_group = ClipGroup(universe=Universe.WEST, year=2024, season=Season.S2)
+    source_manifest_key = _manifest_key(year=2024, season=Season.S1, universe=Universe.WEST)
+    destination_manifest_key = _manifest_key(year=2024, season=Season.S2, universe=Universe.WEST)
+    source_clip_key = _clip_key(year=2024, season=Season.S1, universe=Universe.WEST, clip_id=_UUID_1)
+    source_manifest_entries = [
+        _entry(
+            id=_UUID_1,
+            video_hash=_HASH_A,
+            sub_season=SubSeason.NONE,
+            scope=Scope.EXTRA,
+            batch=1,
+            order=1,
+        )
+    ]
+    destination_manifest_entries = [
+        _entry(
+            id=_UUID_1,
+            video_hash=_HASH_B,
+            sub_season=SubSeason.NONE,
+            scope=Scope.EXTRA,
+            batch=1,
+            order=1,
+        )
+    ]
+    s3_client = _FakeS3Client(
+        {
+            source_manifest_key: _manifest_bytes(source_manifest_entries),
+            destination_manifest_key: _manifest_bytes(destination_manifest_entries),
+            source_clip_key: b'one',
+        }
+    )
+    store = _store(s3_client)
+
+    with pytest.raises(RuntimeError, match='already contains clip id'):
+        await store.transfer(
+            destination_group=destination_group,
+            clips=[TransferClipRef(source_group=source_group, clip_id=_UUID_1)],
+        )
+
+    assert s3_client.moved_keys == []
+    assert json.loads(s3_client.objects[source_manifest_key].decode('utf-8')) == _manifest_payload(
+        source_manifest_entries
+    )
+    assert json.loads(s3_client.objects[destination_manifest_key].decode('utf-8')) == _manifest_payload(
+        destination_manifest_entries
+    )
 
 
 @pytest.mark.asyncio

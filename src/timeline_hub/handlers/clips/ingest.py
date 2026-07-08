@@ -67,6 +67,7 @@ from timeline_hub.handlers.clips.reorder_flow import (
 )
 from timeline_hub.handlers.clips.route_planning import RouteBatch, plan_route_batches
 from timeline_hub.handlers.clips.store_execution import _uses_dense_layout, execute_store_or_produce
+from timeline_hub.handlers.clips.transfer_planning import TransferBatch, plan_transfer_batches
 from timeline_hub.handlers.menu import (
     callback_message,
     create_padding_line,
@@ -89,6 +90,8 @@ from timeline_hub.services.clip_store import (
     Season,
     StoreResult,
     SubSeason,
+    TransferClipRef,
+    TransferResult,
     Universe,
     UnknownClipsError,
 )
@@ -111,6 +114,7 @@ class IntakeAction(StrEnum):
     REORDER = auto()
     COMPACT = auto()
     ROUTE = auto()
+    TRANSFER = auto()
     STORE = auto()
     PRODUCE = auto()
     REMOVE = auto()
@@ -134,6 +138,11 @@ class _RouteResult:
     store_result: StoreResult
     compact_targets: list[tuple[ClipGroup, SubSeason]]
     error_text: str | None = None
+
+
+@dataclass(slots=True)
+class _TransferExecutionResult:
+    transfer_result: TransferResult
 
 
 def _pack_intake_menu_callback(action: MenuAction, step: MenuStep, value: str) -> str:
@@ -457,6 +466,55 @@ async def on_intake_action(
                         'post-store clip compaction failed for {} {}',
                         clip_group,
                         ClipSubGroup(sub_season=sub_season, scope=Scope.SOURCE),
+                    )
+                    raise
+
+        case IntakeAction.TRANSFER:
+            await state.clear()
+            transfer_message_groups = services.chat_message_buffer.peek_grouped(message.chat.id)
+            services.chat_message_buffer.flush(message.chat.id)
+            transfer_batches, error_text = plan_transfer_batches(transfer_message_groups, settings=settings)
+            if error_text is not None:
+                await message.edit_text(error_text, reply_markup=None)
+                return
+            if not transfer_batches:
+                await message.edit_text('No clips received', reply_markup=None)
+                return
+
+            await message.edit_text('Transferring...', reply_markup=None)
+
+            async def update_transfer_progress(selection_batches: Sequence[TransferBatch]) -> None:
+                await message.edit_text(
+                    **_transfer_progress_kwargs(selection_batches),
+                    reply_markup=None,
+                )
+
+            try:
+                transfer_result = await _transfer_clip_batches(
+                    services=services,
+                    transfer_batches=transfer_batches,
+                    on_batch_transferred=update_transfer_progress,
+                )
+            except ClipGroupNotFoundError, UnknownClipsError:
+                await message.edit_text('External clip(s)', reply_markup=None)
+                return
+            await message.answer(**_transfer_summary_kwargs(transfer_result.transfer_result))
+
+            for clip_group, clip_sub_group in transfer_result.transfer_result.affected_sub_groups:
+                if not _uses_dense_layout(clip_sub_group.scope):
+                    continue
+                try:
+                    await services.clip_store.compact(
+                        clip_group,
+                        clip_sub_group,
+                        batch_size=_TELEGRAM_MEDIA_GROUP_LIMIT,
+                        require_exists=False,
+                    )
+                except Exception:
+                    logger.exception(
+                        'post-transfer clip compaction failed for {} {}',
+                        clip_group,
+                        clip_sub_group,
                     )
                     raise
 
@@ -1201,6 +1259,58 @@ async def _store_route_batches(
     )
 
 
+async def _transfer_clip_batches(
+    *,
+    services: Services,
+    transfer_batches: Sequence[TransferBatch],
+    on_batch_transferred: Callable[[Sequence[TransferBatch]], Awaitable[None]] | None = None,
+) -> _TransferExecutionResult:
+    result = TransferResult(
+        transferred_count=0,
+        already_in_destination_group_count=0,
+        duplicate_blocked_count=0,
+    )
+    completed_transfer_batches: list[TransferBatch] = []
+    affected_sub_groups: list[tuple[ClipGroup, ClipSubGroup]] = []
+    affected_sub_group_set: set[tuple[ClipGroup, ClipSubGroup]] = set()
+
+    for transfer_batch in transfer_batches:
+        batch_result = await services.clip_store.transfer(
+            destination_group=transfer_batch.destination_group,
+            clips=[
+                TransferClipRef(
+                    source_group=clip.source_group,
+                    clip_id=clip.clip_id,
+                )
+                for clip in transfer_batch.clips
+            ],
+        )
+        result = TransferResult(
+            transferred_count=result.transferred_count + batch_result.transferred_count,
+            already_in_destination_group_count=(
+                result.already_in_destination_group_count + batch_result.already_in_destination_group_count
+            ),
+            duplicate_blocked_count=result.duplicate_blocked_count + batch_result.duplicate_blocked_count,
+        )
+        for affected_sub_group in batch_result.affected_sub_groups:
+            if affected_sub_group in affected_sub_group_set:
+                continue
+            affected_sub_group_set.add(affected_sub_group)
+            affected_sub_groups.append(affected_sub_group)
+        completed_transfer_batches.append(transfer_batch)
+        if on_batch_transferred is not None:
+            await on_batch_transferred(completed_transfer_batches)
+
+    return _TransferExecutionResult(
+        transfer_result=TransferResult(
+            transferred_count=result.transferred_count,
+            already_in_destination_group_count=result.already_in_destination_group_count,
+            duplicate_blocked_count=result.duplicate_blocked_count,
+            affected_sub_groups=tuple(affected_sub_groups),
+        )
+    )
+
+
 async def _clip_messages_to_clip_files(
     *,
     bot: Bot,
@@ -1353,11 +1463,14 @@ def _intake_action_menu_kwargs(
     clip_count = clip_count_override
     has_video_clip_messages = False
     has_document_clip_messages = False
+    has_standalone_text_messages = False
     if clip_count is None:
         clip_count = 0
     for message in raw_messages:
         if message.video is not None:
             has_video_clip_messages = True
+        if isinstance(message.text, str) and message.text.strip():
+            has_standalone_text_messages = True
         clip_file_id = extract_clip_file_id(message)
         if clip_file_id is not None:
             if clip_count_override is None:
@@ -1368,7 +1481,12 @@ def _intake_action_menu_kwargs(
         return None
     buffer_version = services.chat_message_buffer.version(chat_id)
     document_only_clip_buffer = has_document_clip_messages and not has_video_clip_messages
-    if document_only_clip_buffer:
+    if has_standalone_text_messages:
+        action_buttons = [
+            _create_intake_action_button(IntakeAction.ROUTE, buffer_version=buffer_version),
+            _create_intake_action_button(IntakeAction.TRANSFER, buffer_version=buffer_version),
+        ]
+    elif document_only_clip_buffer:
         action_buttons = [
             _create_intake_action_button(IntakeAction.ROUTE, buffer_version=buffer_version),
             _create_intake_action_button(IntakeAction.PRODUCE, buffer_version=buffer_version),
@@ -1449,6 +1567,26 @@ def _route_progress_kwargs(route_batches: Sequence[RouteBatch]) -> dict[str, Any
                         season=route_batch.clip_group.season,
                         sub_season=route_batch.sub_season,
                         scope=Scope.SOURCE,
+                    )
+                ),
+            ]
+        )
+
+    return Text(*parts).as_kwargs()
+
+
+def _transfer_progress_kwargs(transfer_batches: Sequence[TransferBatch]) -> dict[str, Any]:
+    parts: list[object] = ['Transferring...']
+
+    for transfer_batch in transfer_batches:
+        parts.extend(
+            [
+                '\n',
+                _route_progress_line(
+                    selection_labels(
+                        universe=transfer_batch.destination_group.universe,
+                        year=transfer_batch.destination_group.year,
+                        season=transfer_batch.destination_group.season,
                     )
                 ),
             ]
@@ -1550,6 +1688,33 @@ def _reconcile_summary_kwargs(result: ReconcileResult) -> dict[str, Any]:
             parts.append('\n')
         parts.extend(['Removed: ', Bold(str(result.removed))])
 
+    return Text(*parts).as_kwargs()
+
+
+def _transfer_summary_kwargs(result: TransferResult) -> dict[str, Any]:
+    if (
+        result.transferred_count == 0
+        and result.already_in_destination_group_count == 0
+        and result.duplicate_blocked_count == 0
+    ):
+        return {'text': 'Nothing changed'}
+
+    parts: list[object] = []
+    if result.transferred_count > 0:
+        parts.extend(['Transferred: ', Bold(str(result.transferred_count))])
+    if result.already_in_destination_group_count > 0:
+        if parts:
+            parts.append('\n')
+        parts.extend(
+            [
+                'Already in destination group: ',
+                Bold(str(result.already_in_destination_group_count)),
+            ]
+        )
+    if result.duplicate_blocked_count > 0:
+        if parts:
+            parts.append('\n')
+        parts.extend(['Duplicates exist: ', Bold(str(result.duplicate_blocked_count))])
     return Text(*parts).as_kwargs()
 
 
