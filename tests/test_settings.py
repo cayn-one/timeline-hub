@@ -38,6 +38,7 @@ _CONFIG_CONTENT = dedent(
     namespace = "clips"
     normalization_loudness = -14
     normalization_bitrate = 128
+    max_s3_concurrency = 8
     sampled_phash_mean_threshold = 1.5
 
     [tracks]
@@ -60,6 +61,7 @@ _DEV_CONFIG_CONTENT = dedent(
     namespace = "clips-dev"
     normalization_loudness = -12
     normalization_bitrate = 96
+    max_s3_concurrency = 4
     sampled_phash_mean_threshold = 2.5
 
     [dev.tracks]
@@ -119,6 +121,7 @@ def test_settings_load_reads_production_config_and_env_values(
     assert settings.clip_namespace == 'clips'
     assert settings.normalization_loudness == -14
     assert settings.normalization_bitrate == 128
+    assert settings.max_s3_concurrency == 8
     assert settings.sampled_phash_mean_threshold == 1.5
     assert settings.track_namespace == 'tracks'
     assert settings.variant_max_duration == timedelta(minutes=30)
@@ -143,6 +146,7 @@ def test_settings_load_applies_dev_overrides_from_same_file(
     assert settings.clip_namespace == 'clips-dev'
     assert settings.normalization_loudness == -12
     assert settings.normalization_bitrate == 96
+    assert settings.max_s3_concurrency == 4
     assert settings.sampled_phash_mean_threshold == 2.5
     assert settings.track_namespace == 'tracks-dev'
     assert settings.variant_max_duration == timedelta(minutes=1)
@@ -173,6 +177,7 @@ def test_settings_load_rejects_unknown_config_keys(
             namespace = "clips"
             normalization_loudness = -14
             normalization_bitrate = 128
+            max_s3_concurrency = 8
             sampled_phash_mean_threshold = 1.5
 
             [tracks]
@@ -276,6 +281,46 @@ def test_settings_load_rejects_zero_sampled_phash_mean_threshold(
             _CONFIG_CONTENT,
             old='sampled_phash_mean_threshold = 1.5',
             new='sampled_phash_mean_threshold = 0',
+        ),
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(settings_module, 'CONFIG_PATH', tmp_path / 'config.toml')
+
+    with pytest.raises(ValidationError):
+        Settings.load(is_dev=False)
+
+
+def test_settings_load_rejects_zero_max_s3_concurrency(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _clear_runtime_env(monkeypatch)
+    _write_runtime_files(
+        tmp_path,
+        config_content=_replace_config_line(
+            _CONFIG_CONTENT,
+            old='max_s3_concurrency = 8',
+            new='max_s3_concurrency = 0',
+        ),
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(settings_module, 'CONFIG_PATH', tmp_path / 'config.toml')
+
+    with pytest.raises(ValidationError):
+        Settings.load(is_dev=False)
+
+
+def test_settings_load_rejects_negative_max_s3_concurrency(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _clear_runtime_env(monkeypatch)
+    _write_runtime_files(
+        tmp_path,
+        config_content=_replace_config_line(
+            _CONFIG_CONTENT,
+            old='max_s3_concurrency = 8',
+            new='max_s3_concurrency = -1',
         ),
     )
     monkeypatch.chdir(tmp_path)

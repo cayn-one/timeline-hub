@@ -65,6 +65,7 @@ async def _main(settings: Settings) -> None:
             clip_store=ClipStore(
                 s3_client,
                 namespace=settings.clip_namespace,
+                max_s3_concurrency=settings.max_s3_concurrency,
                 sampled_phash_mean_threshold=settings.sampled_phash_mean_threshold,
             ),
             track_store=TrackStore(

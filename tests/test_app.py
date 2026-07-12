@@ -60,6 +60,7 @@ async def test_main_wires_storage_namespaces_into_stores(monkeypatch: pytest.Mon
         clip_namespace='clips-dev',
         normalization_loudness=-14,
         normalization_bitrate=128,
+        max_s3_concurrency=8,
         sampled_phash_mean_threshold=1.5,
         track_namespace='tracks-dev',
         variant_max_duration=timedelta(minutes=30),
@@ -108,6 +109,7 @@ async def test_main_wires_storage_namespaces_into_stores(monkeypatch: pytest.Mon
     clip_store_ctor.assert_called_once_with(
         s3_client,
         namespace='clips-dev',
+        max_s3_concurrency=8,
         sampled_phash_mean_threshold=1.5,
     )
     preset_store_ctor.assert_called_once()

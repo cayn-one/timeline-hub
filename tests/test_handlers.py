@@ -65,6 +65,7 @@ from timeline_hub.handlers.clips.retrieve import (
     on_retrieve_menu,
 )
 from timeline_hub.handlers.clips.route_planning import parse_route_text
+from timeline_hub.handlers.clips.transfer_planning import plan_transfer_batches
 from timeline_hub.handlers.intake import (
     IntakeFallbackCallbackData,
     on_buffered_relevant_message,
@@ -394,6 +395,7 @@ def _settings(**overrides: object) -> SimpleNamespace:
         'min_year': 2022,
         'normalization_loudness': -14,
         'normalization_bitrate': 128,
+        'max_s3_concurrency': 8,
         'message_width': 35,
         'variant_max_duration': timedelta(minutes=15),
         'slowest_variant_speed': 0.5,
@@ -741,7 +743,7 @@ def test_route_progress_kwargs_preserves_arrow_path_rendering_without_route_labe
 
 
 def _transfer_progress_kwargs(*routes: tuple[str, ...]) -> dict[str, object]:
-    parts: list[object] = ['Transferring...']
+    parts: list[object] = ['Routing...']
     for route in routes:
         line_parts: list[object] = ['→ ']
         for index, value in enumerate(route):
@@ -891,6 +893,58 @@ def test_parse_route_text_accepts_case_insensitive_universe(
 )
 def test_parse_route_text_rejects_invalid_suffixes(text: str) -> None:
     assert parse_route_text(text) is None
+
+
+def test_plan_transfer_batches_keeps_current_destination_across_non_route_captions() -> None:
+    source_group = ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1)
+    source_sub_group = ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.EXTRA)
+
+    batches, error_text = plan_transfer_batches(
+        [
+            [
+                _fake_message(
+                    chat_id=77,
+                    message_id=1,
+                    caption='w251',
+                    video=_fake_video(
+                        file_id='f1',
+                        file_name=_stored_filename(source_group, source_sub_group, _CLIP_ID_1),
+                    ),
+                )
+            ],
+            [
+                _fake_message(
+                    chat_id=77,
+                    message_id=2,
+                    caption='Funny clip',
+                    video=_fake_video(
+                        file_id='f2',
+                        file_name=_stored_filename(source_group, source_sub_group, _CLIP_ID_2),
+                    ),
+                )
+            ],
+            [
+                _fake_message(
+                    chat_id=77,
+                    message_id=3,
+                    video=_fake_video(
+                        file_id='f3',
+                        file_name=_stored_filename(source_group, source_sub_group, _CLIP_ID_3),
+                    ),
+                )
+            ],
+        ],
+        settings=_settings(),
+    )
+
+    assert error_text is None
+    assert len(batches) == 1
+    assert batches[0].destination_group == ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1)
+    assert [(clip.source_group, clip.clip_id) for clip in batches[0].clips] == [
+        (source_group, _CLIP_ID_1),
+        (source_group, _CLIP_ID_2),
+        (source_group, _CLIP_ID_3),
+    ]
 
 
 @pytest.mark.asyncio
@@ -1917,7 +1971,6 @@ async def test_video_dispatch_to_clip_action_menu() -> None:
             for action in [
                 IntakeAction.REORDER,
                 IntakeAction.COMPACT,
-                IntakeAction.ROUTE,
                 IntakeAction.REMOVE,
                 IntakeAction.PRODUCE,
                 IntakeAction.RECONCILE,
@@ -1932,6 +1985,11 @@ async def test_video_dispatch_to_clip_action_menu() -> None:
         ),
     )
     assert reply_markup == expected_reply_markup
+    assert _keyboard_rows(reply_markup) == [
+        ['Produce', 'Reorder'],
+        ['Reconcile', 'Remove', 'Compact'],
+        ['Cancel'],
+    ]
     assert [buffered_message.message_id for buffered_message in services.chat_message_buffer.peek_raw(42)] == [1]
 
 
@@ -1972,10 +2030,7 @@ async def test_document_only_mp4_dispatch_to_restricted_clip_action_menu() -> No
                     buffer_version=services.chat_message_buffer.version(42),
                 ).pack(),
             )
-            for action in [
-                IntakeAction.ROUTE,
-                IntakeAction.PRODUCE,
-            ]
+            for action in [IntakeAction.PRODUCE]
         ],
         back_button=InlineKeyboardButton(
             text=IntakeAction.CANCEL.title(),
@@ -1986,7 +2041,7 @@ async def test_document_only_mp4_dispatch_to_restricted_clip_action_menu() -> No
         ),
     )
     assert reply_markup == expected_reply_markup
-    assert _keyboard_rows(reply_markup) == [['Route'], ['Produce'], ['Cancel']]
+    assert _keyboard_rows(reply_markup) == [[DUMMY_BUTTON_TEXT], ['Produce'], ['Cancel']]
     assert [buffered_message.message_id for buffered_message in services.chat_message_buffer.peek_raw(42)] == [1]
 
 
@@ -2039,7 +2094,6 @@ async def test_mixed_video_and_mp4_document_dispatch_to_full_clip_action_menu() 
             for action in [
                 IntakeAction.REORDER,
                 IntakeAction.COMPACT,
-                IntakeAction.ROUTE,
                 IntakeAction.REMOVE,
                 IntakeAction.PRODUCE,
                 IntakeAction.RECONCILE,
@@ -2055,8 +2109,8 @@ async def test_mixed_video_and_mp4_document_dispatch_to_full_clip_action_menu() 
     )
     assert reply_markup == expected_reply_markup
     assert _keyboard_rows(reply_markup) == [
-        ['Produce', 'Remove', 'Reorder'],
-        ['Reconcile', 'Route', 'Compact'],
+        ['Produce', 'Reorder'],
+        ['Reconcile', 'Remove', 'Compact'],
         ['Cancel'],
     ]
     assert [buffered_message.message_id for buffered_message in services.chat_message_buffer.peek_raw(42)] == [1, 2]
@@ -3067,8 +3121,8 @@ async def test_video_and_unsupported_document_batch_dispatches_to_clip_menu() ->
     reply_markup = message.answer.await_args.kwargs['reply_markup']
     _assert_three_rows(reply_markup)
     assert _keyboard_rows(reply_markup) == [
-        ['Produce', 'Remove', 'Reorder'],
-        ['Reconcile', 'Route', 'Compact'],
+        ['Produce', 'Reorder'],
+        ['Reconcile', 'Remove', 'Compact'],
         ['Cancel'],
     ]
 
@@ -3102,14 +3156,14 @@ async def test_video_and_song_mp3_document_batch_dispatches_to_clip_menu() -> No
     reply_markup = message.answer.await_args.kwargs['reply_markup']
     _assert_three_rows(reply_markup)
     assert _keyboard_rows(reply_markup) == [
-        ['Produce', 'Remove', 'Reorder'],
-        ['Reconcile', 'Route', 'Compact'],
+        ['Produce', 'Reorder'],
+        ['Reconcile', 'Remove', 'Compact'],
         ['Cancel'],
     ]
 
 
 @pytest.mark.asyncio
-async def test_document_mp4_only_batch_dispatches_to_clip_menu() -> None:
+async def test_document_mp4_only_batch_dispatches_to_document_menu_without_route() -> None:
     scheduler = _FakeScheduler()
     buffer = ChatMessageBuffer()
     services = _services(clip_store=SimpleNamespace(), scheduler=scheduler, buffer=buffer)
@@ -3134,11 +3188,11 @@ async def test_document_mp4_only_batch_dispatches_to_clip_menu() -> None:
     _assert_format_kwargs(message.answer.await_args.kwargs, expected)
     reply_markup = message.answer.await_args.kwargs['reply_markup']
     _assert_three_rows(reply_markup)
-    assert _keyboard_rows(reply_markup) == [['Route'], ['Produce'], ['Cancel']]
+    assert _keyboard_rows(reply_markup) == [[DUMMY_BUTTON_TEXT], ['Produce'], ['Cancel']]
 
 
 @pytest.mark.asyncio
-async def test_standalone_text_and_video_clip_dispatch_to_text_aware_clip_menu() -> None:
+async def test_standalone_text_and_video_clip_dispatch_to_route_only_menu() -> None:
     scheduler = _FakeScheduler()
     buffer = ChatMessageBuffer()
     services = _services(clip_store=SimpleNamespace(), scheduler=scheduler, buffer=buffer)
@@ -3161,11 +3215,11 @@ async def test_standalone_text_and_video_clip_dispatch_to_text_aware_clip_menu()
     _assert_format_kwargs(message.answer.await_args.kwargs, expected)
     reply_markup = message.answer.await_args.kwargs['reply_markup']
     _assert_three_rows(reply_markup)
-    assert _keyboard_rows(reply_markup) == [['Route'], ['Transfer'], ['Cancel']]
+    assert _keyboard_rows(reply_markup) == [['Route'], ['—'], ['Cancel']]
 
 
 @pytest.mark.asyncio
-async def test_standalone_text_and_mp4_document_dispatch_to_text_aware_clip_menu() -> None:
+async def test_standalone_text_and_mp4_document_dispatch_to_route_only_menu() -> None:
     scheduler = _FakeScheduler()
     buffer = ChatMessageBuffer()
     services = _services(clip_store=SimpleNamespace(), scheduler=scheduler, buffer=buffer)
@@ -3192,11 +3246,11 @@ async def test_standalone_text_and_mp4_document_dispatch_to_text_aware_clip_menu
     _assert_format_kwargs(message.answer.await_args.kwargs, expected)
     reply_markup = message.answer.await_args.kwargs['reply_markup']
     _assert_three_rows(reply_markup)
-    assert _keyboard_rows(reply_markup) == [['Route'], ['Transfer'], ['Cancel']]
+    assert _keyboard_rows(reply_markup) == [['Route'], ['—'], ['Cancel']]
 
 
 @pytest.mark.asyncio
-async def test_caption_only_video_clip_does_not_trigger_text_aware_clip_menu() -> None:
+async def test_caption_only_video_clip_dispatches_to_route_only_menu() -> None:
     scheduler = _FakeScheduler()
     buffer = ChatMessageBuffer()
     services = _services(clip_store=SimpleNamespace(), scheduler=scheduler, buffer=buffer)
@@ -3222,15 +3276,11 @@ async def test_caption_only_video_clip_does_not_trigger_text_aware_clip_menu() -
     _assert_format_kwargs(message.answer.await_args.kwargs, expected)
     reply_markup = message.answer.await_args.kwargs['reply_markup']
     _assert_three_rows(reply_markup)
-    assert _keyboard_rows(reply_markup) == [
-        ['Produce', 'Remove', 'Reorder'],
-        ['Reconcile', 'Route', 'Compact'],
-        ['Cancel'],
-    ]
+    assert _keyboard_rows(reply_markup) == [['Route'], ['—'], ['Cancel']]
 
 
 @pytest.mark.asyncio
-async def test_caption_only_document_clip_does_not_trigger_text_aware_clip_menu() -> None:
+async def test_caption_only_document_clip_dispatches_to_route_only_menu() -> None:
     scheduler = _FakeScheduler()
     buffer = ChatMessageBuffer()
     services = _services(clip_store=SimpleNamespace(), scheduler=scheduler, buffer=buffer)
@@ -3256,11 +3306,11 @@ async def test_caption_only_document_clip_does_not_trigger_text_aware_clip_menu(
     _assert_format_kwargs(message.answer.await_args.kwargs, expected)
     reply_markup = message.answer.await_args.kwargs['reply_markup']
     _assert_three_rows(reply_markup)
-    assert _keyboard_rows(reply_markup) == [['Route'], ['Produce'], ['Cancel']]
+    assert _keyboard_rows(reply_markup) == [['Route'], ['—'], ['Cancel']]
 
 
 @pytest.mark.asyncio
-async def test_mixed_video_document_and_standalone_text_dispatch_to_text_aware_clip_menu() -> None:
+async def test_mixed_video_document_and_standalone_text_dispatch_to_route_only_menu() -> None:
     scheduler = _FakeScheduler()
     buffer = ChatMessageBuffer()
     services = _services(clip_store=SimpleNamespace(), scheduler=scheduler, buffer=buffer)
@@ -3291,11 +3341,11 @@ async def test_mixed_video_document_and_standalone_text_dispatch_to_text_aware_c
     _assert_format_kwargs(message.answer.await_args.kwargs, expected)
     reply_markup = message.answer.await_args.kwargs['reply_markup']
     _assert_three_rows(reply_markup)
-    assert _keyboard_rows(reply_markup) == [['Route'], ['Transfer'], ['Cancel']]
+    assert _keyboard_rows(reply_markup) == [['Route'], ['—'], ['Cancel']]
 
 
 @pytest.mark.asyncio
-async def test_whitespace_only_text_and_clip_does_not_trigger_text_aware_clip_menu() -> None:
+async def test_whitespace_only_text_and_clip_dispatches_to_generic_clip_menu_without_route() -> None:
     scheduler = _FakeScheduler()
     buffer = ChatMessageBuffer()
     services = _services(clip_store=SimpleNamespace(), scheduler=scheduler, buffer=buffer)
@@ -3317,9 +3367,140 @@ async def test_whitespace_only_text_and_clip_does_not_trigger_text_aware_clip_me
     reply_markup = message.answer.await_args.kwargs['reply_markup']
     _assert_three_rows(reply_markup)
     assert _keyboard_rows(reply_markup) == [
-        ['Produce', 'Remove', 'Reorder'],
-        ['Reconcile', 'Route', 'Compact'],
+        ['Produce', 'Reorder'],
+        ['Reconcile', 'Remove', 'Compact'],
         ['Cancel'],
+    ]
+
+
+@pytest.mark.asyncio
+async def test_non_route_caption_video_clip_dispatches_to_generic_clip_menu_without_route() -> None:
+    scheduler = _FakeScheduler()
+    buffer = ChatMessageBuffer()
+    services = _services(clip_store=SimpleNamespace(), scheduler=scheduler, buffer=buffer)
+    settings = _settings()
+    message = _fake_message(
+        chat_id=42,
+        message_id=1,
+        caption='Vacation in Prague',
+        video=_fake_video(file_id='video-1', file_name='clip.mp4'),
+    )
+
+    await on_buffered_relevant_message(message, services, settings)
+    assert scheduler.job is not None
+
+    await scheduler.job()
+
+    reply_markup = message.answer.await_args.kwargs['reply_markup']
+    _assert_three_rows(reply_markup)
+    assert _keyboard_rows(reply_markup) == [
+        ['Produce', 'Reorder'],
+        ['Reconcile', 'Remove', 'Compact'],
+        ['Cancel'],
+    ]
+
+
+@pytest.mark.asyncio
+async def test_non_route_caption_document_clip_dispatches_to_document_menu_without_route() -> None:
+    scheduler = _FakeScheduler()
+    buffer = ChatMessageBuffer()
+    services = _services(clip_store=SimpleNamespace(), scheduler=scheduler, buffer=buffer)
+    settings = _settings()
+    message = _fake_message(
+        chat_id=42,
+        message_id=1,
+        caption='Funny bug',
+        document=_fake_document(file_id='document-1', file_name='clip.mp4'),
+    )
+
+    await on_buffered_relevant_message(message, services, settings)
+    assert scheduler.job is not None
+
+    await scheduler.job()
+
+    reply_markup = message.answer.await_args.kwargs['reply_markup']
+    _assert_three_rows(reply_markup)
+    assert _keyboard_rows(reply_markup) == [[DUMMY_BUTTON_TEXT], ['Produce'], ['Cancel']]
+
+
+def test_classify_route_request_marks_canonical_video_filename_as_internal() -> None:
+    source_group = ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1)
+    source_sub_group = ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.EXTRA)
+    kind, buffered_clips = intake_module._classify_route_request(
+        [
+            [
+                _fake_message(
+                    video=_fake_video(
+                        file_id='f1',
+                        file_name=_stored_filename(source_group, source_sub_group, _CLIP_ID_1),
+                    )
+                )
+            ]
+        ]
+    )
+
+    assert kind is intake_module.RouteRequestKind.INTERNAL
+    assert [clip.kind for clip in buffered_clips] == [intake_module.RouteRequestKind.INTERNAL]
+
+
+def test_classify_route_request_marks_canonical_mp4_document_filename_as_internal() -> None:
+    source_group = ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1)
+    source_sub_group = ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.EXTRA)
+    kind, buffered_clips = intake_module._classify_route_request(
+        [
+            [
+                _fake_message(
+                    document=_fake_document(
+                        file_id='f1',
+                        file_name=_stored_filename(source_group, source_sub_group, _CLIP_ID_1),
+                    )
+                )
+            ]
+        ]
+    )
+
+    assert kind is intake_module.RouteRequestKind.INTERNAL
+    assert [clip.kind for clip in buffered_clips] == [intake_module.RouteRequestKind.INTERNAL]
+
+
+def test_classify_route_request_marks_missing_or_noncanonical_filename_as_external() -> None:
+    kind, buffered_clips = intake_module._classify_route_request(
+        [
+            [
+                _fake_message(video=_fake_video(file_id='f1', file_name=None)),
+                _fake_message(video=_fake_video(file_id='f2', file_name='fresh-upload.mp4')),
+            ]
+        ]
+    )
+
+    assert kind is intake_module.RouteRequestKind.EXTERNAL
+    assert [clip.kind for clip in buffered_clips] == [
+        intake_module.RouteRequestKind.EXTERNAL,
+        intake_module.RouteRequestKind.EXTERNAL,
+    ]
+
+
+def test_classify_route_request_marks_mixed_internal_and_external_request() -> None:
+    source_group = ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1)
+    source_sub_group = ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.EXTRA)
+    kind, buffered_clips = intake_module._classify_route_request(
+        [
+            [
+                _fake_message(video=_fake_video(file_id='f1', file_name='fresh-upload.mp4')),
+                _fake_message(
+                    video=_fake_video(
+                        file_id='f2',
+                        file_name=_stored_filename(source_group, source_sub_group, _CLIP_ID_1),
+                    )
+                ),
+            ]
+        ]
+    )
+
+    assert kind is intake_module.RouteRequestKind.MIXED
+    assert [clip.kind for clip in buffered_clips] == [
+        intake_module.RouteRequestKind.EXTERNAL,
+        intake_module.RouteRequestKind.INTERNAL,
     ]
 
 
@@ -14137,8 +14318,8 @@ async def test_reorder_back_from_empty_state_returns_to_intake_action_menu() -> 
     reply_markup = message.edit_text.await_args.kwargs['reply_markup']
     _assert_three_rows(reply_markup)
     assert _keyboard_rows(reply_markup) == [
-        ['Produce', 'Remove', 'Reorder'],
-        ['Reconcile', 'Route', 'Compact'],
+        ['Produce', 'Reorder'],
+        ['Reconcile', 'Remove', 'Compact'],
         ['Cancel'],
     ]
     _assert_format_kwargs(
@@ -14607,11 +14788,20 @@ async def test_route_action_stores_clips_in_caption_route_order_across_message_g
         ('West', '2025', '1', 'Source'),
     )
     message.answer.assert_awaited_once_with(**Text('Stored: ', Bold('3')).as_kwargs())
-    clip_store.compact.assert_awaited_once_with(
-        ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1),
-        ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.SOURCE),
-        batch_size=intake_module._TELEGRAM_MEDIA_GROUP_LIMIT,
-    )
+    assert clip_store.compact.await_args_list == [
+        call(
+            ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1),
+            ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.SOURCE),
+            batch_size=intake_module._TELEGRAM_MEDIA_GROUP_LIMIT,
+            require_exists=True,
+        ),
+        call(
+            ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1),
+            ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.EXTRA),
+            batch_size=intake_module._TELEGRAM_MEDIA_GROUP_LIMIT,
+            require_exists=False,
+        ),
+    ]
     assert state.current_state is None
     assert state.clear_count == 1
 
@@ -14697,13 +14887,173 @@ async def test_route_action_stores_mp4_documents_in_caption_route_order_across_m
         ('West', '2025', '1', 'Source'),
     )
     message.answer.assert_awaited_once_with(**Text('Stored: ', Bold('3')).as_kwargs())
-    clip_store.compact.assert_awaited_once_with(
-        ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1),
-        ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.SOURCE),
-        batch_size=intake_module._TELEGRAM_MEDIA_GROUP_LIMIT,
-    )
+    assert clip_store.compact.await_args_list == [
+        call(
+            ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1),
+            ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.SOURCE),
+            batch_size=intake_module._TELEGRAM_MEDIA_GROUP_LIMIT,
+            require_exists=True,
+        ),
+        call(
+            ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1),
+            ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.EXTRA),
+            batch_size=intake_module._TELEGRAM_MEDIA_GROUP_LIMIT,
+            require_exists=False,
+        ),
+    ]
     assert state.current_state is None
     assert state.clear_count == 1
+
+
+@pytest.mark.asyncio
+async def test_route_action_compacts_external_route_before_success_summary() -> None:
+    message = _fake_message(text='Select action:', chat_id=77, message_id=70)
+    callback = _fake_callback(message)
+    state = _FakeState()
+    buffer = ChatMessageBuffer()
+    buffer.append(
+        _fake_message(
+            chat_id=77,
+            message_id=1,
+            caption='w251',
+            video=_fake_video(file_id='f1', file_name='one.mp4'),
+        ),
+        chat_id=77,
+    )
+    events: list[str] = []
+
+    async def record_summary(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        events.append('summary')
+
+    async def record_compaction(*args: object, **kwargs: object) -> None:
+        del kwargs
+        clip_sub_group = args[1]
+        assert clip_sub_group.scope in {Scope.SOURCE, Scope.EXTRA}
+        assert message.answer.await_count == 0
+        events.append(f'compact-{clip_sub_group.scope.name.lower()}')
+
+    clip_store = SimpleNamespace(
+        store=AsyncMock(return_value=StoreResult(stored_count=1, duplicate_count=0)),
+        compact=AsyncMock(side_effect=record_compaction),
+    )
+    services = _services(clip_store=clip_store, buffer=buffer)
+
+    message.answer.side_effect = record_summary
+    bot = AsyncMock()
+    bot.get_file.return_value = SimpleNamespace(file_path='path-1')
+    bot.download_file.return_value = BytesIO(b'one')
+
+    await on_intake_action(
+        callback,
+        SimpleNamespace(action=IntakeAction.ROUTE),
+        bot,
+        services,
+        _settings(),
+        state,
+    )
+
+    assert events == ['compact-source', 'compact-extra', 'summary']
+    message.answer.assert_awaited_once_with(**Text('Stored: ', Bold('1')).as_kwargs())
+    assert clip_store.compact.await_args_list == [
+        call(
+            ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1),
+            ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.SOURCE),
+            batch_size=intake_module._TELEGRAM_MEDIA_GROUP_LIMIT,
+            require_exists=True,
+        ),
+        call(
+            ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1),
+            ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.EXTRA),
+            batch_size=intake_module._TELEGRAM_MEDIA_GROUP_LIMIT,
+            require_exists=False,
+        ),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_route_action_does_not_compact_when_external_route_stores_nothing() -> None:
+    message = _fake_message(text='Select action:', chat_id=77, message_id=70)
+    callback = _fake_callback(message)
+    state = _FakeState()
+    buffer = ChatMessageBuffer()
+    buffer.append(
+        _fake_message(
+            chat_id=77,
+            message_id=1,
+            caption='w251',
+            video=_fake_video(file_id='f1', file_name='one.mp4'),
+        ),
+        chat_id=77,
+    )
+
+    clip_store = SimpleNamespace(
+        store=AsyncMock(return_value=StoreResult(stored_count=0, duplicate_count=1)),
+        compact=AsyncMock(),
+    )
+    services = _services(clip_store=clip_store, buffer=buffer)
+
+    bot = AsyncMock()
+    bot.get_file.return_value = SimpleNamespace(file_path='path-1')
+    bot.download_file.return_value = BytesIO(b'one')
+
+    await on_intake_action(
+        callback,
+        SimpleNamespace(action=IntakeAction.ROUTE),
+        bot,
+        services,
+        _settings(),
+        state,
+    )
+
+    clip_store.compact.assert_not_awaited()
+    message.answer.assert_awaited_once_with(**Text('Deduplicated: ', Bold('1')).as_kwargs())
+
+
+@pytest.mark.asyncio
+async def test_route_action_does_not_send_success_summary_until_external_compaction_finishes() -> None:
+    message = _fake_message(text='Select action:', chat_id=77, message_id=70)
+    callback = _fake_callback(message)
+    state = _FakeState()
+    buffer = ChatMessageBuffer()
+    buffer.append(
+        _fake_message(
+            chat_id=77,
+            message_id=1,
+            caption='w251',
+            video=_fake_video(file_id='f1', file_name='one.mp4'),
+        ),
+        chat_id=77,
+    )
+
+    async def fail_on_extra(*args: object, **kwargs: object) -> None:
+        del kwargs
+        clip_sub_group = args[1]
+        if clip_sub_group.scope is Scope.EXTRA:
+            raise RuntimeError('boom')
+
+    clip_store = SimpleNamespace(
+        store=AsyncMock(return_value=StoreResult(stored_count=1, duplicate_count=0)),
+        compact=AsyncMock(side_effect=fail_on_extra),
+    )
+    services = _services(clip_store=clip_store, buffer=buffer)
+
+    bot = AsyncMock()
+    bot.get_file.return_value = SimpleNamespace(file_path='path-1')
+    bot.download_file.return_value = BytesIO(b'one')
+
+    with pytest.raises(RuntimeError, match='boom'):
+        await on_intake_action(
+            callback,
+            SimpleNamespace(action=IntakeAction.ROUTE),
+            bot,
+            services,
+            _settings(),
+            state,
+        )
+
+    message.answer.assert_not_awaited()
+    assert clip_store.compact.await_count == 2
 
 
 @pytest.mark.asyncio
@@ -14848,11 +15198,25 @@ async def test_route_action_batches_bare_and_suffixed_routes_separately() -> Non
             ClipGroup(universe=Universe.WEST, year=2025, season=Season.S5),
             ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.SOURCE),
             batch_size=intake_module._TELEGRAM_MEDIA_GROUP_LIMIT,
+            require_exists=True,
+        ),
+        call(
+            ClipGroup(universe=Universe.WEST, year=2025, season=Season.S5),
+            ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.EXTRA),
+            batch_size=intake_module._TELEGRAM_MEDIA_GROUP_LIMIT,
+            require_exists=False,
         ),
         call(
             ClipGroup(universe=Universe.WEST, year=2025, season=Season.S5),
             ClipSubGroup(sub_season=SubSeason.A, scope=Scope.SOURCE),
             batch_size=intake_module._TELEGRAM_MEDIA_GROUP_LIMIT,
+            require_exists=True,
+        ),
+        call(
+            ClipGroup(universe=Universe.WEST, year=2025, season=Season.S5),
+            ClipSubGroup(sub_season=SubSeason.A, scope=Scope.EXTRA),
+            batch_size=intake_module._TELEGRAM_MEDIA_GROUP_LIMIT,
+            require_exists=False,
         ),
     ]
     assert services.chat_message_buffer.peek_raw(77) == []
@@ -14966,11 +15330,25 @@ async def test_route_action_splits_store_calls_when_caption_route_overrides() ->
             ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1),
             ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.SOURCE),
             batch_size=intake_module._TELEGRAM_MEDIA_GROUP_LIMIT,
+            require_exists=True,
+        ),
+        call(
+            ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1),
+            ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.EXTRA),
+            batch_size=intake_module._TELEGRAM_MEDIA_GROUP_LIMIT,
+            require_exists=False,
         ),
         call(
             ClipGroup(universe=Universe.EAST, year=2024, season=Season.S2),
             ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.SOURCE),
             batch_size=intake_module._TELEGRAM_MEDIA_GROUP_LIMIT,
+            require_exists=True,
+        ),
+        call(
+            ClipGroup(universe=Universe.EAST, year=2024, season=Season.S2),
+            ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.EXTRA),
+            batch_size=intake_module._TELEGRAM_MEDIA_GROUP_LIMIT,
+            require_exists=False,
         ),
     ]
 
@@ -15034,11 +15412,20 @@ async def test_route_action_chunks_long_single_route_group_without_duplicate_pro
     )
     assert len(message.edit_text.await_args_list) == 2
     message.answer.assert_awaited_once_with(**Text('Stored: ', Bold('10')).as_kwargs())
-    clip_store.compact.assert_awaited_once_with(
-        ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1),
-        ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.SOURCE),
-        batch_size=intake_module._TELEGRAM_MEDIA_GROUP_LIMIT,
-    )
+    assert clip_store.compact.await_args_list == [
+        call(
+            ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1),
+            ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.SOURCE),
+            batch_size=intake_module._TELEGRAM_MEDIA_GROUP_LIMIT,
+            require_exists=True,
+        ),
+        call(
+            ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1),
+            ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.EXTRA),
+            batch_size=intake_module._TELEGRAM_MEDIA_GROUP_LIMIT,
+            require_exists=False,
+        ),
+    ]
 
 
 @pytest.mark.asyncio
@@ -15130,11 +15517,25 @@ async def test_route_action_chunks_per_route_group_without_crossing_route_bounda
             ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1),
             ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.SOURCE),
             batch_size=intake_module._TELEGRAM_MEDIA_GROUP_LIMIT,
+            require_exists=True,
+        ),
+        call(
+            ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1),
+            ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.EXTRA),
+            batch_size=intake_module._TELEGRAM_MEDIA_GROUP_LIMIT,
+            require_exists=False,
         ),
         call(
             ClipGroup(universe=Universe.EAST, year=2024, season=Season.S2),
             ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.SOURCE),
             batch_size=intake_module._TELEGRAM_MEDIA_GROUP_LIMIT,
+            require_exists=True,
+        ),
+        call(
+            ClipGroup(universe=Universe.EAST, year=2024, season=Season.S2),
+            ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.EXTRA),
+            batch_size=intake_module._TELEGRAM_MEDIA_GROUP_LIMIT,
+            require_exists=False,
         ),
     ]
 
@@ -15233,16 +15634,37 @@ async def test_route_action_updates_active_route_from_standalone_text_and_clip_c
             ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1),
             ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.SOURCE),
             batch_size=intake_module._TELEGRAM_MEDIA_GROUP_LIMIT,
+            require_exists=True,
+        ),
+        call(
+            ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1),
+            ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.EXTRA),
+            batch_size=intake_module._TELEGRAM_MEDIA_GROUP_LIMIT,
+            require_exists=False,
         ),
         call(
             ClipGroup(universe=Universe.EAST, year=2024, season=Season.S2),
             ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.SOURCE),
             batch_size=intake_module._TELEGRAM_MEDIA_GROUP_LIMIT,
+            require_exists=True,
+        ),
+        call(
+            ClipGroup(universe=Universe.EAST, year=2024, season=Season.S2),
+            ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.EXTRA),
+            batch_size=intake_module._TELEGRAM_MEDIA_GROUP_LIMIT,
+            require_exists=False,
         ),
         call(
             ClipGroup(universe=Universe.WEST, year=2025, season=Season.S2),
             ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.SOURCE),
             batch_size=intake_module._TELEGRAM_MEDIA_GROUP_LIMIT,
+            require_exists=True,
+        ),
+        call(
+            ClipGroup(universe=Universe.WEST, year=2025, season=Season.S2),
+            ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.EXTRA),
+            batch_size=intake_module._TELEGRAM_MEDIA_GROUP_LIMIT,
+            require_exists=False,
         ),
     ]
     assert services.chat_message_buffer.peek_raw(77) == []
@@ -15356,11 +15778,20 @@ async def test_route_action_uses_latest_valid_pre_clip_text_before_first_video()
         message.edit_text.await_args_list[1],
         ('West', '2025', '1', 'Source'),
     )
-    clip_store.compact.assert_awaited_once_with(
-        ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1),
-        ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.SOURCE),
-        batch_size=intake_module._TELEGRAM_MEDIA_GROUP_LIMIT,
-    )
+    assert clip_store.compact.await_args_list == [
+        call(
+            ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1),
+            ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.SOURCE),
+            batch_size=intake_module._TELEGRAM_MEDIA_GROUP_LIMIT,
+            require_exists=True,
+        ),
+        call(
+            ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1),
+            ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.EXTRA),
+            batch_size=intake_module._TELEGRAM_MEDIA_GROUP_LIMIT,
+            require_exists=False,
+        ),
+    ]
     assert services.chat_message_buffer.peek_raw(77) == []
 
 
@@ -15668,15 +16099,14 @@ async def test_route_action_rejects_season_not_allowed_for_current_year_before_e
 
 
 @pytest.mark.asyncio
-async def test_transfer_action_uses_text_destinations_and_ignores_clip_captions() -> None:
+async def test_route_action_uses_internal_route_destination_from_caption_only_stored_clip() -> None:
     message = _fake_message(text='Select action:', chat_id=77, message_id=79)
     callback = _fake_callback(message)
     state = _FakeState()
     buffer = ChatMessageBuffer()
-    destination_group = ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1)
+    destination_group = ClipGroup(universe=Universe.EAST, year=2024, season=Season.S2)
     source_group = ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1)
     source_sub_group = ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.EXTRA)
-    buffer.append(_fake_message(chat_id=77, message_id=1, text='w251'), chat_id=77)
     buffer.append(
         _fake_message(
             chat_id=77,
@@ -15701,7 +16131,7 @@ async def test_transfer_action_uses_text_destinations_and_ignores_clip_captions(
 
     await on_intake_action(
         callback,
-        SimpleNamespace(action=IntakeAction.TRANSFER),
+        SimpleNamespace(action=IntakeAction.ROUTE),
         AsyncMock(),
         services,
         _settings(),
@@ -15710,12 +16140,13 @@ async def test_transfer_action_uses_text_destinations_and_ignores_clip_captions(
 
     clip_store.transfer.assert_awaited_once()
     assert clip_store.transfer.await_args.kwargs['destination_group'] == destination_group
-    assert clip_store.transfer.await_args.kwargs['clips'][0].source_group == source_group
-    assert clip_store.transfer.await_args.kwargs['clips'][0].clip_id == _CLIP_ID_1
-    assert message.edit_text.await_args_list[0] == call('Transferring...', reply_markup=None)
+    assert clip_store.transfer.await_args.kwargs['clips'] == [
+        intake_module.TransferClipRef(source_group=source_group, clip_id=_CLIP_ID_1)
+    ]
+    assert message.edit_text.await_args_list[0] == call('Routing...', reply_markup=None)
     _assert_format_kwargs(
         message.edit_text.await_args_list[1].kwargs,
-        {**_transfer_progress_kwargs(('West', '2025', '1')), 'reply_markup': None},
+        {**_transfer_progress_kwargs(('East', '2024', '2')), 'reply_markup': None},
     )
     message.answer.assert_awaited_once_with(**Text('Transferred: ', Bold('1')).as_kwargs())
     assert clip_store.compact.await_args_list == [
@@ -15735,7 +16166,145 @@ async def test_transfer_action_uses_text_destinations_and_ignores_clip_captions(
 
 
 @pytest.mark.asyncio
-async def test_transfer_action_accepts_stored_mp4_documents() -> None:
+async def test_route_action_internal_caption_destination_carries_forward_to_uncaptioned_stored_clips() -> None:
+    message = _fake_message(text='Select action:', chat_id=77, message_id=79)
+    callback = _fake_callback(message)
+    state = _FakeState()
+    buffer = ChatMessageBuffer()
+    destination_group = ClipGroup(universe=Universe.EAST, year=2024, season=Season.S2)
+    source_group = ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1)
+    source_sub_group = ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.EXTRA)
+    buffer.append(
+        _fake_message(
+            chat_id=77,
+            message_id=1,
+            caption='e242',
+            video=_fake_video(file_id='f1', file_name=_stored_filename(source_group, source_sub_group, _CLIP_ID_1)),
+        ),
+        chat_id=77,
+    )
+    buffer.append(
+        _fake_message(
+            chat_id=77,
+            message_id=2,
+            video=_fake_video(file_id='f2', file_name=_stored_filename(source_group, source_sub_group, _CLIP_ID_2)),
+        ),
+        chat_id=77,
+    )
+    clip_store = SimpleNamespace(
+        transfer=AsyncMock(
+            return_value=TransferResult(
+                transferred_count=2,
+                already_in_destination_group_count=0,
+                duplicate_blocked_count=0,
+                affected_sub_groups=((source_group, source_sub_group), (destination_group, source_sub_group)),
+            )
+        ),
+        compact=AsyncMock(),
+    )
+    services = _services(clip_store=clip_store, buffer=buffer)
+
+    await on_intake_action(
+        callback,
+        SimpleNamespace(action=IntakeAction.ROUTE),
+        AsyncMock(),
+        services,
+        _settings(),
+        state,
+    )
+
+    clip_store.transfer.assert_awaited_once()
+    assert clip_store.transfer.await_args.kwargs['destination_group'] == destination_group
+    assert clip_store.transfer.await_args.kwargs['clips'] == [
+        intake_module.TransferClipRef(source_group=source_group, clip_id=_CLIP_ID_1),
+        intake_module.TransferClipRef(source_group=source_group, clip_id=_CLIP_ID_2),
+    ]
+    assert message.edit_text.await_args_list[0] == call('Routing...', reply_markup=None)
+    _assert_format_kwargs(
+        message.edit_text.await_args_list[1].kwargs,
+        {**_transfer_progress_kwargs(('East', '2024', '2')), 'reply_markup': None},
+    )
+    message.answer.assert_awaited_once_with(**Text('Transferred: ', Bold('2')).as_kwargs())
+    assert clip_store.compact.await_args_list == [
+        call(
+            source_group,
+            source_sub_group,
+            batch_size=intake_module._TELEGRAM_MEDIA_GROUP_LIMIT,
+            require_exists=False,
+        ),
+        call(
+            destination_group,
+            source_sub_group,
+            batch_size=intake_module._TELEGRAM_MEDIA_GROUP_LIMIT,
+            require_exists=False,
+        ),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_route_action_internal_route_updates_destination_across_multiple_caption_changes() -> None:
+    message = _fake_message(text='Select action:', chat_id=77, message_id=82)
+    callback = _fake_callback(message)
+    state = _FakeState()
+    buffer = ChatMessageBuffer()
+    west_destination = ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1)
+    east_destination = ClipGroup(universe=Universe.EAST, year=2024, season=Season.S2)
+    source_group = ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1)
+    source_sub_group = ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.EXTRA)
+    for buffered_message in [
+        _fake_message(
+            chat_id=77,
+            message_id=1,
+            caption='w251',
+            video=_fake_video(file_id='f1', file_name=_stored_filename(source_group, source_sub_group, _CLIP_ID_1)),
+        ),
+        _fake_message(
+            chat_id=77,
+            message_id=2,
+            caption='e242',
+            video=_fake_video(file_id='f2', file_name=_stored_filename(source_group, source_sub_group, _CLIP_ID_2)),
+        ),
+        _fake_message(
+            chat_id=77,
+            message_id=3,
+            video=_fake_video(file_id='f3', file_name=_stored_filename(source_group, source_sub_group, _CLIP_ID_3)),
+        ),
+    ]:
+        buffer.append(buffered_message, chat_id=77)
+    clip_store = SimpleNamespace(
+        transfer=AsyncMock(
+            side_effect=[
+                TransferResult(transferred_count=1, already_in_destination_group_count=0, duplicate_blocked_count=0),
+                TransferResult(transferred_count=2, already_in_destination_group_count=0, duplicate_blocked_count=0),
+            ]
+        ),
+        compact=AsyncMock(),
+    )
+    services = _services(clip_store=clip_store, buffer=buffer)
+
+    await on_intake_action(
+        callback,
+        SimpleNamespace(action=IntakeAction.ROUTE),
+        AsyncMock(),
+        services,
+        _settings(),
+        state,
+    )
+
+    assert clip_store.transfer.await_count == 2
+    assert clip_store.transfer.await_args_list[0].kwargs['destination_group'] == west_destination
+    assert clip_store.transfer.await_args_list[0].kwargs['clips'] == [
+        intake_module.TransferClipRef(source_group=source_group, clip_id=_CLIP_ID_1)
+    ]
+    assert clip_store.transfer.await_args_list[1].kwargs['destination_group'] == east_destination
+    assert clip_store.transfer.await_args_list[1].kwargs['clips'] == [
+        intake_module.TransferClipRef(source_group=source_group, clip_id=_CLIP_ID_2),
+        intake_module.TransferClipRef(source_group=source_group, clip_id=_CLIP_ID_3),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_route_action_accepts_internal_mp4_documents() -> None:
     message = _fake_message(text='Select action:', chat_id=77, message_id=82)
     callback = _fake_callback(message)
     state = _FakeState()
@@ -15770,7 +16339,7 @@ async def test_transfer_action_accepts_stored_mp4_documents() -> None:
 
     await on_intake_action(
         callback,
-        SimpleNamespace(action=IntakeAction.TRANSFER),
+        SimpleNamespace(action=IntakeAction.ROUTE),
         AsyncMock(),
         services,
         _settings(),
@@ -15786,7 +16355,236 @@ async def test_transfer_action_accepts_stored_mp4_documents() -> None:
 
 
 @pytest.mark.asyncio
-async def test_transfer_action_reports_already_in_destination_and_duplicate_blocked_counts() -> None:
+async def test_route_action_compacts_internal_route_before_success_summary() -> None:
+    message = _fake_message(text='Select action:', chat_id=77, message_id=79)
+    callback = _fake_callback(message)
+    state = _FakeState()
+    buffer = ChatMessageBuffer()
+    destination_group = ClipGroup(universe=Universe.EAST, year=2024, season=Season.S2)
+    source_group = ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1)
+    source_sub_group = ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.EXTRA)
+    buffer.append(
+        _fake_message(
+            chat_id=77,
+            message_id=1,
+            caption='e242',
+            video=_fake_video(file_id='f1', file_name=_stored_filename(source_group, source_sub_group, _CLIP_ID_1)),
+        ),
+        chat_id=77,
+    )
+    events: list[str] = []
+
+    async def record_summary(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        events.append('summary')
+
+    async def record_compaction(*args: object, **kwargs: object) -> None:
+        del kwargs
+        clip_group = args[0]
+        assert message.answer.await_count == 0
+        if clip_group == source_group:
+            events.append('compact-source')
+        else:
+            assert clip_group == destination_group
+            events.append('compact-destination')
+
+    clip_store = SimpleNamespace(
+        transfer=AsyncMock(
+            return_value=TransferResult(
+                transferred_count=1,
+                already_in_destination_group_count=0,
+                duplicate_blocked_count=0,
+                affected_sub_groups=((source_group, source_sub_group), (destination_group, source_sub_group)),
+            )
+        ),
+        compact=AsyncMock(side_effect=record_compaction),
+    )
+    services = _services(clip_store=clip_store, buffer=buffer)
+
+    message.answer.side_effect = record_summary
+
+    await on_intake_action(
+        callback,
+        SimpleNamespace(action=IntakeAction.ROUTE),
+        AsyncMock(),
+        services,
+        _settings(),
+        state,
+    )
+
+    assert events == ['compact-source', 'compact-destination', 'summary']
+    message.answer.assert_awaited_once_with(**Text('Transferred: ', Bold('1')).as_kwargs())
+    assert clip_store.compact.await_args_list == [
+        call(
+            source_group,
+            source_sub_group,
+            batch_size=intake_module._TELEGRAM_MEDIA_GROUP_LIMIT,
+            require_exists=False,
+        ),
+        call(
+            destination_group,
+            source_sub_group,
+            batch_size=intake_module._TELEGRAM_MEDIA_GROUP_LIMIT,
+            require_exists=False,
+        ),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_route_action_does_not_send_success_summary_until_internal_compaction_finishes() -> None:
+    message = _fake_message(text='Select action:', chat_id=77, message_id=79)
+    callback = _fake_callback(message)
+    state = _FakeState()
+    buffer = ChatMessageBuffer()
+    destination_group = ClipGroup(universe=Universe.EAST, year=2024, season=Season.S2)
+    source_group = ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1)
+    source_sub_group = ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.EXTRA)
+    buffer.append(
+        _fake_message(
+            chat_id=77,
+            message_id=1,
+            caption='e242',
+            video=_fake_video(file_id='f1', file_name=_stored_filename(source_group, source_sub_group, _CLIP_ID_1)),
+        ),
+        chat_id=77,
+    )
+
+    async def fail_on_destination(*args: object, **kwargs: object) -> None:
+        del kwargs
+        clip_group = args[0]
+        if clip_group == source_group:
+            return
+        raise RuntimeError('boom')
+
+    clip_store = SimpleNamespace(
+        transfer=AsyncMock(
+            return_value=TransferResult(
+                transferred_count=1,
+                already_in_destination_group_count=0,
+                duplicate_blocked_count=0,
+                affected_sub_groups=((source_group, source_sub_group), (destination_group, source_sub_group)),
+            )
+        ),
+        compact=AsyncMock(side_effect=fail_on_destination),
+    )
+    services = _services(clip_store=clip_store, buffer=buffer)
+
+    with pytest.raises(RuntimeError, match='boom'):
+        await on_intake_action(
+            callback,
+            SimpleNamespace(action=IntakeAction.ROUTE),
+            AsyncMock(),
+            services,
+            _settings(),
+            state,
+        )
+
+    message.answer.assert_not_awaited()
+    assert clip_store.compact.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_route_action_internal_route_standalone_text_then_caption_updates_destination() -> None:
+    message = _fake_message(text='Select action:', chat_id=77, message_id=80)
+    callback = _fake_callback(message)
+    state = _FakeState()
+    buffer = ChatMessageBuffer()
+    west_destination = ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1)
+    east_destination = ClipGroup(universe=Universe.EAST, year=2024, season=Season.S2)
+    source_group = ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1)
+    source_sub_group = ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.COLLECTION)
+    for buffered_message in [
+        _fake_message(chat_id=77, message_id=1, text='w251'),
+        _fake_message(
+            chat_id=77,
+            message_id=2,
+            video=_fake_video(file_id='f1', file_name=_stored_filename(source_group, source_sub_group, _CLIP_ID_1)),
+        ),
+        _fake_message(
+            chat_id=77,
+            message_id=3,
+            caption='e242',
+            video=_fake_video(file_id='f2', file_name=_stored_filename(source_group, source_sub_group, _CLIP_ID_2)),
+        ),
+    ]:
+        buffer.append(buffered_message, chat_id=77)
+    clip_store = SimpleNamespace(
+        transfer=AsyncMock(
+            side_effect=[
+                TransferResult(transferred_count=1, already_in_destination_group_count=0, duplicate_blocked_count=0),
+                TransferResult(transferred_count=1, already_in_destination_group_count=0, duplicate_blocked_count=0),
+            ]
+        ),
+        compact=AsyncMock(),
+    )
+    services = _services(clip_store=clip_store, buffer=buffer)
+
+    await on_intake_action(
+        callback,
+        SimpleNamespace(action=IntakeAction.ROUTE),
+        AsyncMock(),
+        services,
+        _settings(),
+        state,
+    )
+
+    assert clip_store.transfer.await_count == 2
+    assert clip_store.transfer.await_args_list[0].kwargs['destination_group'] == west_destination
+    assert clip_store.transfer.await_args_list[1].kwargs['destination_group'] == east_destination
+
+
+@pytest.mark.asyncio
+async def test_route_action_internal_route_caption_then_standalone_text_updates_destination() -> None:
+    message = _fake_message(text='Select action:', chat_id=77, message_id=81)
+    callback = _fake_callback(message)
+    state = _FakeState()
+    buffer = ChatMessageBuffer()
+    west_destination = ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1)
+    east_destination = ClipGroup(universe=Universe.EAST, year=2024, season=Season.S2)
+    source_group = ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1)
+    source_sub_group = ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.COLLECTION)
+    for buffered_message in [
+        _fake_message(
+            chat_id=77,
+            message_id=1,
+            caption='w251',
+            video=_fake_video(file_id='f1', file_name=_stored_filename(source_group, source_sub_group, _CLIP_ID_1)),
+        ),
+        _fake_message(chat_id=77, message_id=2, text='e242'),
+        _fake_message(
+            chat_id=77,
+            message_id=3,
+            video=_fake_video(file_id='f2', file_name=_stored_filename(source_group, source_sub_group, _CLIP_ID_2)),
+        ),
+    ]:
+        buffer.append(buffered_message, chat_id=77)
+    clip_store = SimpleNamespace(
+        transfer=AsyncMock(
+            side_effect=[
+                TransferResult(transferred_count=1, already_in_destination_group_count=0, duplicate_blocked_count=0),
+                TransferResult(transferred_count=1, already_in_destination_group_count=0, duplicate_blocked_count=0),
+            ]
+        ),
+        compact=AsyncMock(),
+    )
+    services = _services(clip_store=clip_store, buffer=buffer)
+
+    await on_intake_action(
+        callback,
+        SimpleNamespace(action=IntakeAction.ROUTE),
+        AsyncMock(),
+        services,
+        _settings(),
+        state,
+    )
+
+    assert clip_store.transfer.await_count == 2
+    assert clip_store.transfer.await_args_list[0].kwargs['destination_group'] == west_destination
+    assert clip_store.transfer.await_args_list[1].kwargs['destination_group'] == east_destination
+
+
+@pytest.mark.asyncio
+async def test_route_action_reports_internal_route_counts() -> None:
     message = _fake_message(text='Select action:', chat_id=77, message_id=80)
     callback = _fake_callback(message)
     state = _FakeState()
@@ -15816,7 +16614,7 @@ async def test_transfer_action_reports_already_in_destination_and_duplicate_bloc
 
     await on_intake_action(
         callback,
-        SimpleNamespace(action=IntakeAction.TRANSFER),
+        SimpleNamespace(action=IntakeAction.ROUTE),
         AsyncMock(),
         services,
         _settings(),
@@ -15839,7 +16637,7 @@ async def test_transfer_action_reports_already_in_destination_and_duplicate_bloc
 
 
 @pytest.mark.asyncio
-async def test_transfer_action_rejects_fresh_clip_identity_input() -> None:
+async def test_legacy_transfer_action_rejects_fresh_clip_identity_input() -> None:
     message = _fake_message(text='Select action:', chat_id=77, message_id=81)
     callback = _fake_callback(message)
     state = _FakeState()
@@ -15884,7 +16682,7 @@ async def test_transfer_action_rejects_fresh_clip_identity_input() -> None:
         ),
     ],
 )
-async def test_transfer_action_surfaces_stale_stored_references_as_external_clips(
+async def test_route_action_surfaces_stale_internal_references_as_external_clips(
     transfer_error: Exception,
 ) -> None:
     message = _fake_message(text='Select action:', chat_id=77, message_id=83)
@@ -15910,7 +16708,7 @@ async def test_transfer_action_surfaces_stale_stored_references_as_external_clip
 
     await on_intake_action(
         callback,
-        SimpleNamespace(action=IntakeAction.TRANSFER),
+        SimpleNamespace(action=IntakeAction.ROUTE),
         AsyncMock(),
         services,
         _settings(),
@@ -15918,7 +16716,7 @@ async def test_transfer_action_surfaces_stale_stored_references_as_external_clip
     )
 
     assert message.edit_text.await_args_list == [
-        call('Transferring...', reply_markup=None),
+        call('Routing...', reply_markup=None),
         call('External clip(s)', reply_markup=None),
     ]
     message.answer.assert_not_awaited()
@@ -15927,7 +16725,7 @@ async def test_transfer_action_surfaces_stale_stored_references_as_external_clip
 
 
 @pytest.mark.asyncio
-async def test_transfer_action_surfaces_stale_same_group_reference_as_external_clip() -> None:
+async def test_route_action_surfaces_stale_same_group_internal_reference_as_external_clip() -> None:
     message = _fake_message(text='Select action:', chat_id=77, message_id=84)
     callback = _fake_callback(message)
     state = _FakeState()
@@ -15951,7 +16749,7 @@ async def test_transfer_action_surfaces_stale_same_group_reference_as_external_c
 
     await on_intake_action(
         callback,
-        SimpleNamespace(action=IntakeAction.TRANSFER),
+        SimpleNamespace(action=IntakeAction.ROUTE),
         AsyncMock(),
         services,
         _settings(),
@@ -15959,12 +16757,126 @@ async def test_transfer_action_surfaces_stale_same_group_reference_as_external_c
     )
 
     assert message.edit_text.await_args_list == [
-        call('Transferring...', reply_markup=None),
+        call('Routing...', reply_markup=None),
         call('External clip(s)', reply_markup=None),
     ]
     message.answer.assert_not_awaited()
     clip_store.compact.assert_not_awaited()
     assert services.chat_message_buffer.peek_raw(77) == []
+
+
+@pytest.mark.asyncio
+async def test_route_action_rejects_mixed_external_and_internal_clips_before_side_effects() -> None:
+    message = _fake_message(text='Select action:', chat_id=77, message_id=85)
+    callback = _fake_callback(message)
+    state = _FakeState()
+    buffer = ChatMessageBuffer()
+    source_group = ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1)
+    source_sub_group = ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.EXTRA)
+    buffer.append(_fake_message(chat_id=77, message_id=1, text='w251'), chat_id=77)
+    buffer.append(
+        _fake_message(
+            chat_id=77,
+            message_id=2,
+            video=_fake_video(file_id='f1', file_name='fresh-upload.mp4'),
+        ),
+        chat_id=77,
+    )
+    buffer.append(
+        _fake_message(
+            chat_id=77,
+            message_id=3,
+            video=_fake_video(file_id='f2', file_name=_stored_filename(source_group, source_sub_group, _CLIP_ID_1)),
+        ),
+        chat_id=77,
+    )
+    clip_store = SimpleNamespace(store=AsyncMock(), transfer=AsyncMock(), compact=AsyncMock())
+    bot = AsyncMock()
+    services = _services(clip_store=clip_store, buffer=buffer)
+
+    await on_intake_action(
+        callback,
+        SimpleNamespace(action=IntakeAction.ROUTE),
+        bot,
+        services,
+        _settings(),
+        state,
+    )
+
+    message.edit_text.assert_awaited_once_with('Mixed clip types', reply_markup=None)
+    clip_store.store.assert_not_awaited()
+    clip_store.transfer.assert_not_awaited()
+    clip_store.compact.assert_not_awaited()
+    bot.get_file.assert_not_awaited()
+    bot.download_file.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_route_action_requires_physical_group_for_internal_route() -> None:
+    message = _fake_message(text='Select action:', chat_id=77, message_id=86)
+    callback = _fake_callback(message)
+    state = _FakeState()
+    buffer = ChatMessageBuffer()
+    source_group = ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1)
+    source_sub_group = ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.EXTRA)
+    buffer.append(_fake_message(chat_id=77, message_id=1, text='w251a'), chat_id=77)
+    buffer.append(
+        _fake_message(
+            chat_id=77,
+            message_id=2,
+            video=_fake_video(file_id='f1', file_name=_stored_filename(source_group, source_sub_group, _CLIP_ID_1)),
+        ),
+        chat_id=77,
+    )
+    clip_store = SimpleNamespace(transfer=AsyncMock(), compact=AsyncMock())
+    services = _services(clip_store=clip_store, buffer=buffer)
+
+    await on_intake_action(
+        callback,
+        SimpleNamespace(action=IntakeAction.ROUTE),
+        AsyncMock(),
+        services,
+        _settings(),
+        state,
+    )
+
+    message.edit_text.assert_awaited_once_with('Physical group required', reply_markup=None)
+    clip_store.transfer.assert_not_awaited()
+    clip_store.compact.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_route_action_requires_physical_group_for_internal_route_caption() -> None:
+    message = _fake_message(text='Select action:', chat_id=77, message_id=87)
+    callback = _fake_callback(message)
+    state = _FakeState()
+    buffer = ChatMessageBuffer()
+    source_group = ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1)
+    source_sub_group = ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.EXTRA)
+    buffer.append(
+        _fake_message(
+            chat_id=77,
+            message_id=1,
+            caption='w251a',
+            video=_fake_video(file_id='f1', file_name=_stored_filename(source_group, source_sub_group, _CLIP_ID_1)),
+        ),
+        chat_id=77,
+    )
+    clip_store = SimpleNamespace(transfer=AsyncMock(), compact=AsyncMock())
+    services = _services(clip_store=clip_store, buffer=buffer)
+
+    await on_intake_action(
+        callback,
+        SimpleNamespace(action=IntakeAction.ROUTE),
+        AsyncMock(),
+        services,
+        _settings(),
+        state,
+    )
+
+    message.edit_text.assert_awaited_once_with('Physical group required', reply_markup=None)
+    clip_store.transfer.assert_not_awaited()
+    clip_store.compact.assert_not_awaited()
 
 
 @pytest.mark.asyncio

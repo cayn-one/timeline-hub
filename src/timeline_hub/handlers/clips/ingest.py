@@ -65,16 +65,18 @@ from timeline_hub.handlers.clips.reorder_flow import (
     reordered_video_messages,
     show_reorder_selection_menu,
 )
-from timeline_hub.handlers.clips.route_planning import RouteBatch, plan_route_batches
+from timeline_hub.handlers.clips.route_planning import RouteBatch, parse_route_text, plan_route_batches
 from timeline_hub.handlers.clips.store_execution import _uses_dense_layout, execute_store_or_produce
 from timeline_hub.handlers.clips.transfer_planning import TransferBatch, plan_transfer_batches
 from timeline_hub.handlers.menu import (
     callback_message,
     create_padding_line,
+    dummy_button,
     handle_stale_selection,
     selected_text,
     selection_keyboard,
     selection_text,
+    three_row_keyboard,
     validate_flow_state,
 )
 from timeline_hub.infra.ffmpeg import UnsupportedVideoCodecError
@@ -132,6 +134,12 @@ class IntakeCallbackData(CallbackData, prefix='clip_intake'):
     value: str
 
 
+class RouteRequestKind(StrEnum):
+    EXTERNAL = auto()
+    INTERNAL = auto()
+    MIXED = auto()
+
+
 @dataclass(slots=True)
 class _RouteResult:
     selection_groups: list[ClipGroup]
@@ -143,6 +151,12 @@ class _RouteResult:
 @dataclass(slots=True)
 class _TransferExecutionResult:
     transfer_result: TransferResult
+
+
+@dataclass(frozen=True, slots=True)
+class _BufferedRouteClip:
+    message: Message
+    kind: RouteRequestKind
 
 
 def _pack_intake_menu_callback(action: MenuAction, step: MenuStep, value: str) -> str:
@@ -426,11 +440,25 @@ async def on_intake_action(
             # UI stateless and simple; users must resend clips if validation fails.
             route_message_groups = services.chat_message_buffer.peek_grouped(message.chat.id)
             services.chat_message_buffer.flush(message.chat.id)
+            route_kind, route_clip_messages = _classify_route_request(route_message_groups)
+            if route_kind is RouteRequestKind.MIXED:
+                await message.edit_text('Mixed clip types', reply_markup=None)
+                return
+            if route_kind is RouteRequestKind.INTERNAL:
+                await _execute_internal_route_action(
+                    message=message,
+                    services=services,
+                    settings=settings,
+                    state=state,
+                    transfer_message_groups=route_message_groups,
+                )
+                return
+
             route_batches, error_text = plan_route_batches(route_message_groups, settings=settings)
             if error_text is not None:
                 await message.edit_text(error_text, reply_markup=None)
                 return
-            if not route_batches:
+            if not route_batches or not route_clip_messages:
                 await message.edit_text('No clips received', reply_markup=None)
                 return
 
@@ -452,71 +480,38 @@ async def on_intake_action(
             except UnsupportedVideoCodecError:
                 await message.edit_text('Invalid codec', reply_markup=None)
                 return
-            await message.answer(**store_summary_kwargs(route_result.store_result))
-
             for clip_group, sub_season in route_result.compact_targets:
-                try:
-                    await services.clip_store.compact(
-                        clip_group,
-                        ClipSubGroup(sub_season=sub_season, scope=Scope.SOURCE),
-                        batch_size=_TELEGRAM_MEDIA_GROUP_LIMIT,
-                    )
-                except Exception:
-                    logger.exception(
-                        'post-store clip compaction failed for {} {}',
-                        clip_group,
-                        ClipSubGroup(sub_season=sub_season, scope=Scope.SOURCE),
-                    )
-                    raise
+                for clip_sub_group in (
+                    ClipSubGroup(sub_season=sub_season, scope=Scope.SOURCE),
+                    ClipSubGroup(sub_season=sub_season, scope=Scope.EXTRA),
+                ):
+                    try:
+                        await services.clip_store.compact(
+                            clip_group,
+                            clip_sub_group,
+                            batch_size=_TELEGRAM_MEDIA_GROUP_LIMIT,
+                            require_exists=clip_sub_group.scope is Scope.SOURCE,
+                        )
+                    except Exception:
+                        logger.exception(
+                            'post-store clip compaction failed for {} {}',
+                            clip_group,
+                            clip_sub_group,
+                        )
+                        raise
+            await message.answer(**store_summary_kwargs(route_result.store_result))
 
         case IntakeAction.TRANSFER:
             await state.clear()
             transfer_message_groups = services.chat_message_buffer.peek_grouped(message.chat.id)
             services.chat_message_buffer.flush(message.chat.id)
-            transfer_batches, error_text = plan_transfer_batches(transfer_message_groups, settings=settings)
-            if error_text is not None:
-                await message.edit_text(error_text, reply_markup=None)
-                return
-            if not transfer_batches:
-                await message.edit_text('No clips received', reply_markup=None)
-                return
-
-            await message.edit_text('Transferring...', reply_markup=None)
-
-            async def update_transfer_progress(selection_batches: Sequence[TransferBatch]) -> None:
-                await message.edit_text(
-                    **_transfer_progress_kwargs(selection_batches),
-                    reply_markup=None,
-                )
-
-            try:
-                transfer_result = await _transfer_clip_batches(
-                    services=services,
-                    transfer_batches=transfer_batches,
-                    on_batch_transferred=update_transfer_progress,
-                )
-            except ClipGroupNotFoundError, UnknownClipsError:
-                await message.edit_text('External clip(s)', reply_markup=None)
-                return
-            await message.answer(**_transfer_summary_kwargs(transfer_result.transfer_result))
-
-            for clip_group, clip_sub_group in transfer_result.transfer_result.affected_sub_groups:
-                if not _uses_dense_layout(clip_sub_group.scope):
-                    continue
-                try:
-                    await services.clip_store.compact(
-                        clip_group,
-                        clip_sub_group,
-                        batch_size=_TELEGRAM_MEDIA_GROUP_LIMIT,
-                        require_exists=False,
-                    )
-                except Exception:
-                    logger.exception(
-                        'post-transfer clip compaction failed for {} {}',
-                        clip_group,
-                        clip_sub_group,
-                    )
-                    raise
+            await _execute_internal_route_action(
+                message=message,
+                services=services,
+                settings=settings,
+                state=state,
+                transfer_message_groups=transfer_message_groups,
+            )
 
 
 @router.callback_query(
@@ -1311,6 +1306,92 @@ async def _transfer_clip_batches(
     )
 
 
+def _classify_route_request(
+    message_groups: Sequence[MessageGroup],
+) -> tuple[RouteRequestKind, list[_BufferedRouteClip]]:
+    buffered_clips: list[_BufferedRouteClip] = []
+    seen_kinds: set[RouteRequestKind] = set()
+
+    for message_group in message_groups:
+        for message in message_group:
+            if extract_clip_file_id(message) is None:
+                continue
+            route_kind = _route_clip_kind(message)
+            seen_kinds.add(route_kind)
+            buffered_clips.append(_BufferedRouteClip(message=message, kind=route_kind))
+
+    if RouteRequestKind.EXTERNAL in seen_kinds and RouteRequestKind.INTERNAL in seen_kinds:
+        return RouteRequestKind.MIXED, buffered_clips
+    if RouteRequestKind.INTERNAL in seen_kinds:
+        return RouteRequestKind.INTERNAL, buffered_clips
+    return RouteRequestKind.EXTERNAL, buffered_clips
+
+
+def _route_clip_kind(message: Message) -> RouteRequestKind:
+    file_name = _route_message_filename(message)
+    if not file_name:
+        return RouteRequestKind.EXTERNAL
+    try:
+        parse_clip_identity_filename(file_name)
+    except ValueError:
+        return RouteRequestKind.EXTERNAL
+    return RouteRequestKind.INTERNAL
+
+
+async def _execute_internal_route_action(
+    *,
+    message: Message,
+    services: Services,
+    settings: Settings,
+    state: FSMContext,
+    transfer_message_groups: Sequence[MessageGroup],
+) -> None:
+    del state
+    transfer_batches, error_text = plan_transfer_batches(transfer_message_groups, settings=settings)
+    if error_text is not None:
+        await message.edit_text(error_text, reply_markup=None)
+        return
+    if not transfer_batches:
+        await message.edit_text('No clips received', reply_markup=None)
+        return
+
+    await message.edit_text('Routing...', reply_markup=None)
+
+    async def update_transfer_progress(selection_batches: Sequence[TransferBatch]) -> None:
+        await message.edit_text(
+            **_transfer_progress_kwargs(selection_batches),
+            reply_markup=None,
+        )
+
+    try:
+        transfer_result = await _transfer_clip_batches(
+            services=services,
+            transfer_batches=transfer_batches,
+            on_batch_transferred=update_transfer_progress,
+        )
+    except ClipGroupNotFoundError, UnknownClipsError:
+        await message.edit_text('External clip(s)', reply_markup=None)
+        return
+    for clip_group, clip_sub_group in transfer_result.transfer_result.affected_sub_groups:
+        if not _uses_dense_layout(clip_sub_group.scope):
+            continue
+        try:
+            await services.clip_store.compact(
+                clip_group,
+                clip_sub_group,
+                batch_size=_TELEGRAM_MEDIA_GROUP_LIMIT,
+                require_exists=False,
+            )
+        except Exception:
+            logger.exception(
+                'post-transfer clip compaction failed for {} {}',
+                clip_group,
+                clip_sub_group,
+            )
+            raise
+    await message.answer(**_transfer_summary_kwargs(transfer_result.transfer_result))
+
+
 async def _clip_messages_to_clip_files(
     *,
     bot: Bot,
@@ -1463,14 +1544,14 @@ def _intake_action_menu_kwargs(
     clip_count = clip_count_override
     has_video_clip_messages = False
     has_document_clip_messages = False
-    has_standalone_text_messages = False
+    has_route_menu_signal = False
     if clip_count is None:
         clip_count = 0
     for message in raw_messages:
         if message.video is not None:
             has_video_clip_messages = True
-        if isinstance(message.text, str) and message.text.strip():
-            has_standalone_text_messages = True
+        if _message_has_route_menu_signal(message):
+            has_route_menu_signal = True
         clip_file_id = extract_clip_file_id(message)
         if clip_file_id is not None:
             if clip_count_override is None:
@@ -1481,25 +1562,40 @@ def _intake_action_menu_kwargs(
         return None
     buffer_version = services.chat_message_buffer.version(chat_id)
     document_only_clip_buffer = has_document_clip_messages and not has_video_clip_messages
-    if has_standalone_text_messages:
-        action_buttons = [
-            _create_intake_action_button(IntakeAction.ROUTE, buffer_version=buffer_version),
-            _create_intake_action_button(IntakeAction.TRANSFER, buffer_version=buffer_version),
-        ]
+    if has_route_menu_signal:
+        route_button = _create_intake_action_button(IntakeAction.ROUTE, buffer_version=buffer_version)
+        cancel_button = _create_intake_action_button(IntakeAction.CANCEL, buffer_version=buffer_version)
+        reply_markup = three_row_keyboard(
+            top_row=[route_button],
+            middle_row=[dummy_button()],
+            bottom_row=[cancel_button],
+        )
     elif document_only_clip_buffer:
         action_buttons = [
-            _create_intake_action_button(IntakeAction.ROUTE, buffer_version=buffer_version),
             _create_intake_action_button(IntakeAction.PRODUCE, buffer_version=buffer_version),
         ]
+        reply_markup = selection_keyboard(
+            buttons=action_buttons,
+            back_button=_create_intake_action_button(
+                IntakeAction.CANCEL,
+                buffer_version=buffer_version,
+            ),
+        )
     else:
         action_buttons = [
             _create_intake_action_button(IntakeAction.REORDER, buffer_version=buffer_version),
             _create_intake_action_button(IntakeAction.COMPACT, buffer_version=buffer_version),
-            _create_intake_action_button(IntakeAction.ROUTE, buffer_version=buffer_version),
             _create_intake_action_button(IntakeAction.REMOVE, buffer_version=buffer_version),
             _create_intake_action_button(IntakeAction.PRODUCE, buffer_version=buffer_version),
             _create_intake_action_button(IntakeAction.RECONCILE, buffer_version=buffer_version),
         ]
+        reply_markup = selection_keyboard(
+            buttons=action_buttons,
+            back_button=_create_intake_action_button(
+                IntakeAction.CANCEL,
+                buffer_version=buffer_version,
+            ),
+        )
     return {
         **Text(
             create_padding_line(message_width),
@@ -1509,14 +1605,18 @@ def _intake_action_menu_kwargs(
         ).as_kwargs(),
         # Root clip actions are versioned because these are destructive,
         # state-coupled callbacks that must not survive buffer changes.
-        'reply_markup': selection_keyboard(
-            buttons=action_buttons,
-            back_button=_create_intake_action_button(
-                IntakeAction.CANCEL,
-                buffer_version=buffer_version,
-            ),
-        ),
+        'reply_markup': reply_markup,
     }
+
+
+def _message_has_route_menu_signal(message: Message) -> bool:
+    if isinstance(message.text, str) and parse_route_text(message.text) is not None:
+        return True
+    if extract_clip_file_id(message) is None:
+        return False
+    if not isinstance(message.caption, str):
+        return False
+    return parse_route_text(message.caption) is not None
 
 
 async def try_dispatch_clip_intake(
@@ -1576,7 +1676,7 @@ def _route_progress_kwargs(route_batches: Sequence[RouteBatch]) -> dict[str, Any
 
 
 def _transfer_progress_kwargs(transfer_batches: Sequence[TransferBatch]) -> dict[str, Any]:
-    parts: list[object] = ['Transferring...']
+    parts: list[object] = ['Routing...']
 
     for transfer_batch in transfer_batches:
         parts.extend(

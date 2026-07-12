@@ -50,8 +50,12 @@ def plan_transfer_batches(
                 if message.text is None:
                     continue
 
+                destination_text = message.text
+                if _is_sub_group_route_text(destination_text):
+                    return [], 'Physical group required'
+
                 parsed_destination = _parse_and_validate_destination(
-                    message.text,
+                    destination_text,
                     today=today,
                     allowed_years=allowed_years,
                 )
@@ -70,14 +74,13 @@ def plan_transfer_batches(
             clip_file_name = _transfer_clip_file_name(message)
             if not clip_file_name:
                 return [], 'External clip(s)'
-            if pending_destination is None:
-                return [], 'Invalid input'
 
-            if message.text is not None:
+            route_text = message.caption if message.caption is not None else message.text
+            if route_text is not None:
+                if _is_sub_group_route_text(route_text):
+                    return [], 'Physical group required'
                 parsed_destination = _parse_and_validate_destination(
-                    message.text,
-                    today=today,
-                    allowed_years=allowed_years,
+                    route_text, today=today, allowed_years=allowed_years
                 )
                 if parsed_destination is not None:
                     if pending_clips:
@@ -88,7 +91,8 @@ def plan_transfer_batches(
                         )
                         pending_clips = []
                     pending_destination = parsed_destination
-                    continue
+            if pending_destination is None:
+                return [], 'Invalid input'
 
             try:
                 source_group, clip_id = parse_clip_identity_filename(clip_file_name)
@@ -165,3 +169,14 @@ def _parse_and_validate_destination(
     if parsed_group.season not in store_allowed_seasons(year=parsed_group.year, today=today):
         return None
     return parsed_group
+
+
+def _is_sub_group_route_text(text: str) -> bool:
+    parsed_destination = parse_group_selector_text(
+        text,
+        allow_sub_season_suffix=True,
+    )
+    if parsed_destination is None:
+        return False
+    _parsed_group, parsed_sub_season = parsed_destination
+    return parsed_sub_season.exists

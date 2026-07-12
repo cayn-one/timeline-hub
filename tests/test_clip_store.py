@@ -18,6 +18,7 @@ from timeline_hub.services.clip_store import (
     ClipRemoveManifestSyncError,
     ClipStore,
     ClipSubGroup,
+    ClipTransferSyncError,
     DuplicateClipIdsError,
     FetchedClip,
     InvalidClipIdentityError,
@@ -181,24 +182,42 @@ class _FakeS3Client:
         *,
         delete_failures: set[str] | None = None,
         move_failures: set[tuple[str, str]] | None = None,
+        move_gate: asyncio.Event | None = None,
+        put_gate: asyncio.Event | None = None,
         put_failures: set[str] | None = None,
         prefixes: list[str] | None = None,
     ) -> None:
         self.objects = dict(objects or {})
         self.delete_failures = set(delete_failures or set())
         self.move_failures = set(move_failures or set())
+        self.move_gate = move_gate
+        self.put_gate = put_gate
         self.put_failures = set(put_failures or set())
         self.prefixes = list(prefixes or [])
         self.get_calls: list[str] = []
         self.put_calls: list[tuple[str, bytes, str | None]] = []
         self.deleted_keys: list[str] = []
         self.moved_keys: list[tuple[str, str]] = []
+        self.move_started_keys: list[tuple[str, str]] = []
+        self.put_started_keys: list[str] = []
+        self.active_puts = 0
+        self.max_active_puts = 0
+        self.active_moves = 0
+        self.max_active_moves = 0
 
     async def put_bytes(self, key: str, data: bytes, *, content_type: str | None = None) -> None:
-        if key in self.put_failures:
-            raise RuntimeError(f'boom putting {key}')
-        self.objects[key] = data
-        self.put_calls.append((key, data, content_type))
+        self.active_puts += 1
+        self.max_active_puts = max(self.max_active_puts, self.active_puts)
+        self.put_started_keys.append(key)
+        try:
+            if self.put_gate is not None:
+                await self.put_gate.wait()
+            if key in self.put_failures:
+                raise RuntimeError(f'boom putting {key}')
+            self.objects[key] = data
+            self.put_calls.append((key, data, content_type))
+        finally:
+            self.active_puts -= 1
 
     async def get_bytes(self, key: str) -> bytes:
         self.get_calls.append(key)
@@ -228,15 +247,23 @@ class _FakeS3Client:
 
     async def move(self, source_key: str, target_key: str, *, overwrite: bool = False) -> None:
         del overwrite
-        if (source_key, target_key) in self.move_failures:
-            raise RuntimeError(f'boom moving {source_key} -> {target_key}')
+        self.active_moves += 1
+        self.max_active_moves = max(self.max_active_moves, self.active_moves)
+        self.move_started_keys.append((source_key, target_key))
         try:
-            payload = self.objects[source_key]
-        except KeyError as error:
-            raise S3ObjectNotFoundError(source_key) from error
-        self.objects[target_key] = payload
-        self.objects.pop(source_key, None)
-        self.moved_keys.append((source_key, target_key))
+            if self.move_gate is not None:
+                await self.move_gate.wait()
+            if (source_key, target_key) in self.move_failures:
+                raise RuntimeError(f'boom moving {source_key} -> {target_key}')
+            try:
+                payload = self.objects[source_key]
+            except KeyError as error:
+                raise S3ObjectNotFoundError(source_key) from error
+            self.objects[target_key] = payload
+            self.objects.pop(source_key, None)
+            self.moved_keys.append((source_key, target_key))
+        finally:
+            self.active_moves -= 1
 
 
 def _clip_key(*, year: int, season: Season, universe: Universe, clip_id: str) -> str:
@@ -310,8 +337,13 @@ def _mp4_file(data: bytes) -> FileBytes:
     return FileBytes(data=data, extension=Extension.MP4)
 
 
-def _store(s3_client: _FakeS3Client) -> ClipStore:
-    return ClipStore(s3_client, namespace=_CLIP_NAMESPACE, sampled_phash_mean_threshold=1.5)
+def _store(s3_client: _FakeS3Client, *, max_s3_concurrency: int = 8) -> ClipStore:
+    return ClipStore(
+        s3_client,
+        namespace=_CLIP_NAMESPACE,
+        max_s3_concurrency=max_s3_concurrency,
+        sampled_phash_mean_threshold=1.5,
+    )
 
 
 def _entry(**kwargs: object) -> ManifestEntry:
@@ -3224,6 +3256,108 @@ async def test_store_uploads_all_clips_successfully_with_concurrent_uploads(
 
 
 @pytest.mark.asyncio
+async def test_store_uploads_multiple_clips_with_bounded_s3_concurrency(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_hashes(monkeypatch, {b'first': _HASH_A, b'second': _HASH_B, b'third': _HASH_C})
+    _patch_uuid7(monkeypatch, _UUID_1, _UUID_2, _UUID_3)
+    put_gate = asyncio.Event()
+    s3_client = _FakeS3Client(put_gate=put_gate)
+    store = _store(s3_client, max_s3_concurrency=2)
+
+    store_task = asyncio.create_task(
+        store.store(
+            ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1),
+            ClipSubGroup(sub_season=SubSeason.A, scope=Scope.COLLECTION),
+            clips=[
+                _mp4_file(b'first'),
+                _mp4_file(b'second'),
+                _mp4_file(b'third'),
+            ],
+        )
+    )
+
+    while s3_client.max_active_puts < 2:
+        await asyncio.sleep(0)
+    put_gate.set()
+
+    await store_task
+
+    assert s3_client.max_active_puts == 2
+
+
+@pytest.mark.asyncio
+async def test_store_with_concurrency_one_preserves_sequential_s3_uploads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_hashes(monkeypatch, {b'first': _HASH_A, b'second': _HASH_B})
+    _patch_uuid7(monkeypatch, _UUID_1, _UUID_2)
+    put_gate = asyncio.Event()
+    s3_client = _FakeS3Client(put_gate=put_gate)
+    store = _store(s3_client, max_s3_concurrency=1)
+
+    store_task = asyncio.create_task(
+        store.store(
+            ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1),
+            ClipSubGroup(sub_season=SubSeason.A, scope=Scope.COLLECTION),
+            clips=[
+                _mp4_file(b'first'),
+                _mp4_file(b'second'),
+            ],
+        )
+    )
+
+    while s3_client.active_puts < 1:
+        await asyncio.sleep(0)
+    put_gate.set()
+
+    await store_task
+
+    assert s3_client.max_active_puts == 1
+
+
+@pytest.mark.asyncio
+async def test_store_waits_for_all_uploads_before_raising_sync_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_hashes(monkeypatch, {b'first': _HASH_A, b'second': _HASH_B, b'third': _HASH_C})
+    _patch_uuid7(monkeypatch, _UUID_1, _UUID_2, _UUID_3)
+    clip_group = ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1)
+    clip_sub_group = ClipSubGroup(sub_season=SubSeason.A, scope=Scope.COLLECTION)
+    manifest_key = _manifest_key(year=2024, season=Season.S1, universe=Universe.WEST)
+    second_clip_key = _clip_key(year=2024, season=Season.S1, universe=Universe.WEST, clip_id=_UUID_2)
+    put_gate = asyncio.Event()
+    s3_client = _FakeS3Client(
+        {_manifest_key(year=2024, season=Season.S1, universe=Universe.WEST): _manifest_bytes([])},
+        put_failures={second_clip_key},
+        put_gate=put_gate,
+    )
+    store = _store(s3_client, max_s3_concurrency=2)
+
+    store_task = asyncio.create_task(
+        store.store(
+            clip_group,
+            clip_sub_group,
+            clips=[
+                _mp4_file(b'first'),
+                _mp4_file(b'second'),
+                _mp4_file(b'third'),
+            ],
+        )
+    )
+
+    while s3_client.max_active_puts < 2:
+        await asyncio.sleep(0)
+    put_gate.set()
+
+    with pytest.raises(ClipManifestSyncError, match='clip_upload'):
+        await store_task
+
+    assert s3_client.active_puts == 0
+    assert manifest_key not in [key for key, _, _ in s3_client.put_calls]
+
+
+@pytest.mark.asyncio
 async def test_store_raises_sync_error_when_manifest_write_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -4248,6 +4382,870 @@ async def test_transfer_fails_loudly_when_destination_already_contains_clip_id()
     assert json.loads(s3_client.objects[destination_manifest_key].decode('utf-8')) == _manifest_payload(
         destination_manifest_entries
     )
+
+
+@pytest.mark.asyncio
+async def test_transfer_moves_multiple_clips_with_bounded_s3_concurrency() -> None:
+    move_gate = asyncio.Event()
+    source_group = ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1)
+    destination_group = ClipGroup(universe=Universe.WEST, year=2024, season=Season.S2)
+    source_manifest_key = _manifest_key(year=2024, season=Season.S1, universe=Universe.WEST)
+    destination_manifest_key = _manifest_key(year=2024, season=Season.S2, universe=Universe.WEST)
+    source_clip_key_1 = _clip_key(year=2024, season=Season.S1, universe=Universe.WEST, clip_id=_UUID_1)
+    source_clip_key_2 = _clip_key(year=2024, season=Season.S1, universe=Universe.WEST, clip_id=_UUID_2)
+    destination_clip_key_1 = _clip_key(year=2024, season=Season.S2, universe=Universe.WEST, clip_id=_UUID_1)
+    destination_clip_key_2 = _clip_key(year=2024, season=Season.S2, universe=Universe.WEST, clip_id=_UUID_2)
+    s3_client = _FakeS3Client(
+        {
+            source_manifest_key: _manifest_bytes(
+                [
+                    _entry(
+                        id=_UUID_1,
+                        video_hash=_HASH_A,
+                        sub_season=SubSeason.NONE,
+                        scope=Scope.EXTRA,
+                        batch=1,
+                        order=1,
+                    ),
+                    _entry(
+                        id=_UUID_2,
+                        video_hash=_HASH_B,
+                        frame_count=None,
+                        sampled_phashes=None,
+                        sub_season=SubSeason.NONE,
+                        scope=Scope.EXTRA,
+                        batch=1,
+                        order=2,
+                    ),
+                ]
+            ),
+            destination_manifest_key: _manifest_bytes([]),
+            source_clip_key_1: b'one',
+            source_clip_key_2: b'two',
+        },
+        move_gate=move_gate,
+    )
+    store = _store(s3_client, max_s3_concurrency=2)
+
+    transfer_task = asyncio.create_task(
+        store.transfer(
+            destination_group=destination_group,
+            clips=[
+                TransferClipRef(source_group=source_group, clip_id=_UUID_1),
+                TransferClipRef(source_group=source_group, clip_id=_UUID_2),
+            ],
+        )
+    )
+
+    while s3_client.max_active_moves < 2:
+        await asyncio.sleep(0)
+    move_gate.set()
+
+    result = await transfer_task
+
+    assert result.transferred_count == 2
+    assert s3_client.max_active_moves == 2
+    assert s3_client.moved_keys == [
+        (source_clip_key_1, destination_clip_key_1),
+        (source_clip_key_2, destination_clip_key_2),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_transfer_with_concurrency_one_preserves_sequential_s3_moves() -> None:
+    move_gate = asyncio.Event()
+    source_group = ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1)
+    destination_group = ClipGroup(universe=Universe.WEST, year=2024, season=Season.S2)
+    source_manifest_key = _manifest_key(year=2024, season=Season.S1, universe=Universe.WEST)
+    destination_manifest_key = _manifest_key(year=2024, season=Season.S2, universe=Universe.WEST)
+    source_clip_key_1 = _clip_key(year=2024, season=Season.S1, universe=Universe.WEST, clip_id=_UUID_1)
+    source_clip_key_2 = _clip_key(year=2024, season=Season.S1, universe=Universe.WEST, clip_id=_UUID_2)
+    s3_client = _FakeS3Client(
+        {
+            source_manifest_key: _manifest_bytes(
+                [
+                    _entry(
+                        id=_UUID_1,
+                        video_hash=_HASH_A,
+                        sub_season=SubSeason.NONE,
+                        scope=Scope.EXTRA,
+                        batch=1,
+                        order=1,
+                    ),
+                    _entry(
+                        id=_UUID_2,
+                        video_hash=_HASH_B,
+                        frame_count=None,
+                        sampled_phashes=None,
+                        sub_season=SubSeason.NONE,
+                        scope=Scope.EXTRA,
+                        batch=1,
+                        order=2,
+                    ),
+                ]
+            ),
+            destination_manifest_key: _manifest_bytes([]),
+            source_clip_key_1: b'one',
+            source_clip_key_2: b'two',
+        },
+        move_gate=move_gate,
+    )
+    store = _store(s3_client, max_s3_concurrency=1)
+
+    transfer_task = asyncio.create_task(
+        store.transfer(
+            destination_group=destination_group,
+            clips=[
+                TransferClipRef(source_group=source_group, clip_id=_UUID_1),
+                TransferClipRef(source_group=source_group, clip_id=_UUID_2),
+            ],
+        )
+    )
+
+    while s3_client.active_moves < 1:
+        await asyncio.sleep(0)
+    move_gate.set()
+
+    await transfer_task
+
+    assert s3_client.max_active_moves == 1
+
+
+@pytest.mark.asyncio
+async def test_transfer_moves_raw_before_normalized_for_each_clip() -> None:
+    source_group = ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1)
+    destination_group = ClipGroup(universe=Universe.WEST, year=2024, season=Season.S2)
+    source_manifest_key = _manifest_key(year=2024, season=Season.S1, universe=Universe.WEST)
+    source_clip_key = _clip_key(year=2024, season=Season.S1, universe=Universe.WEST, clip_id=_UUID_1)
+    source_normalized_key = _normalized_clip_key(
+        year=2024,
+        season=Season.S1,
+        universe=Universe.WEST,
+        clip_id=_UUID_1,
+    )
+    destination_clip_key = _clip_key(
+        year=2024,
+        season=Season.S2,
+        universe=Universe.WEST,
+        clip_id=_UUID_1,
+    )
+    destination_normalized_key = _normalized_clip_key(
+        year=2024, season=Season.S2, universe=Universe.WEST, clip_id=_UUID_1
+    )
+    normalization = AudioNormalization(loudness=-14, bitrate=128)
+    s3_client = _FakeS3Client(
+        {
+            source_manifest_key: _manifest_bytes(
+                [
+                    _entry(
+                        id=_UUID_1,
+                        video_hash=_HASH_A,
+                        sub_season=SubSeason.NONE,
+                        scope=Scope.EXTRA,
+                        batch=1,
+                        order=1,
+                        audio_normalization=normalization,
+                    )
+                ]
+            ),
+            source_clip_key: b'one',
+            source_normalized_key: b'one-normalized',
+        }
+    )
+    store = _store(s3_client)
+
+    await store.transfer(
+        destination_group=destination_group,
+        clips=[TransferClipRef(source_group=source_group, clip_id=_UUID_1)],
+    )
+
+    assert s3_client.move_started_keys == [
+        (source_clip_key, destination_clip_key),
+        (source_normalized_key, destination_normalized_key),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_transfer_cancellation_preserves_partial_raw_move_diagnostics_for_normalized_clip() -> None:
+    normalized_move_gate = asyncio.Event()
+    normalized_move_started = asyncio.Event()
+    source_group = ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1)
+    destination_group = ClipGroup(universe=Universe.WEST, year=2024, season=Season.S2)
+    source_manifest_key = _manifest_key(year=2024, season=Season.S1, universe=Universe.WEST)
+    destination_manifest_key = _manifest_key(year=2024, season=Season.S2, universe=Universe.WEST)
+    source_clip_key = _clip_key(year=2024, season=Season.S1, universe=Universe.WEST, clip_id=_UUID_1)
+    source_normalized_key = _normalized_clip_key(
+        year=2024,
+        season=Season.S1,
+        universe=Universe.WEST,
+        clip_id=_UUID_1,
+    )
+    destination_clip_key = _clip_key(
+        year=2024,
+        season=Season.S2,
+        universe=Universe.WEST,
+        clip_id=_UUID_1,
+    )
+    destination_normalized_key = _normalized_clip_key(
+        year=2024, season=Season.S2, universe=Universe.WEST, clip_id=_UUID_1
+    )
+    normalization = AudioNormalization(loudness=-14, bitrate=128)
+
+    class _NormalizedMoveBlockedS3Client(_FakeS3Client):
+        async def move(self, source_key: str, target_key: str, *, overwrite: bool = False) -> None:
+            del overwrite
+            self.active_moves += 1
+            self.max_active_moves = max(self.max_active_moves, self.active_moves)
+            self.move_started_keys.append((source_key, target_key))
+            try:
+                if (source_key, target_key) == (source_normalized_key, destination_normalized_key):
+                    normalized_move_started.set()
+                    await normalized_move_gate.wait()
+                try:
+                    payload = self.objects[source_key]
+                except KeyError as error:
+                    raise S3ObjectNotFoundError(source_key) from error
+                self.objects[target_key] = payload
+                self.objects.pop(source_key, None)
+                self.moved_keys.append((source_key, target_key))
+            finally:
+                self.active_moves -= 1
+
+    s3_client = _NormalizedMoveBlockedS3Client(
+        {
+            source_manifest_key: _manifest_bytes(
+                [
+                    _entry(
+                        id=_UUID_1,
+                        video_hash=_HASH_A,
+                        sub_season=SubSeason.NONE,
+                        scope=Scope.EXTRA,
+                        batch=1,
+                        order=1,
+                        audio_normalization=normalization,
+                    )
+                ]
+            ),
+            destination_manifest_key: _manifest_bytes([]),
+            source_clip_key: b'one',
+            source_normalized_key: b'one-normalized',
+        }
+    )
+    store = _store(s3_client)
+
+    transfer_task = asyncio.create_task(
+        store.transfer(
+            destination_group=destination_group,
+            clips=[TransferClipRef(source_group=source_group, clip_id=_UUID_1)],
+        )
+    )
+
+    await normalized_move_started.wait()
+    transfer_task.cancel()
+
+    with pytest.raises(asyncio.CancelledError) as excinfo:
+        await transfer_task
+
+    assert s3_client.moved_keys == [(source_clip_key, destination_clip_key)]
+    assert destination_clip_key in s3_client.objects
+    assert source_clip_key not in s3_client.objects
+    assert source_normalized_key in s3_client.objects
+    assert destination_normalized_key not in s3_client.objects
+    assert [key for key, _, _ in s3_client.put_calls] == []
+    assert json.loads(s3_client.objects[source_manifest_key].decode('utf-8')) == _manifest_payload(
+        [
+            _entry(
+                id=_UUID_1,
+                video_hash=_HASH_A,
+                sub_season=SubSeason.NONE,
+                scope=Scope.EXTRA,
+                batch=1,
+                order=1,
+                audio_normalization=normalization,
+            )
+        ]
+    )
+    assert json.loads(s3_client.objects[destination_manifest_key].decode('utf-8')) == _manifest_payload([])
+    diagnostics = getattr(excinfo.value, 'transfer_cancellation_diagnostics', None)
+    assert diagnostics is not None
+    assert diagnostics.moved_keys == (destination_clip_key,)
+    assert diagnostics.affected_clip_ids == (_UUID_1,)
+    assert diagnostics.manifest_keys == (destination_manifest_key, source_manifest_key)
+    assert excinfo.value.__notes__ is not None
+    assert any(destination_clip_key in note for note in excinfo.value.__notes__)
+    assert all(destination_normalized_key not in note for note in excinfo.value.__notes__)
+    assert any(_UUID_1 in note for note in excinfo.value.__notes__)
+    assert any(destination_manifest_key in note for note in excinfo.value.__notes__)
+    assert any(source_manifest_key in note for note in excinfo.value.__notes__)
+
+
+@pytest.mark.asyncio
+async def test_transfer_propagates_cancellation_during_concurrent_moves() -> None:
+    move_gate = asyncio.Event()
+    source_group = ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1)
+    destination_group = ClipGroup(universe=Universe.WEST, year=2024, season=Season.S2)
+    source_manifest_key = _manifest_key(year=2024, season=Season.S1, universe=Universe.WEST)
+    destination_manifest_key = _manifest_key(year=2024, season=Season.S2, universe=Universe.WEST)
+    source_clip_key_1 = _clip_key(year=2024, season=Season.S1, universe=Universe.WEST, clip_id=_UUID_1)
+    source_clip_key_2 = _clip_key(year=2024, season=Season.S1, universe=Universe.WEST, clip_id=_UUID_2)
+    source_manifest_entries = [
+        _entry(
+            id=_UUID_1,
+            video_hash=_HASH_A,
+            sub_season=SubSeason.NONE,
+            scope=Scope.EXTRA,
+            batch=1,
+            order=1,
+        ),
+        _entry(
+            id=_UUID_2,
+            video_hash=_HASH_B,
+            frame_count=None,
+            sampled_phashes=None,
+            sub_season=SubSeason.NONE,
+            scope=Scope.EXTRA,
+            batch=1,
+            order=2,
+        ),
+    ]
+    s3_client = _FakeS3Client(
+        {
+            source_manifest_key: _manifest_bytes(source_manifest_entries),
+            destination_manifest_key: _manifest_bytes([]),
+            source_clip_key_1: b'one',
+            source_clip_key_2: b'two',
+        },
+        move_gate=move_gate,
+    )
+    store = _store(s3_client, max_s3_concurrency=2)
+
+    transfer_task = asyncio.create_task(
+        store.transfer(
+            destination_group=destination_group,
+            clips=[
+                TransferClipRef(source_group=source_group, clip_id=_UUID_1),
+                TransferClipRef(source_group=source_group, clip_id=_UUID_2),
+            ],
+        )
+    )
+
+    while s3_client.max_active_moves < 2:
+        await asyncio.sleep(0)
+    transfer_task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await transfer_task
+
+    assert s3_client.moved_keys == []
+    assert [key for key, _, _ in s3_client.put_calls] == []
+    assert json.loads(s3_client.objects[source_manifest_key].decode('utf-8')) == _manifest_payload(
+        source_manifest_entries
+    )
+    assert json.loads(s3_client.objects[destination_manifest_key].decode('utf-8')) == _manifest_payload([])
+
+
+@pytest.mark.asyncio
+async def test_transfer_cancellation_preserves_completed_move_diagnostics() -> None:
+    move_gate = asyncio.Event()
+    first_move = (
+        _clip_key(year=2024, season=Season.S1, universe=Universe.WEST, clip_id=_UUID_1),
+        _clip_key(year=2024, season=Season.S2, universe=Universe.WEST, clip_id=_UUID_1),
+    )
+    blocked_move = (
+        _clip_key(year=2024, season=Season.S1, universe=Universe.WEST, clip_id=_UUID_2),
+        _clip_key(year=2024, season=Season.S2, universe=Universe.WEST, clip_id=_UUID_2),
+    )
+    first_move_done = asyncio.Event()
+    blocked_move_started = asyncio.Event()
+
+    class _PartiallyBlockedMoveS3Client(_FakeS3Client):
+        async def move(self, source_key: str, target_key: str, *, overwrite: bool = False) -> None:
+            del overwrite
+            self.active_moves += 1
+            self.max_active_moves = max(self.max_active_moves, self.active_moves)
+            self.move_started_keys.append((source_key, target_key))
+            try:
+                if (source_key, target_key) == blocked_move:
+                    blocked_move_started.set()
+                    await move_gate.wait()
+                try:
+                    payload = self.objects[source_key]
+                except KeyError as error:
+                    raise S3ObjectNotFoundError(source_key) from error
+                self.objects[target_key] = payload
+                self.objects.pop(source_key, None)
+                self.moved_keys.append((source_key, target_key))
+                if (source_key, target_key) == first_move:
+                    first_move_done.set()
+            finally:
+                self.active_moves -= 1
+
+    source_group = ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1)
+    destination_group = ClipGroup(universe=Universe.WEST, year=2024, season=Season.S2)
+    source_manifest_key = _manifest_key(year=2024, season=Season.S1, universe=Universe.WEST)
+    destination_manifest_key = _manifest_key(year=2024, season=Season.S2, universe=Universe.WEST)
+    source_manifest_entries = [
+        _entry(
+            id=_UUID_1,
+            video_hash=_HASH_A,
+            sub_season=SubSeason.NONE,
+            scope=Scope.EXTRA,
+            batch=1,
+            order=1,
+        ),
+        _entry(
+            id=_UUID_2,
+            video_hash=_HASH_B,
+            frame_count=None,
+            sampled_phashes=None,
+            sub_season=SubSeason.NONE,
+            scope=Scope.EXTRA,
+            batch=1,
+            order=2,
+        ),
+    ]
+    s3_client = _PartiallyBlockedMoveS3Client(
+        {
+            source_manifest_key: _manifest_bytes(source_manifest_entries),
+            destination_manifest_key: _manifest_bytes([]),
+            first_move[0]: b'one',
+            blocked_move[0]: b'two',
+        }
+    )
+    store = _store(s3_client, max_s3_concurrency=2)
+
+    transfer_task = asyncio.create_task(
+        store.transfer(
+            destination_group=destination_group,
+            clips=[
+                TransferClipRef(source_group=source_group, clip_id=_UUID_1),
+                TransferClipRef(source_group=source_group, clip_id=_UUID_2),
+            ],
+        )
+    )
+
+    await first_move_done.wait()
+    await blocked_move_started.wait()
+    transfer_task.cancel()
+
+    with pytest.raises(asyncio.CancelledError) as excinfo:
+        await transfer_task
+
+    assert s3_client.moved_keys == [first_move]
+    assert first_move[1] in s3_client.objects
+    assert first_move[0] not in s3_client.objects
+    assert blocked_move[0] in s3_client.objects
+    assert blocked_move[1] not in s3_client.objects
+    assert [key for key, _, _ in s3_client.put_calls] == []
+    assert json.loads(s3_client.objects[source_manifest_key].decode('utf-8')) == _manifest_payload(
+        source_manifest_entries
+    )
+    assert json.loads(s3_client.objects[destination_manifest_key].decode('utf-8')) == _manifest_payload([])
+    assert excinfo.value.__notes__ is not None
+    assert any(first_move[1] in note for note in excinfo.value.__notes__)
+    assert any(_UUID_1 in note for note in excinfo.value.__notes__)
+    assert any(destination_manifest_key in note for note in excinfo.value.__notes__)
+
+
+@pytest.mark.asyncio
+async def test_transfer_does_not_write_manifests_when_any_concurrent_move_fails() -> None:
+    move_gate = asyncio.Event()
+    source_group = ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1)
+    destination_group = ClipGroup(universe=Universe.WEST, year=2024, season=Season.S2)
+    source_manifest_key = _manifest_key(year=2024, season=Season.S1, universe=Universe.WEST)
+    destination_manifest_key = _manifest_key(year=2024, season=Season.S2, universe=Universe.WEST)
+    source_clip_key_1 = _clip_key(year=2024, season=Season.S1, universe=Universe.WEST, clip_id=_UUID_1)
+    source_clip_key_2 = _clip_key(year=2024, season=Season.S1, universe=Universe.WEST, clip_id=_UUID_2)
+    destination_clip_key_1 = _clip_key(year=2024, season=Season.S2, universe=Universe.WEST, clip_id=_UUID_1)
+    destination_clip_key_2 = _clip_key(year=2024, season=Season.S2, universe=Universe.WEST, clip_id=_UUID_2)
+    source_manifest_entries = [
+        _entry(
+            id=_UUID_1,
+            video_hash=_HASH_A,
+            sub_season=SubSeason.NONE,
+            scope=Scope.EXTRA,
+            batch=1,
+            order=1,
+        ),
+        _entry(
+            id=_UUID_2,
+            video_hash=_HASH_B,
+            frame_count=None,
+            sampled_phashes=None,
+            sub_season=SubSeason.NONE,
+            scope=Scope.EXTRA,
+            batch=1,
+            order=2,
+        ),
+    ]
+    s3_client = _FakeS3Client(
+        {
+            source_manifest_key: _manifest_bytes(source_manifest_entries),
+            destination_manifest_key: _manifest_bytes([]),
+            source_clip_key_1: b'one',
+            source_clip_key_2: b'two',
+        },
+        move_failures={(source_clip_key_2, destination_clip_key_2)},
+        move_gate=move_gate,
+    )
+    store = _store(s3_client, max_s3_concurrency=2)
+
+    transfer_task = asyncio.create_task(
+        store.transfer(
+            destination_group=destination_group,
+            clips=[
+                TransferClipRef(source_group=source_group, clip_id=_UUID_1),
+                TransferClipRef(source_group=source_group, clip_id=_UUID_2),
+            ],
+        )
+    )
+
+    while s3_client.max_active_moves < 2:
+        await asyncio.sleep(0)
+    move_gate.set()
+
+    with pytest.raises(ClipTransferSyncError, match='clip_move') as excinfo:
+        await transfer_task
+
+    assert excinfo.value.stage == 'clip_move'
+    assert excinfo.value.moved_keys == (destination_clip_key_1,)
+    assert excinfo.value.affected_clip_ids == (_UUID_1, _UUID_2)
+    assert [key for key, _, _ in s3_client.put_calls] == []
+    assert json.loads(s3_client.objects[source_manifest_key].decode('utf-8')) == _manifest_payload(
+        source_manifest_entries
+    )
+    assert json.loads(s3_client.objects[destination_manifest_key].decode('utf-8')) == _manifest_payload([])
+
+
+@pytest.mark.asyncio
+async def test_transfer_stops_starting_queued_candidates_after_first_move_failure() -> None:
+    failure_gate = asyncio.Event()
+    sibling_gate = asyncio.Event()
+    source_group = ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1)
+    destination_group = ClipGroup(universe=Universe.WEST, year=2024, season=Season.S2)
+    source_manifest_key = _manifest_key(year=2024, season=Season.S1, universe=Universe.WEST)
+    destination_manifest_key = _manifest_key(year=2024, season=Season.S2, universe=Universe.WEST)
+    source_clip_key_1 = _clip_key(year=2024, season=Season.S1, universe=Universe.WEST, clip_id=_UUID_1)
+    source_clip_key_2 = _clip_key(year=2024, season=Season.S1, universe=Universe.WEST, clip_id=_UUID_2)
+    source_clip_key_3 = _clip_key(year=2024, season=Season.S1, universe=Universe.WEST, clip_id=_UUID_3)
+    source_clip_key_4 = _clip_key(year=2024, season=Season.S1, universe=Universe.WEST, clip_id=_UUID_4)
+    destination_clip_key_2 = _clip_key(year=2024, season=Season.S2, universe=Universe.WEST, clip_id=_UUID_2)
+    source_manifest_entries = [
+        _entry(
+            id=_UUID_1,
+            video_hash=_HASH_A,
+            frame_count=None,
+            sampled_phashes=None,
+            sub_season=SubSeason.NONE,
+            scope=Scope.EXTRA,
+            batch=1,
+            order=1,
+        ),
+        _entry(
+            id=_UUID_2,
+            video_hash=_HASH_B,
+            frame_count=None,
+            sampled_phashes=None,
+            sub_season=SubSeason.NONE,
+            scope=Scope.EXTRA,
+            batch=1,
+            order=2,
+        ),
+        _entry(
+            id=_UUID_3,
+            video_hash=_HASH_C,
+            frame_count=None,
+            sampled_phashes=None,
+            sub_season=SubSeason.NONE,
+            scope=Scope.EXTRA,
+            batch=1,
+            order=3,
+        ),
+        _entry(
+            id=_UUID_4,
+            video_hash=_HASH_D,
+            frame_count=None,
+            sampled_phashes=None,
+            sub_season=SubSeason.NONE,
+            scope=Scope.EXTRA,
+            batch=1,
+            order=4,
+        ),
+    ]
+
+    class _FailClosedMoveS3Client(_FakeS3Client):
+        async def move(self, source_key: str, target_key: str, *, overwrite: bool = False) -> None:
+            del overwrite
+            self.active_moves += 1
+            self.max_active_moves = max(self.max_active_moves, self.active_moves)
+            self.move_started_keys.append((source_key, target_key))
+            try:
+                if source_key == source_clip_key_1:
+                    await failure_gate.wait()
+                    raise RuntimeError(f'boom moving {source_key} -> {target_key}')
+                if source_key == source_clip_key_2:
+                    await sibling_gate.wait()
+                payload = self.objects[source_key]
+                self.objects[target_key] = payload
+                self.objects.pop(source_key, None)
+                self.moved_keys.append((source_key, target_key))
+            finally:
+                self.active_moves -= 1
+
+    s3_client = _FailClosedMoveS3Client(
+        {
+            source_manifest_key: _manifest_bytes(source_manifest_entries),
+            destination_manifest_key: _manifest_bytes([]),
+            source_clip_key_1: b'one',
+            source_clip_key_2: b'two',
+            source_clip_key_3: b'three',
+            source_clip_key_4: b'four',
+        }
+    )
+    store = _store(s3_client, max_s3_concurrency=2)
+
+    transfer_task = asyncio.create_task(
+        store.transfer(
+            destination_group=destination_group,
+            clips=[
+                TransferClipRef(source_group=source_group, clip_id=_UUID_1),
+                TransferClipRef(source_group=source_group, clip_id=_UUID_2),
+                TransferClipRef(source_group=source_group, clip_id=_UUID_3),
+                TransferClipRef(source_group=source_group, clip_id=_UUID_4),
+            ],
+        )
+    )
+
+    while len(s3_client.move_started_keys) < 2:
+        await asyncio.sleep(0)
+    failure_gate.set()
+    sibling_gate.set()
+
+    with pytest.raises(ClipTransferSyncError, match='clip_move') as excinfo:
+        await transfer_task
+
+    assert excinfo.value.stage == 'clip_move'
+    assert excinfo.value.moved_keys == (destination_clip_key_2,)
+    assert excinfo.value.affected_clip_ids == (_UUID_1, _UUID_2)
+    assert source_manifest_key in excinfo.value.manifest_keys
+    assert destination_manifest_key in excinfo.value.manifest_keys
+    assert s3_client.move_started_keys == [
+        (source_clip_key_1, _clip_key(year=2024, season=Season.S2, universe=Universe.WEST, clip_id=_UUID_1)),
+        (source_clip_key_2, destination_clip_key_2),
+    ]
+    assert source_clip_key_3 in s3_client.objects
+    assert source_clip_key_4 in s3_client.objects
+    assert s3_client.active_moves == 0
+    assert [key for key, _, _ in s3_client.put_calls] == []
+    assert json.loads(s3_client.objects[source_manifest_key].decode('utf-8')) == _manifest_payload(
+        source_manifest_entries
+    )
+    assert json.loads(s3_client.objects[destination_manifest_key].decode('utf-8')) == _manifest_payload([])
+
+
+@pytest.mark.asyncio
+async def test_transfer_with_concurrency_one_stops_after_first_move_failure() -> None:
+    source_group = ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1)
+    destination_group = ClipGroup(universe=Universe.WEST, year=2024, season=Season.S2)
+    source_manifest_key = _manifest_key(year=2024, season=Season.S1, universe=Universe.WEST)
+    destination_manifest_key = _manifest_key(year=2024, season=Season.S2, universe=Universe.WEST)
+    source_clip_key_1 = _clip_key(year=2024, season=Season.S1, universe=Universe.WEST, clip_id=_UUID_1)
+    source_clip_key_2 = _clip_key(year=2024, season=Season.S1, universe=Universe.WEST, clip_id=_UUID_2)
+    source_clip_key_3 = _clip_key(year=2024, season=Season.S1, universe=Universe.WEST, clip_id=_UUID_3)
+    source_manifest_entries = [
+        _entry(
+            id=_UUID_1,
+            video_hash=_HASH_A,
+            frame_count=None,
+            sampled_phashes=None,
+            sub_season=SubSeason.NONE,
+            scope=Scope.EXTRA,
+            batch=1,
+            order=1,
+        ),
+        _entry(
+            id=_UUID_2,
+            video_hash=_HASH_B,
+            frame_count=None,
+            sampled_phashes=None,
+            sub_season=SubSeason.NONE,
+            scope=Scope.EXTRA,
+            batch=1,
+            order=2,
+        ),
+        _entry(
+            id=_UUID_3,
+            video_hash=_HASH_C,
+            frame_count=None,
+            sampled_phashes=None,
+            sub_season=SubSeason.NONE,
+            scope=Scope.EXTRA,
+            batch=1,
+            order=3,
+        ),
+    ]
+
+    class _SequentialFailingMoveS3Client(_FakeS3Client):
+        async def move(self, source_key: str, target_key: str, *, overwrite: bool = False) -> None:
+            del overwrite
+            self.active_moves += 1
+            self.max_active_moves = max(self.max_active_moves, self.active_moves)
+            self.move_started_keys.append((source_key, target_key))
+            try:
+                if source_key == source_clip_key_1:
+                    raise RuntimeError(f'boom moving {source_key} -> {target_key}')
+                payload = self.objects[source_key]
+                self.objects[target_key] = payload
+                self.objects.pop(source_key, None)
+                self.moved_keys.append((source_key, target_key))
+            finally:
+                self.active_moves -= 1
+
+    s3_client = _SequentialFailingMoveS3Client(
+        {
+            source_manifest_key: _manifest_bytes(source_manifest_entries),
+            destination_manifest_key: _manifest_bytes([]),
+            source_clip_key_1: b'one',
+            source_clip_key_2: b'two',
+            source_clip_key_3: b'three',
+        }
+    )
+    store = _store(s3_client, max_s3_concurrency=1)
+
+    with pytest.raises(ClipTransferSyncError, match='clip_move') as excinfo:
+        await store.transfer(
+            destination_group=destination_group,
+            clips=[
+                TransferClipRef(source_group=source_group, clip_id=_UUID_1),
+                TransferClipRef(source_group=source_group, clip_id=_UUID_2),
+                TransferClipRef(source_group=source_group, clip_id=_UUID_3),
+            ],
+        )
+
+    assert excinfo.value.affected_clip_ids == (_UUID_1,)
+    assert s3_client.move_started_keys == [
+        (source_clip_key_1, _clip_key(year=2024, season=Season.S2, universe=Universe.WEST, clip_id=_UUID_1))
+    ]
+    assert source_clip_key_2 in s3_client.objects
+    assert source_clip_key_3 in s3_client.objects
+    assert s3_client.active_moves == 0
+    assert [key for key, _, _ in s3_client.put_calls] == []
+
+
+@pytest.mark.asyncio
+async def test_transfer_cancels_sibling_workers_after_unexpected_scheduler_exception(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    completed_move_gate = asyncio.Event()
+    sibling_move_gate = asyncio.Event()
+    source_group = ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1)
+    destination_group = ClipGroup(universe=Universe.WEST, year=2024, season=Season.S2)
+    source_manifest_key = _manifest_key(year=2024, season=Season.S1, universe=Universe.WEST)
+    destination_manifest_key = _manifest_key(year=2024, season=Season.S2, universe=Universe.WEST)
+    source_clip_key_1 = _clip_key(year=2024, season=Season.S1, universe=Universe.WEST, clip_id=_UUID_1)
+    source_clip_key_2 = _clip_key(year=2024, season=Season.S1, universe=Universe.WEST, clip_id=_UUID_2)
+    destination_clip_key_1 = _clip_key(year=2024, season=Season.S2, universe=Universe.WEST, clip_id=_UUID_1)
+    destination_clip_key_2 = _clip_key(year=2024, season=Season.S2, universe=Universe.WEST, clip_id=_UUID_2)
+    source_manifest_entries = [
+        _entry(
+            id=_UUID_1,
+            video_hash=_HASH_A,
+            frame_count=None,
+            sampled_phashes=None,
+            sub_season=SubSeason.NONE,
+            scope=Scope.EXTRA,
+            batch=1,
+            order=1,
+        ),
+        _entry(
+            id=_UUID_2,
+            video_hash=_HASH_B,
+            frame_count=None,
+            sampled_phashes=None,
+            sub_season=SubSeason.NONE,
+            scope=Scope.EXTRA,
+            batch=1,
+            order=2,
+        ),
+    ]
+
+    class _WorkerCrashMoveS3Client(_FakeS3Client):
+        async def move(self, source_key: str, target_key: str, *, overwrite: bool = False) -> None:
+            del overwrite
+            self.active_moves += 1
+            self.max_active_moves = max(self.max_active_moves, self.active_moves)
+            self.move_started_keys.append((source_key, target_key))
+            try:
+                if source_key == source_clip_key_1:
+                    await completed_move_gate.wait()
+                if source_key == source_clip_key_2:
+                    await sibling_move_gate.wait()
+                payload = self.objects[source_key]
+                self.objects[target_key] = payload
+                self.objects.pop(source_key, None)
+                self.moved_keys.append((source_key, target_key))
+            finally:
+                self.active_moves -= 1
+
+    s3_client = _WorkerCrashMoveS3Client(
+        {
+            source_manifest_key: _manifest_bytes(source_manifest_entries),
+            destination_manifest_key: _manifest_bytes([]),
+            source_clip_key_1: b'one',
+            source_clip_key_2: b'two',
+        },
+    )
+    store = _store(s3_client, max_s3_concurrency=2)
+
+    original_get_nowait = asyncio.Queue.get_nowait
+    get_nowait_calls = 0
+
+    def crashing_get_nowait(
+        self: asyncio.Queue[tuple[TransferClipRef, ManifestEntry, object]],
+    ) -> tuple[TransferClipRef, ManifestEntry, object]:
+        nonlocal get_nowait_calls
+        get_nowait_calls += 1
+        if get_nowait_calls == 2:
+            raise RuntimeError('scheduler boom')
+        return original_get_nowait(self)
+
+    monkeypatch.setattr(asyncio.Queue, 'get_nowait', crashing_get_nowait)
+
+    transfer_task = asyncio.create_task(
+        store.transfer(
+            destination_group=destination_group,
+            clips=[
+                TransferClipRef(source_group=source_group, clip_id=_UUID_1),
+                TransferClipRef(source_group=source_group, clip_id=_UUID_2),
+            ],
+        )
+    )
+
+    while s3_client.move_started_keys != [(source_clip_key_1, destination_clip_key_1)]:
+        await asyncio.sleep(0)
+    completed_move_gate.set()
+
+    with pytest.raises(ClipTransferSyncError, match='clip_move') as excinfo:
+        await transfer_task
+
+    assert excinfo.value.failure_detail == "RuntimeError('scheduler boom')"
+    assert excinfo.value.moved_keys == (destination_clip_key_1,)
+    assert _UUID_1 in excinfo.value.affected_clip_ids
+    assert excinfo.value.manifest_keys == (destination_manifest_key, source_manifest_key)
+    assert s3_client.move_started_keys == [
+        (source_clip_key_1, destination_clip_key_1),
+        (source_clip_key_2, destination_clip_key_2),
+    ]
+    assert s3_client.active_moves == 0
+    assert [key for key, _, _ in s3_client.put_calls] == []
+    assert json.loads(s3_client.objects[source_manifest_key].decode('utf-8')) == _manifest_payload(
+        source_manifest_entries
+    )
+    assert json.loads(s3_client.objects[destination_manifest_key].decode('utf-8')) == _manifest_payload([])
+    assert destination_clip_key_1 in s3_client.objects
+    assert source_clip_key_1 not in s3_client.objects
+    assert source_clip_key_2 in s3_client.objects
+    assert destination_clip_key_2 not in s3_client.objects
 
 
 @pytest.mark.asyncio

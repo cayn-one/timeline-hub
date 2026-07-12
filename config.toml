@@ -11,6 +11,8 @@ min_year = 2022
 [clips]
 # S3 namespace for clip manifests and media
 namespace = "clips"
+# Maximum concurrent clip S3 move/upload operations within one clip-store action
+max_s3_concurrency = 8
 # Audio normalization target in LUFS
 normalization_loudness = -14
 # Audio bitrate for normalized output

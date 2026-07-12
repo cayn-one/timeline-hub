@@ -611,6 +611,13 @@ class ClipTransferSyncError(RuntimeError):
 
 
 @dataclass(frozen=True, slots=True)
+class _TransferCancellationDiagnostics:
+    moved_keys: tuple[Key, ...]
+    affected_clip_ids: tuple[ClipId, ...]
+    manifest_keys: tuple[Key, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class _ComparisonManifest:
     group: ClipGroup
     manifest: Manifest
@@ -666,10 +673,18 @@ class ClipStore:
     internal processing byte-based. All returned clip files are MP4.
     """
 
-    def __init__(self, s3_client: S3Client, *, namespace: Prefix, sampled_phash_mean_threshold: float) -> None:
+    def __init__(
+        self,
+        s3_client: S3Client,
+        *,
+        namespace: Prefix,
+        max_s3_concurrency: int,
+        sampled_phash_mean_threshold: float,
+    ) -> None:
         """Initialize the store with an opened generic S3 client."""
         self._s3_client = s3_client
         self._namespace = namespace
+        self._max_s3_concurrency = max_s3_concurrency
         self._sampled_phash_mean_threshold = sampled_phash_mean_threshold
         self._manifest_cache: dict[Prefix, Manifest] = {}
 
@@ -978,12 +993,26 @@ class ClipStore:
         upload_keys = [self._clip_key(clip_group_prefix, entry.id) for entry, _ in new_entries]
         clip_ids = [entry.id for entry, _ in new_entries]
         clip_bytes_list = [clip_bytes for _, clip_bytes in new_entries]
-        upload_results = await asyncio.gather(
-            *(
-                self._s3_client.put_bytes(
+
+        async def upload_clip(
+            semaphore: asyncio.Semaphore,
+            clip_key: Key,
+            clip_bytes: bytes,
+        ) -> None:
+            async with semaphore:
+                await self._s3_client.put_bytes(
                     clip_key,
                     clip_bytes,
                     content_type=S3ContentType.MP4,
+                )
+
+        semaphore = asyncio.Semaphore(self._max_s3_concurrency)
+        upload_results = await asyncio.gather(
+            *(
+                upload_clip(
+                    semaphore,
+                    clip_key,
+                    clip_bytes,
                 )
                 for clip_key, clip_bytes in zip(upload_keys, clip_bytes_list, strict=True)
             ),
@@ -1177,9 +1206,38 @@ class ClipStore:
         )
         moved_keys: list[Key] = []
         moved_clip_ids = [clip.clip_id for clip, _entry in moved_candidates]
+        transfer_cancellation_manifest_keys = [
+            self._manifest_key(destination_prefix),
+            *[
+                self._manifest_key(
+                    self._clip_group_prefix(
+                        universe=group.universe,
+                        year=group.year,
+                        season=group.season,
+                    )
+                )
+                for group in rewritten_source_manifests
+            ],
+        ]
 
-        try:
-            for clip, entry in moved_candidates:
+        @dataclass(frozen=True, slots=True)
+        class _TransferMoveOutcome:
+            clip_id: ClipId
+            moved_keys: tuple[Key, ...]
+            error: BaseException | None = None
+
+        @dataclass(slots=True)
+        class _TransferMoveDiagnostics:
+            clip_id: ClipId
+            moved_keys: list[Key]
+            started: bool = False
+
+        async def move_transfer_candidate(
+            clip: TransferClipRef,
+            entry: ManifestEntry,
+            diagnostics: _TransferMoveDiagnostics,
+        ) -> _TransferMoveOutcome:
+            try:
                 source_prefix = self._clip_group_prefix(
                     universe=clip.source_group.universe,
                     year=clip.source_group.year,
@@ -1188,27 +1246,127 @@ class ClipStore:
                 source_key = self._clip_key(source_prefix, clip.clip_id)
                 destination_key = self._clip_key(destination_prefix, clip.clip_id)
                 await self._s3_client.move(source_key, destination_key)
-                moved_keys.append(destination_key)
+                diagnostics.moved_keys.append(destination_key)
 
-                if entry.audio_normalization is None:
-                    continue
+                if entry.audio_normalization is not None:
+                    normalized_source_key = self._normalized_clip_key(source_prefix, clip.clip_id)
+                    if await self._s3_client.exists(normalized_source_key):
+                        normalized_destination_key = self._normalized_clip_key(destination_prefix, clip.clip_id)
+                        await self._s3_client.move(normalized_source_key, normalized_destination_key)
+                        diagnostics.moved_keys.append(normalized_destination_key)
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                return _TransferMoveOutcome(
+                    clip_id=clip.clip_id,
+                    moved_keys=tuple(diagnostics.moved_keys),
+                    error=error,
+                )
+            return _TransferMoveOutcome(
+                clip_id=clip.clip_id,
+                moved_keys=tuple(diagnostics.moved_keys),
+            )
 
-                normalized_source_key = self._normalized_clip_key(source_prefix, clip.clip_id)
-                if not await self._s3_client.exists(normalized_source_key):
-                    continue
+        def extend_move_diagnostics(outcomes: Iterable[_TransferMoveOutcome]) -> list[_TransferMoveOutcome]:
+            failures: list[_TransferMoveOutcome] = []
+            for outcome in outcomes:
+                moved_keys.extend(outcome.moved_keys)
+                if outcome.error is not None:
+                    failures.append(outcome)
+            return failures
 
-                normalized_destination_key = self._normalized_clip_key(destination_prefix, clip.clip_id)
-                await self._s3_client.move(normalized_source_key, normalized_destination_key)
-                moved_keys.append(normalized_destination_key)
+        def build_cancellation_diagnostics(
+            move_diagnostics: Iterable[_TransferMoveDiagnostics],
+        ) -> _TransferCancellationDiagnostics:
+            return _TransferCancellationDiagnostics(
+                moved_keys=tuple(key for diagnostics in move_diagnostics for key in diagnostics.moved_keys),
+                affected_clip_ids=tuple(diagnostics.clip_id for diagnostics in move_diagnostics if diagnostics.started),
+                manifest_keys=tuple(transfer_cancellation_manifest_keys),
+            )
+
+        def moved_destination_keys(move_diagnostics: Iterable[_TransferMoveDiagnostics]) -> list[Key]:
+            return [key for diagnostics in move_diagnostics for key in diagnostics.moved_keys]
+
+        def started_clip_ids(move_diagnostics: Iterable[_TransferMoveDiagnostics]) -> list[ClipId]:
+            return [diagnostics.clip_id for diagnostics in move_diagnostics if diagnostics.started]
+
+        async def settle_move_tasks(*, cancel_unfinished: bool) -> list[_TransferMoveOutcome]:
+            if cancel_unfinished:
+                for task in move_tasks:
+                    if not task.done():
+                        task.cancel()
+            if not move_tasks:
+                return []
+            settled_results = await asyncio.gather(*move_tasks, return_exceptions=True)
+            return [outcome for result in settled_results if isinstance(result, list) for outcome in result]
+
+        move_tasks: list[asyncio.Task[list[_TransferMoveOutcome]]] = []
+        move_diagnostics = [
+            _TransferMoveDiagnostics(clip_id=clip.clip_id, moved_keys=[]) for clip, _entry in moved_candidates
+        ]
+        try:
+            worker_count = min(self._max_s3_concurrency, len(moved_candidates))
+            pending_candidates: asyncio.Queue[tuple[TransferClipRef, ManifestEntry, _TransferMoveDiagnostics]] = (
+                asyncio.Queue()
+            )
+            for (clip, entry), diagnostics in zip(moved_candidates, move_diagnostics, strict=True):
+                pending_candidates.put_nowait((clip, entry, diagnostics))
+
+            failure_detected = asyncio.Event()
+
+            async def move_worker() -> list[_TransferMoveOutcome]:
+                outcomes: list[_TransferMoveOutcome] = []
+                while not failure_detected.is_set():
+                    try:
+                        clip, entry, diagnostics = pending_candidates.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+                    diagnostics.started = True
+                    outcome = await move_transfer_candidate(clip, entry, diagnostics)
+                    outcomes.append(outcome)
+                    if outcome.error is not None:
+                        failure_detected.set()
+                        break
+                return outcomes
+
+            move_tasks = [asyncio.create_task(move_worker()) for _ in range(worker_count)]
+            move_outcome_groups = await asyncio.gather(*move_tasks)
+        except asyncio.CancelledError as error:
+            move_outcomes = await settle_move_tasks(cancel_unfinished=True)
+            extend_move_diagnostics(move_outcomes)
+            cancellation_diagnostics = build_cancellation_diagnostics(move_diagnostics)
+            if cancellation_diagnostics.moved_keys:
+                error.__dict__['transfer_cancellation_diagnostics'] = cancellation_diagnostics
+                error.add_note(
+                    'Transfer move cancellation left partial physical state; '
+                    f'moved keys: {list(cancellation_diagnostics.moved_keys)}; '
+                    f'affected clip ids: {list(cancellation_diagnostics.affected_clip_ids)}; '
+                    f'manifest keys: {list(cancellation_diagnostics.manifest_keys)}. '
+                    'Manifest state remains unchanged because transfer commit did not start.'
+                )
+            raise
         except Exception as error:
+            await settle_move_tasks(cancel_unfinished=True)
             raise ClipTransferSyncError(
                 stage='clip_move',
-                moved_keys=moved_keys,
-                affected_clip_ids=moved_clip_ids,
-                manifest_keys=[self._manifest_key(destination_prefix)],
+                moved_keys=moved_destination_keys(move_diagnostics),
+                affected_clip_ids=started_clip_ids(move_diagnostics),
+                manifest_keys=transfer_cancellation_manifest_keys,
                 logical_state='Manifest state remains unchanged because transfer commit did not start.',
                 failure_detail=repr(error),
             ) from error
+        move_outcomes = [outcome for outcomes in move_outcome_groups for outcome in outcomes]
+        failures = extend_move_diagnostics(move_outcomes)
+        if failures:
+            failure_details = [f'clip_id={outcome.clip_id}: {outcome.error!r}' for outcome in failures]
+            raise ClipTransferSyncError(
+                stage='clip_move',
+                moved_keys=moved_keys,
+                affected_clip_ids=started_clip_ids(move_diagnostics),
+                manifest_keys=transfer_cancellation_manifest_keys,
+                logical_state='Manifest state remains unchanged because transfer commit did not start.',
+                failure_detail=repr(RuntimeError('; '.join(failure_details))),
+            )
 
         manifest_keys = [self._manifest_key(destination_prefix)]
         try:
