@@ -67,7 +67,11 @@ Pre-commit:
 - Use single quotes for normal strings.
 - Use triple double quotes for triple-quoted strings and docstrings.
 - Use Google-style docstrings.
-- Do not add `from __future__ import annotations` unless there is a real need.
+- Do not add `from __future__ import annotations`; Python 3.14 provides lazy annotation evaluation by default.
+- Do not quote type annotations merely to express forward references.
+- Use normal class names directly, including for classes defined later in the module.
+- Use `Self` when the annotation means the dynamic type of `self` or `cls`; use the concrete class name when a specific class is intended.
+- Keep quoted annotations only when required by an external runtime API or another concrete compatibility constraint, and justify the exception narrowly.
 - Prefer snake_case naming.
 - Use absolute imports from top-level packages.
 - Do not rely on private attributes or methods unless explicitly required or there is no viable public alternative.
