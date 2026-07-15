@@ -77,6 +77,16 @@ Pre-commit:
 - Do not rely on private attributes or methods unless explicitly required or there is no viable public alternative.
 - Document intentional contract-level exceptions in `Raises:` sections.
 - Do not document incidental internal exceptions unless they are part of intended API behavior.
+
+Exception design:
+- Name exceptions by semantic cause or outcome, not by caller handling policy.
+- Avoid exception inheritance used only to control logging severity or catch ordering.
+- Introduce a distinct exception type only when callers may handle the condition differently.
+- Keep object-level conversion outcomes separate from response-, batch-, or operation-level failures.
+- Place exceptions in the module that owns and raises the condition.
+- Re-export exceptions only when they are an intentional part of the public API.
+- Document intended public custom exceptions in Google-style `Raises:` sections.
+
 - In behavioral and API-facing modules, prefer top-down organization:
   - public constants, types, and protocols
   - public classes and functions
