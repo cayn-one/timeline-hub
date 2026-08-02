@@ -1,13 +1,19 @@
 import asyncio
 import contextlib
 import json
+import os
+import shutil
 import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Coroutine, Iterator, Sequence
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
+from typing import TypeVar
+
+from loguru import logger
 
 
 @dataclass(frozen=True, slots=True)
@@ -18,6 +24,14 @@ class TrackMetadata:
 
 class YtDlpMetadataError(RuntimeError):
     """Raised when yt-dlp metadata extraction or parsing fails."""
+
+
+class YtDlpAuthenticationError(RuntimeError):
+    """Raised when yt-dlp reports a known YouTube authentication rejection."""
+
+
+class YtDlpCookieFileError(RuntimeError):
+    """Raised when an operation-local yt-dlp cookie file cannot be prepared."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -33,9 +47,352 @@ class UrlTrackInfo:
     metadata: TrackMetadata | None = None
 
 
+_YT_DLP_SENSITIVE_FLAGS = {
+    '-p',
+    '-u',
+    '--add-headers',
+    '--cookies',
+    '--cookies-from-browser',
+    '--extractor-args',
+    '--netrc',
+    '--netrc-cmd',
+    '--netrc-file',
+    '--netrc-location',
+    '--password',
+    '--proxy',
+    '--user-agent',
+    '--username',
+    '--video-password',
+    '--xff',
+}
+_YT_DLP_MAX_DIAGNOSTIC_TEXT = 2048
+_PROCESS_TERMINATION_GRACE_SECONDS = 1.0
+_T = TypeVar('_T')
+_YOUTUBE_AUTHENTICATION_FAILURE_PHRASES = (
+    "sign in to confirm you're not a bot",
+    'authentication cookies are no longer valid',
+    'authentication cookies are invalid',
+    'authentication cookies have expired',
+    'youtube account cookies are no longer valid',
+    'youtube account cookies are invalid',
+    'youtube account cookies have expired',
+    'please sign in to youtube',
+    'you must be logged in to youtube',
+)
+
+
+def _with_common_yt_dlp_args(
+    args: Sequence[str],
+    *,
+    cookie_file: Path,
+) -> tuple[str, ...]:
+    _validate_cookie_file_path(cookie_file)
+    command = tuple(args)
+    common_args = (
+        '--cookies',
+        str(cookie_file),
+        '--remote-components',
+        'ejs:github',
+        '--ignore-config',
+    )
+    return (command[0], *common_args, *command[1:])
+
+
+def _validate_cookie_file_path(cookie_file: Path) -> None:
+    if not cookie_file.is_absolute():
+        raise ValueError('cookie_file must be an absolute path')
+
+
+@contextlib.contextmanager
+def _isolated_cookie_file(cookie_file: Path) -> Iterator[Path]:
+    """Isolate one operation because yt-dlp writes its cookie jar on shutdown.
+
+    Deletion is best effort: a cleanup failure is logged without masking the
+    operation's result or cancellation.
+    """
+    _validate_cookie_file_path(cookie_file)
+    temporary_path: Path | None = None
+    try:
+        try:
+            with cookie_file.open('rb') as source_file:
+                with tempfile.NamedTemporaryFile(
+                    mode='wb',
+                    dir=cookie_file.parent,
+                    prefix=f'.{cookie_file.name}.operation.',
+                    delete=False,
+                ) as temporary_file:
+                    temporary_path = Path(temporary_file.name)
+                    shutil.copyfileobj(source_file, temporary_file)
+            os.chmod(temporary_path, 0o600)
+        except OSError as error:
+            raise YtDlpCookieFileError('failed to prepare isolated yt-dlp cookie file') from error
+        yield temporary_path
+    finally:
+        if temporary_path is not None:
+            try:
+                temporary_path.unlink()
+            except OSError:
+                logger.warning('failed to remove isolated yt-dlp cookie file')
+
+
+def _sanitize_yt_dlp_args(args: Sequence[str]) -> list[str]:
+    sanitized: list[str] = []
+    skip_next = False
+    for arg in args:
+        if skip_next:
+            sanitized.append('<redacted>')
+            skip_next = False
+            continue
+        flag, has_value, _value = _split_command_option(arg)
+        if flag in _YT_DLP_SENSITIVE_FLAGS:
+            if has_value:
+                sanitized.append(f'{flag}=<redacted>')
+            else:
+                sanitized.append(flag)
+                skip_next = True
+            continue
+        sanitized.append(_sanitize_command_token(arg))
+    return sanitized
+
+
+def _split_command_option(arg: str) -> tuple[str, bool, str]:
+    if '=' not in arg or not arg.startswith('-'):
+        return arg, False, ''
+    flag, value = arg.split('=', 1)
+    return flag, True, value
+
+
+def _sanitize_command_token(token: str) -> str:
+    if not token.startswith(('http://', 'https://')):
+        return token
+    parsed = urllib.parse.urlsplit(token)
+    if parsed.scheme not in {'http', 'https'} or not parsed.netloc:
+        return token
+    netloc = parsed.hostname or ''
+    if parsed.port is not None:
+        netloc = f'{netloc}:{parsed.port}'
+    return urllib.parse.urlunsplit((parsed.scheme, netloc, parsed.path, '', ''))
+
+
+def _truncate_diagnostic_text(text: str, *, max_length: int = _YT_DLP_MAX_DIAGNOSTIC_TEXT) -> str:
+    if len(text) <= max_length:
+        return text
+    omitted = len(text) - max_length
+    marker = f'... <truncated {omitted} chars> ...'
+    if max_length <= len(marker):
+        return marker[:max_length]
+    remaining = max_length - len(marker)
+    prefix_length = remaining // 2
+    suffix_length = remaining - prefix_length
+    return f'{text[:prefix_length]}{marker}{text[-suffix_length:]}'
+
+
+def _is_youtube_authentication_failure(stderr: bytes) -> bool:
+    text = stderr.decode(errors='replace').lower().replace('\u2019', "'")
+    if any(phrase in text for phrase in _YOUTUBE_AUTHENTICATION_FAILURE_PHRASES):
+        return True
+    return 'login required' in text and any(
+        youtube_context in text
+        for youtube_context in (
+            '[youtube',
+            'youtube.com',
+            'youtube account',
+        )
+    )
+
+
+def _format_yt_dlp_failure(
+    *,
+    operation: str,
+    returncode: int,
+    args: Sequence[str],
+    stderr: bytes,
+    stdout: bytes = b'',
+) -> str:
+    stderr_text = _truncate_diagnostic_text(stderr.decode(errors='replace').strip())
+    stdout_text = _truncate_diagnostic_text(stdout.decode(errors='replace').strip())
+    message = (
+        f'yt-dlp {operation} failed with exit code {returncode}; '
+        f'command={_sanitize_yt_dlp_args(args)}; '
+        f'stderr={stderr_text}'
+    )
+    if stdout_text:
+        message += f'; stdout={stdout_text}'
+    return message
+
+
+def _format_process_failure(
+    *,
+    command_name: str,
+    operation: str,
+    returncode: int,
+    args: Sequence[str],
+    stderr: bytes,
+    stdout: bytes = b'',
+) -> str:
+    stderr_text = _truncate_diagnostic_text(stderr.decode(errors='replace').strip())
+    stdout_text = _truncate_diagnostic_text(stdout.decode(errors='replace').strip())
+    message = (
+        f'{command_name} {operation} failed with exit code {returncode}; '
+        f'command={_sanitize_yt_dlp_args(args)}; '
+        f'stderr={stderr_text}'
+    )
+    if stdout_text:
+        message += f'; stdout={stdout_text}'
+    return message
+
+
+def _yt_dlp_timeout_error(*, operation: str, args: Sequence[str], timeout: timedelta) -> asyncio.TimeoutError:
+    return asyncio.TimeoutError(
+        f'yt-dlp {operation} timed out after {timeout.total_seconds()}s; command={_sanitize_yt_dlp_args(args)}'
+    )
+
+
+async def _stop_process(
+    process: asyncio.subprocess.Process,
+    *,
+    grace_seconds: float | None = None,
+) -> None:
+    """Terminate, kill if needed, and reap one owned subprocess."""
+    if grace_seconds is None:
+        grace_seconds = _PROCESS_TERMINATION_GRACE_SECONDS
+    if process.returncode is not None:
+        await process.wait()
+        return
+
+    terminate = getattr(process, 'terminate', None)
+    if callable(terminate):
+        try:
+            terminate()
+        except ProcessLookupError:
+            pass
+    else:
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+
+    wait_task = asyncio.create_task(process.wait())
+    try:
+        await asyncio.wait_for(asyncio.shield(wait_task), timeout=grace_seconds)
+        return
+    except asyncio.TimeoutError:
+        pass
+
+    if process.returncode is None:
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+    await wait_task
+
+
+async def _await_task_after_cancellation(task: asyncio.Task[_T]) -> tuple[_T, bool]:
+    """Wait for a task despite repeated cancellation and report later cancellation."""
+    cancelled_during_cleanup = False
+    while True:
+        try:
+            return await asyncio.shield(task), cancelled_during_cleanup
+        except asyncio.CancelledError:
+            cancelled_during_cleanup = True
+            if task.done():
+                return task.result(), cancelled_during_cleanup
+
+
+async def _await_cleanup_after_cancellation(cleanup: Coroutine[object, object, None]) -> bool:
+    """Finish cleanup despite repeated cancellation and report a later cancellation."""
+    _result, cancelled_during_cleanup = await _await_task_after_cancellation(asyncio.create_task(cleanup))
+    return cancelled_during_cleanup
+
+
+async def _create_owned_subprocess_exec(
+    *args: str,
+    stdin: int | None = None,
+    stdout: int | None = None,
+    stderr: int | None = None,
+) -> asyncio.subprocess.Process:
+    """Create a subprocess without losing ownership if the caller is cancelled."""
+    creation_task = asyncio.create_task(
+        asyncio.create_subprocess_exec(
+            *args,
+            stdin=stdin,
+            stdout=stdout,
+            stderr=stderr,
+        ),
+    )
+    try:
+        return await asyncio.shield(creation_task)
+    except asyncio.CancelledError:
+        try:
+            process, _cancelled_during_creation = await _await_task_after_cancellation(creation_task)
+        except asyncio.CancelledError:
+            # The caller-visible cancellation remains the result when creation also stops.
+            pass
+        except Exception:
+            # No child was created, so there is no cleanup failure to report.
+            pass
+        else:
+            try:
+                await _await_cleanup_after_cancellation(_stop_process(process))
+            except asyncio.CancelledError:
+                # Preserve the original caller cancellation after mandatory cleanup.
+                pass
+            except Exception:
+                logger.warning('yt-dlp subprocess cleanup failed after cancellation during creation')
+        raise
+
+
+async def _run_yt_dlp_command(
+    *,
+    operation: str,
+    args: Sequence[str],
+    timeout: timedelta,
+) -> tuple[bytes, bytes]:
+    proc = await _create_owned_subprocess_exec(
+        *args,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(
+            proc.communicate(),
+            timeout=timeout.total_seconds(),
+        )
+    except asyncio.TimeoutError:
+        try:
+            cancelled_during_cleanup = await _await_cleanup_after_cancellation(_stop_process(proc))
+            if cancelled_during_cleanup:
+                raise asyncio.CancelledError
+        except Exception as error:
+            logger.warning('yt-dlp {} cleanup failed after timeout: {}', operation, error)
+        raise _yt_dlp_timeout_error(operation=operation, args=args, timeout=timeout) from None
+    except asyncio.CancelledError:
+        try:
+            await _await_cleanup_after_cancellation(_stop_process(proc))
+        except Exception as error:
+            logger.warning('yt-dlp {} cleanup failed after cancellation: {}', operation, error)
+        raise
+
+    returncode = proc.returncode if proc.returncode is not None else -1
+    if returncode != 0:
+        message = _format_yt_dlp_failure(
+            operation=operation,
+            returncode=returncode,
+            args=args,
+            stderr=stderr,
+            stdout=stdout,
+        )
+        if _is_youtube_authentication_failure(stderr):
+            raise YtDlpAuthenticationError(message)
+        raise RuntimeError(message)
+
+    return stdout, stderr
+
+
 async def fetch_track_info(
     url: str,
     *,
+    cookie_file: Path,
     with_cover: bool = True,
     with_metadata: bool = True,
     timeout: timedelta = timedelta(minutes=1),
@@ -56,28 +413,39 @@ async def fetch_track_info(
         RuntimeError: If cover extraction fails or `yt-dlp` fails.
         YtDlpMetadataError: If metadata extraction or parsing fails.
     """
+    _validate_cookie_file_path(cookie_file)
     normalized_url = _normalize_url(url)
     if not with_cover and not with_metadata:
         return UrlTrackInfo()
 
-    cover: bytes | None = None
-    metadata: TrackMetadata | None = None
-    if with_cover:
-        youtube_video_id = None
-        if not with_metadata:
-            youtube_video_id = _extract_youtube_video_id(normalized_url)
-        if youtube_video_id is not None:
-            cover = await _download_youtube_thumbnail_as_jpg(youtube_video_id, timeout=timeout)
-        else:
-            cover = await _download_cover_as_jpg(normalized_url, timeout=timeout)
-    if with_metadata:
-        metadata = await _download_track_metadata(normalized_url, timeout=timeout)
-    return UrlTrackInfo(cover=cover, metadata=metadata)
+    with _isolated_cookie_file(cookie_file) as operation_cookie_file:
+        cover: bytes | None = None
+        metadata: TrackMetadata | None = None
+        if with_cover:
+            youtube_video_id = None
+            if not with_metadata:
+                youtube_video_id = _extract_youtube_video_id(normalized_url)
+            if youtube_video_id is not None:
+                cover = await _download_youtube_thumbnail_as_jpg(youtube_video_id, timeout=timeout)
+            else:
+                cover = await _download_cover_as_jpg(
+                    normalized_url,
+                    cookie_file=operation_cookie_file,
+                    timeout=timeout,
+                )
+        if with_metadata:
+            metadata = await _download_track_metadata(
+                normalized_url,
+                cookie_file=operation_cookie_file,
+                timeout=timeout,
+            )
+        return UrlTrackInfo(cover=cover, metadata=metadata)
 
 
 async def download_audio_as_opus(
     url: str,
     *,
+    cookie_file: Path,
     with_cover: bool = False,
     with_metadata: bool = False,
     max_duration: timedelta | None = None,
@@ -98,13 +466,16 @@ async def download_audio_as_opus(
         RuntimeError: If `yt-dlp` fails or output validation fails.
         YtDlpMetadataError: If metadata is requested but cannot be extracted or parsed.
     """
-    result = await _download_audio(
-        url,
-        with_cover=with_cover,
-        with_metadata=with_metadata,
-        max_duration=max_duration,
-        timeout=timeout,
-    )
+    _validate_cookie_file_path(cookie_file)
+    with _isolated_cookie_file(cookie_file) as operation_cookie_file:
+        result = await _download_audio(
+            url,
+            cookie_file=operation_cookie_file,
+            with_cover=with_cover,
+            with_metadata=with_metadata,
+            max_duration=max_duration,
+            timeout=timeout,
+        )
     if with_cover and result.cover is None:
         raise RuntimeError('yt-dlp did not produce cover output')
     return result
@@ -113,6 +484,7 @@ async def download_audio_as_opus(
 async def _download_audio(
     url: str,
     *,
+    cookie_file: Path,
     with_cover: bool,
     with_metadata: bool,
     max_duration: timedelta | None,
@@ -121,6 +493,7 @@ async def _download_audio(
     if max_duration is None:
         audio, cover, metadata = await _download_audio_as_opus_internal(
             url,
+            cookie_file=cookie_file,
             download_cover=with_cover,
             with_metadata=with_metadata,
             timeout=timeout,
@@ -128,10 +501,11 @@ async def _download_audio(
         return DownloadedAudio(audio=audio, cover=cover, metadata=metadata)
 
     _validate_max_duration(max_duration)
-    duration = await get_media_duration(url, timeout=timedelta(seconds=30))
+    duration = await _get_media_duration(url, cookie_file=cookie_file, timeout=timedelta(seconds=30))
     if duration is not None and duration <= max_duration:
         audio, cover, metadata = await _download_audio_as_opus_internal(
             url,
+            cookie_file=cookie_file,
             download_cover=with_cover,
             with_metadata=with_metadata,
             timeout=timeout,
@@ -140,14 +514,15 @@ async def _download_audio(
 
     audio = await _download_audio_as_opus_clipped(
         url,
+        cookie_file=cookie_file,
         max_duration=max_duration,
         timeout=timeout,
     )
     metadata: TrackMetadata | None = None
     if with_metadata:
-        metadata = await _download_track_metadata(url, timeout=timeout)
+        metadata = await _download_track_metadata(url, cookie_file=cookie_file, timeout=timeout)
     if with_cover:
-        cover = await _download_cover_as_jpg(url, timeout=timeout)
+        cover = await _download_cover_as_jpg(url, cookie_file=cookie_file, timeout=timeout)
         return DownloadedAudio(audio=audio, cover=cover, metadata=metadata)
     return DownloadedAudio(audio=audio, metadata=metadata)
 
@@ -155,34 +530,37 @@ async def _download_audio(
 async def get_media_duration(
     url: str,
     *,
+    cookie_file: Path,
     timeout: timedelta = timedelta(seconds=30),
 ) -> timedelta | None:
+    with _isolated_cookie_file(cookie_file) as operation_cookie_file:
+        return await _get_media_duration(url, cookie_file=operation_cookie_file, timeout=timeout)
+
+
+async def _get_media_duration(
+    url: str,
+    *,
+    cookie_file: Path,
+    timeout: timedelta,
+) -> timedelta | None:
     normalized_url = _normalize_url(url)
-    proc = await asyncio.create_subprocess_exec(
-        'yt-dlp',
-        '--no-warnings',
-        '--print',
-        '%(duration)s',
-        '--skip-download',
-        '--no-playlist',
-        normalized_url,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
+    stdout, _stderr = await _run_yt_dlp_command(
+        operation='duration_probe',
+        args=_with_common_yt_dlp_args(
+            (
+                'yt-dlp',
+                '--print',
+                '%(duration)s',
+                '--simulate',
+                '--skip-download',
+                '--ignore-no-formats-error',
+                '--no-playlist',
+                normalized_url,
+            ),
+            cookie_file=cookie_file,
+        ),
+        timeout=timeout,
     )
-
-    try:
-        stdout, stderr = await asyncio.wait_for(
-            proc.communicate(),
-            timeout=timeout.total_seconds(),
-        )
-    except asyncio.TimeoutError:
-        proc.kill()
-        await proc.wait()
-        raise
-
-    if proc.returncode != 0:
-        stderr_text = stderr.decode(errors='replace')
-        raise RuntimeError(f'yt-dlp failed: {stderr_text}')
 
     duration_text = stdout.decode(errors='replace').strip()
     if not duration_text or duration_text in {'NA', 'None'}:
@@ -295,6 +673,7 @@ async def _download_http_bytes(url: str, *, timeout_seconds: float) -> bytes:
 async def _download_audio_as_opus_internal(
     url: str,
     *,
+    cookie_file: Path,
     download_cover: bool,
     with_metadata: bool,
     timeout: timedelta,
@@ -310,8 +689,6 @@ async def _download_audio_as_opus_internal(
             '--extract-audio',
             '--audio-format',
             'opus',
-            '--quiet',
-            '--no-warnings',
             '--no-playlist',
         ]
         if download_cover:
@@ -325,26 +702,12 @@ async def _download_audio_as_opus_internal(
         if with_metadata:
             args.append('--write-info-json')
         args.extend(['-o', str(output_template), normalized_url])
-        proc = await asyncio.create_subprocess_exec(
-            *args,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+
+        await _run_yt_dlp_command(
+            operation='audio_download',
+            args=_with_common_yt_dlp_args(args, cookie_file=cookie_file),
+            timeout=timeout,
         )
-
-        try:
-            _, stderr = await asyncio.wait_for(
-                proc.communicate(),
-                timeout=timeout.total_seconds(),
-            )
-        except asyncio.TimeoutError:
-            proc.kill()
-            await proc.wait()
-            raise
-
-        if proc.returncode != 0:
-            stderr_text = stderr.decode(errors='replace')
-            raise RuntimeError(f'yt-dlp failed: {stderr_text}')
-
         output_files = sorted(Path(temp_dir).glob('*.opus'))
         if not output_files:
             raise RuntimeError('yt-dlp did not produce opus output')
@@ -428,40 +791,29 @@ def _parse_comma_separated_artists(value: object) -> tuple[str, ...]:
 async def _download_cover_as_jpg(
     url: str,
     *,
+    cookie_file: Path,
     timeout: timedelta,
 ) -> bytes:
     normalized_url = _normalize_url(url)
     with tempfile.TemporaryDirectory() as temp_dir:
         output_template = Path(temp_dir) / 'cover.%(ext)s'
-        proc = await asyncio.create_subprocess_exec(
-            'yt-dlp',
-            '--skip-download',
-            '--write-thumbnail',
-            '--convert-thumbnails',
-            'jpg',
-            '--quiet',
-            '--no-warnings',
-            '--no-playlist',
-            '-o',
-            str(output_template),
-            normalized_url,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+        await _run_yt_dlp_command(
+            operation='cover_download',
+            args=_with_common_yt_dlp_args(
+                (
+                    'yt-dlp',
+                    '--skip-download',
+                    '--write-thumbnail',
+                    '--convert-thumbnails',
+                    'jpg',
+                    '-o',
+                    str(output_template),
+                    normalized_url,
+                ),
+                cookie_file=cookie_file,
+            ),
+            timeout=timeout,
         )
-
-        try:
-            _, stderr = await asyncio.wait_for(
-                proc.communicate(),
-                timeout=timeout.total_seconds(),
-            )
-        except asyncio.TimeoutError:
-            proc.kill()
-            await proc.wait()
-            raise
-
-        if proc.returncode != 0:
-            stderr_text = stderr.decode(errors='replace')
-            raise RuntimeError(f'yt-dlp failed: {stderr_text}')
 
         cover_files = sorted(Path(temp_dir).glob('*.jpg'))
         if not cover_files:
@@ -478,38 +830,27 @@ async def _download_cover_as_jpg(
 async def _download_track_metadata(
     url: str,
     *,
+    cookie_file: Path,
     timeout: timedelta,
 ) -> TrackMetadata:
     normalized_url = _normalize_url(url)
     with tempfile.TemporaryDirectory() as temp_dir:
         output_template = Path(temp_dir) / 'metadata.%(ext)s'
-        proc = await asyncio.create_subprocess_exec(
-            'yt-dlp',
-            '--skip-download',
-            '--write-info-json',
-            '--quiet',
-            '--no-warnings',
-            '--no-playlist',
-            '-o',
-            str(output_template),
-            normalized_url,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+        await _run_yt_dlp_command(
+            operation='metadata_download',
+            args=_with_common_yt_dlp_args(
+                (
+                    'yt-dlp',
+                    '--skip-download',
+                    '--write-info-json',
+                    '-o',
+                    str(output_template),
+                    normalized_url,
+                ),
+                cookie_file=cookie_file,
+            ),
+            timeout=timeout,
         )
-
-        try:
-            _, stderr = await asyncio.wait_for(
-                proc.communicate(),
-                timeout=timeout.total_seconds(),
-            )
-        except asyncio.TimeoutError:
-            proc.kill()
-            await proc.wait()
-            raise
-
-        if proc.returncode != 0:
-            stderr_text = stderr.decode(errors='replace')
-            raise RuntimeError(f'yt-dlp failed: {stderr_text}')
 
         metadata_files = sorted(Path(temp_dir).glob('*.info.json'))
         if not metadata_files:
@@ -528,30 +869,10 @@ async def _download_track_metadata(
 async def _download_audio_as_opus_clipped(
     url: str,
     *,
+    cookie_file: Path,
     max_duration: timedelta,
     timeout: timedelta,
 ) -> bytes:
-    async def _stop_process(proc: asyncio.subprocess.Process, *, grace_seconds: float) -> None:
-        if proc.returncode is not None:
-            return
-        terminate = getattr(proc, 'terminate', None)
-        if callable(terminate):
-            with contextlib.suppress(ProcessLookupError):
-                terminate()
-        else:
-            with contextlib.suppress(ProcessLookupError):
-                proc.kill()
-        try:
-            await asyncio.wait_for(proc.wait(), timeout=grace_seconds)
-            return
-        except asyncio.TimeoutError:
-            pass
-        if proc.returncode is None:
-            with contextlib.suppress(ProcessLookupError):
-                proc.kill()
-        with contextlib.suppress(Exception):
-            await proc.wait()
-
     normalized_url = _normalize_url(url)
     _validate_max_duration(max_duration)
     max_duration_seconds = str(max_duration.total_seconds())
@@ -559,19 +880,15 @@ async def _download_audio_as_opus_clipped(
     deadline = loop.time() + timeout.total_seconds()
     source_codec = await _get_selected_audio_codec(
         normalized_url,
+        cookie_file=cookie_file,
         timeout=timeout,
     )
     remaining_timeout_seconds = deadline - loop.time()
     if remaining_timeout_seconds <= 0:
         raise asyncio.TimeoutError
-    codec_is_opus = _codec_is_opus(source_codec)
+
     codec_args: tuple[str, ...]
-    if codec_is_opus:
-        codec_args = (
-            '-c:a',
-            'copy',
-        )
-    else:
+    if not _codec_is_opus(source_codec):
         codec_args = (
             '-c:a',
             'libopus',
@@ -582,21 +899,30 @@ async def _download_audio_as_opus_clipped(
             '-compression_level',
             '10',
         )
+    else:
+        codec_args = (
+            '-c:a',
+            'copy',
+        )
 
-    ytdlp_proc = await asyncio.create_subprocess_exec(
-        'yt-dlp',
-        '-f',
-        'bestaudio',
-        '--quiet',
-        '--no-warnings',
-        '--no-playlist',
-        '-o',
-        '-',
-        normalized_url,
+    ytdlp_args = _with_common_yt_dlp_args(
+        (
+            'yt-dlp',
+            '-f',
+            'bestaudio',
+            '--no-playlist',
+            '-o',
+            '-',
+            normalized_url,
+        ),
+        cookie_file=cookie_file,
+    )
+    ytdlp_proc = await _create_owned_subprocess_exec(
+        *ytdlp_args,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    ffmpeg_proc = await asyncio.create_subprocess_exec(
+    ffmpeg_args = (
         'ffmpeg',
         '-hide_banner',
         '-loglevel',
@@ -615,10 +941,23 @@ async def _download_audio_as_opus_clipped(
         '-f',
         'opus',
         'pipe:1',
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
     )
+    try:
+        ffmpeg_proc = await _create_owned_subprocess_exec(
+            *ffmpeg_args,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except asyncio.CancelledError:
+        try:
+            await _await_cleanup_after_cancellation(_stop_process(ytdlp_proc))
+        except Exception as error:
+            logger.warning('yt-dlp clipped_audio_download cleanup failed after cancellation: {}', error)
+        raise
+    except Exception:
+        await _stop_process(ytdlp_proc)
+        raise
     assert ytdlp_proc.stdout is not None
     assert ytdlp_proc.stderr is not None
     assert ffmpeg_proc.stdin is not None
@@ -638,6 +977,25 @@ async def _download_audio_as_opus_clipped(
         ffmpeg_wait_task,
         ytdlp_wait_task,
     )
+    ytdlp_returncode: int | None = None
+    ytdlp_stderr = b''
+    pipeline_settled = False
+
+    async def _stop_pipeline() -> None:
+        cleanup_error: Exception | None = None
+        for process in (ffmpeg_proc, ytdlp_proc):
+            try:
+                await _stop_process(process)
+            except Exception as error:
+                if cleanup_error is None:
+                    cleanup_error = error
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        if cleanup_error is not None:
+            raise cleanup_error
+
     try:
         async with asyncio.timeout(remaining_timeout_seconds):
             await ffmpeg_wait_task
@@ -645,50 +1003,84 @@ async def _download_audio_as_opus_clipped(
             ffmpeg_stdout = await ffmpeg_stdout_task
             ffmpeg_stderr = await ffmpeg_stderr_task
 
-            if ffmpeg_returncode == 0 and ffmpeg_stdout and ffmpeg_stdout.startswith(b'OggS'):
-                await _stop_process(ytdlp_proc, grace_seconds=1.0)
-                return ffmpeg_stdout
-
-            ytdlp_returncode = ytdlp_proc.returncode
-            if ytdlp_returncode is None:
+            if ytdlp_wait_task.done():
+                ytdlp_returncode = ytdlp_wait_task.result()
+            else:
                 try:
-                    ytdlp_returncode = await asyncio.wait_for(ytdlp_wait_task, timeout=1.0)
+                    ytdlp_returncode = await asyncio.wait_for(
+                        asyncio.shield(ytdlp_wait_task),
+                        timeout=1.0,
+                    )
                 except asyncio.TimeoutError:
-                    ytdlp_returncode = None
+                    await _stop_process(ytdlp_proc)
+                    ytdlp_returncode = await ytdlp_wait_task
+                except asyncio.CancelledError:
+                    raise
             if ytdlp_stderr_task.done():
                 ytdlp_stderr = ytdlp_stderr_task.result()
             else:
                 try:
-                    ytdlp_stderr = await asyncio.wait_for(ytdlp_stderr_task, timeout=1.0)
+                    ytdlp_stderr = await asyncio.wait_for(
+                        asyncio.shield(ytdlp_stderr_task),
+                        timeout=1.0,
+                    )
                 except asyncio.TimeoutError:
                     ytdlp_stderr = b''
     except asyncio.TimeoutError:
-        await _stop_process(ytdlp_proc, grace_seconds=0.1)
-        await _stop_process(ffmpeg_proc, grace_seconds=0.1)
-        await asyncio.gather(
-            ytdlp_proc.wait(),
-            ffmpeg_proc.wait(),
-            return_exceptions=True,
-        )
-        for task in tasks:
-            if not task.done():
-                task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+        try:
+            cancelled_during_cleanup = await _await_cleanup_after_cancellation(_stop_pipeline())
+            pipeline_settled = True
+            if cancelled_during_cleanup:
+                raise asyncio.CancelledError
+        except Exception as error:
+            logger.warning('yt-dlp clipped_audio_download cleanup failed after timeout: {}', error)
+        raise _yt_dlp_timeout_error(operation='clipped_audio_download', args=ytdlp_args, timeout=timeout) from None
+    except asyncio.CancelledError:
+        try:
+            await _await_cleanup_after_cancellation(_stop_pipeline())
+            pipeline_settled = True
+        except Exception as error:
+            logger.warning('yt-dlp clipped_audio_download cleanup failed after cancellation: {}', error)
+        raise
+    except Exception:
+        await _stop_pipeline()
+        pipeline_settled = True
         raise
     finally:
-        for task in tasks:
-            if not task.done():
-                task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+        if not pipeline_settled:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
+    ytdlp_failure_message: str | None = None
     if ytdlp_returncode not in (None, 0):
         ytdlp_stderr_text = ytdlp_stderr.decode(errors='replace')
         if 'broken pipe' not in ytdlp_stderr_text.lower():
-            raise RuntimeError(f'yt-dlp failed: {ytdlp_stderr_text}')
+            ytdlp_failure_message = _format_yt_dlp_failure(
+                operation='clipped_audio_download',
+                returncode=ytdlp_returncode,
+                args=ytdlp_args,
+                stderr=ytdlp_stderr,
+            )
 
+    ffmpeg_failure_message: str | None = None
     if ffmpeg_returncode != 0:
-        stderr_text = ffmpeg_stderr.decode(errors='replace')
-        raise RuntimeError(f'ffmpeg failed: {stderr_text}')
+        ffmpeg_failure_message = _format_process_failure(
+            command_name='ffmpeg',
+            operation='clipped_audio_download',
+            returncode=ffmpeg_returncode,
+            args=ffmpeg_args,
+            stderr=ffmpeg_stderr,
+            stdout=ffmpeg_stdout,
+        )
+
+    if ytdlp_failure_message is not None:
+        if _is_youtube_authentication_failure(ytdlp_stderr):
+            raise YtDlpAuthenticationError(ytdlp_failure_message)
+        raise RuntimeError(ytdlp_failure_message)
+    if ffmpeg_failure_message is not None:
+        raise RuntimeError(ffmpeg_failure_message)
 
     if not ffmpeg_stdout or not ffmpeg_stdout.startswith(b'OggS'):
         raise RuntimeError('yt-dlp output is not a valid Ogg/Opus container')
@@ -719,38 +1111,29 @@ async def _pipe_stream(
 async def _get_selected_audio_codec(
     url: str,
     *,
+    cookie_file: Path,
     timeout: timedelta = timedelta(seconds=30),
 ) -> str | None:
-    proc = await asyncio.create_subprocess_exec(
-        'yt-dlp',
-        '--no-warnings',
-        '--print',
-        '%(acodec)s',
-        '-f',
-        'bestaudio',
-        '--skip-download',
-        '--no-playlist',
-        url,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
+    stdout, _stderr = await _run_yt_dlp_command(
+        operation='codec_probe',
+        args=_with_common_yt_dlp_args(
+            (
+                'yt-dlp',
+                '--print',
+                '%(acodec)s',
+                '-f',
+                'bestaudio',
+                '--skip-download',
+                '--no-playlist',
+                url,
+            ),
+            cookie_file=cookie_file,
+        ),
+        timeout=timeout,
     )
 
-    try:
-        stdout, stderr = await asyncio.wait_for(
-            proc.communicate(),
-            timeout=timeout.total_seconds(),
-        )
-    except asyncio.TimeoutError:
-        proc.kill()
-        await proc.wait()
-        raise
-
-    if proc.returncode != 0:
-        stderr_text = stderr.decode(errors='replace')
-        raise RuntimeError(f'yt-dlp failed: {stderr_text}')
-
     codec = stdout.decode(errors='replace').strip()
-    if not codec:
+    if not codec or codec.lower() in {'none', 'na', 'unknown'}:
         return None
     return codec
 

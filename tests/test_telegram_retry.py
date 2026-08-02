@@ -149,6 +149,10 @@ async def test_app_registers_retry_middleware_on_bot_session(monkeypatch: pytest
         async def __aexit__(self, exc_type, exc, tb) -> None:
             return None
 
+        async def get_bytes(self, key: str) -> bytes:
+            assert key == 'youtube-cookies/cookies.txt'
+            return b'# Netscape HTTP Cookie File\n.youtube.com\tTRUE\t/\tTRUE\t0\tSID\tvalue\n'
+
     class _FakeDispatcher:
         def __init__(self, storage) -> None:
             self.storage = storage

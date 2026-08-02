@@ -31,13 +31,16 @@ from timeline_hub.handlers.tracks.store_execution import (
     TrackInputError,
     TrackLinkDownloadError,
     UploadedFileTooBigError,
+    YoutubeCookieAuthenticationRetryExhaustedError,
     download_link_audio,
     download_link_audio_and_cover,
+    download_link_audio_with_metadata,
     extract_photo_messages_for_remove,
     extract_single_photo_audio_messages,
     extract_store_messages,
     extract_track_audio_attachment,
     extract_track_identity_from_photo_message,
+    fetch_link_track_info,
     is_supported_youtube_store_url,
     parse_cover_link_store_input,
     prepare_audio_from_message,
@@ -54,7 +57,7 @@ from timeline_hub.handlers.tracks.store_execution import (
     validate_uploaded_source_variant_batch,
 )
 from timeline_hub.infra.images import normalize_cover_to_jpg
-from timeline_hub.infra.ytdlp import YtDlpMetadataError, download_audio_as_opus, fetch_track_info
+from timeline_hub.infra.ytdlp import YtDlpMetadataError
 from timeline_hub.services.container import Services
 from timeline_hub.services.track_store import (
     InvalidTrackIdentityError,
@@ -72,6 +75,7 @@ from timeline_hub.services.track_store import (
     TrackUpdateManifestSyncError,
     UploadedVariant,
 )
+from timeline_hub.services.youtube_cookies import YoutubeCookieStoreError
 from timeline_hub.settings import Settings
 from timeline_hub.types import Extension, FileBytes, InvalidExtensionError
 
@@ -87,12 +91,6 @@ _EXPECTED_TRACK_METADATA_UNAVAILABLE_ERRORS = frozenset(
     {
         'yt-dlp produced incomplete metadata output',
         'yt-dlp did not produce metadata output',
-    }
-)
-_YOUTUBE_COOKIES_REQUIRED_ERROR_SUBSTRINGS = frozenset(
-    {
-        'sign in to confirm your age',
-        'use --cookies-from-browser or --cookies',
     }
 )
 
@@ -161,13 +159,6 @@ class TrackUploadedFinalCallbackData(CallbackData, prefix='track_uploaded'):
 
 def _is_expected_track_metadata_unavailable(error: YtDlpMetadataError) -> bool:
     return str(error) in _EXPECTED_TRACK_METADATA_UNAVAILABLE_ERRORS
-
-
-def _is_youtube_cookies_required_error(error: TrackLinkDownloadError | Exception) -> bool:
-    normalized_error_text = str(error).strip().lower()
-    if not normalized_error_text:
-        return False
-    return any(candidate in normalized_error_text for candidate in _YOUTUBE_COOKIES_REQUIRED_ERROR_SUBSTRINGS)
 
 
 class TrackStoreFlow(StatesGroup):
@@ -1728,8 +1719,9 @@ async def _execute_track_store_with_uploaded_audio_link_info(
     try:
         audio = await prepare_audio_from_message(bot=bot, audio_message=audio_message)
         try:
-            fetched_track_info = await fetch_track_info(
+            fetched_track_info = await fetch_link_track_info(
                 parsed_link_input.url,
+                cookie_store=services.youtube_cookie_store,
                 with_cover=True,
                 with_metadata=parsed_link_input.requires_metadata,
             )
@@ -1749,15 +1741,15 @@ async def _execute_track_store_with_uploaded_audio_link_info(
                 text='No artists and title available',
             )
             return
-        except Exception as error:
-            if _is_youtube_cookies_required_error(error):
-                await _invalidate_track_intake_buffer(
-                    message=message,
-                    state=state,
-                    services=services,
-                    text='Cookies required',
-                )
-                return
+        except YoutubeCookieAuthenticationRetryExhaustedError:
+            await _invalidate_track_intake_buffer(
+                message=message,
+                state=state,
+                services=services,
+                text='Cookies expired',
+            )
+            return
+        except Exception:
             logger.exception('track link info fetch failed')
             await _invalidate_track_intake_buffer(
                 message=message,
@@ -1844,6 +1836,7 @@ async def _execute_track_store_with_auto_cover(
         try:
             downloaded_result = await download_link_audio_and_cover(
                 parsed_link_input.url,
+                cookie_store=services.youtube_cookie_store,
                 with_metadata=parsed_link_input.requires_metadata,
                 max_duration=_derived_track_link_source_max_duration(settings),
             )
@@ -1861,15 +1854,15 @@ async def _execute_track_store_with_auto_cover(
                 text='No artists and title available',
             )
             return
-        except TrackLinkDownloadError as error:
-            if _is_youtube_cookies_required_error(error):
-                await _invalidate_track_intake_buffer(
-                    message=message,
-                    state=state,
-                    services=services,
-                    text='Cookies required',
-                )
-                return
+        except YoutubeCookieAuthenticationRetryExhaustedError:
+            await _invalidate_track_intake_buffer(
+                message=message,
+                state=state,
+                services=services,
+                text='Cookies expired',
+            )
+            return
+        except TrackLinkDownloadError, YoutubeCookieStoreError:
             logger.exception('track link download failed')
             await _invalidate_track_intake_buffer(
                 message=message,
@@ -1963,9 +1956,9 @@ async def _execute_track_store_with_user_cover_link(
         cover = normalize_cover_to_jpg(downloaded_cover.read())
 
         try:
-            downloaded_result = await download_audio_as_opus(
+            downloaded_result = await download_link_audio_with_metadata(
                 parsed_cover_link_input.url,
-                with_cover=False,
+                cookie_store=services.youtube_cookie_store,
                 with_metadata=parsed_cover_link_input.requires_metadata,
                 max_duration=_derived_track_link_source_max_duration(settings),
             )
@@ -1988,15 +1981,15 @@ async def _execute_track_store_with_user_cover_link(
                 text='No artists and title available',
             )
             return
-        except Exception as error:
-            if _is_youtube_cookies_required_error(error):
-                await _invalidate_track_intake_buffer(
-                    message=message,
-                    state=state,
-                    services=services,
-                    text='Cookies required',
-                )
-                return
+        except YoutubeCookieAuthenticationRetryExhaustedError:
+            await _invalidate_track_intake_buffer(
+                message=message,
+                state=state,
+                services=services,
+                text='Cookies expired',
+            )
+            return
+        except Exception:
             logger.exception('track link download failed')
             await _invalidate_track_intake_buffer(
                 message=message,
@@ -2123,17 +2116,18 @@ async def _execute_track_store_with_album_reuse(
             try:
                 downloaded_audio = await download_link_audio(
                     parsed_link_input.url,
+                    cookie_store=services.youtube_cookie_store,
                     max_duration=_derived_track_link_source_max_duration(settings),
                 )
-            except TrackLinkDownloadError as error:
-                if _is_youtube_cookies_required_error(error):
-                    await _invalidate_track_intake_buffer(
-                        message=message,
-                        state=state,
-                        services=services,
-                        text='Cookies required',
-                    )
-                    return
+            except YoutubeCookieAuthenticationRetryExhaustedError:
+                await _invalidate_track_intake_buffer(
+                    message=message,
+                    state=state,
+                    services=services,
+                    text='Cookies expired',
+                )
+                return
+            except TrackLinkDownloadError, YoutubeCookieStoreError:
                 logger.exception('track link audio download failed')
                 await _invalidate_track_intake_buffer(
                     message=message,

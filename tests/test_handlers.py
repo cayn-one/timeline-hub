@@ -3,8 +3,9 @@ import math
 from collections.abc import Callable
 from datetime import date, timedelta
 from io import BytesIO
+from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock, call
+from unittest.mock import AsyncMock, Mock, call, patch
 
 import pytest
 from aiogram.exceptions import TelegramBadRequest, TelegramEntityTooLarge
@@ -112,7 +113,7 @@ from timeline_hub.handlers.tracks.retrieve import (
     on_retrieve_menu as on_tracks_retrieve_menu,
 )
 from timeline_hub.infra.ffmpeg import UnsupportedVideoCodecError
-from timeline_hub.infra.ytdlp import DownloadedAudio, TrackMetadata, YtDlpMetadataError
+from timeline_hub.infra.ytdlp import DownloadedAudio, TrackMetadata, YtDlpAuthenticationError, YtDlpMetadataError
 from timeline_hub.services.clip_store import (
     AudioNormalization,
     ClipGroup,
@@ -133,6 +134,7 @@ from timeline_hub.services.clip_store import (
 )
 from timeline_hub.services.container import Services
 from timeline_hub.services.message_buffer import ChatMessageBuffer
+from timeline_hub.services.youtube_cookies import YoutubeCookieStoreError
 from timeline_hub.types import Extension, FileBytes
 
 _CLIP_ID_1 = '018f05c1f1a37b348d291f53a1c9d0e1'
@@ -381,11 +383,16 @@ def _services(
     scheduler: _FakeScheduler | None = None,
     buffer: ChatMessageBuffer | None = None,
 ) -> Services:
+    cookie_snapshot = SimpleNamespace(path=Path('/tmp/timeline-hub-test/youtube-cookies.txt'))
     return Services(
         task_scheduler=scheduler or _FakeScheduler(),
         chat_message_buffer=buffer or ChatMessageBuffer(),
         clip_store=clip_store,
         track_store=track_store or SimpleNamespace(store=AsyncMock()),
+        youtube_cookie_store=SimpleNamespace(
+            current=Mock(return_value=cookie_snapshot),
+            refresh_after_rejection=AsyncMock(return_value=cookie_snapshot),
+        ),
     )
 
 
@@ -7002,6 +7009,11 @@ async def test_uploaded_main_action_source_preparation_failure_still_invalidates
     bot = SimpleNamespace(get_file=AsyncMock(), download_file=AsyncMock())
     monkeypatch.setattr(
         track_ingest_module,
+        'fetch_link_track_info',
+        AsyncMock(return_value=SimpleNamespace(cover=b'cover', metadata=None)),
+    )
+    monkeypatch.setattr(
+        track_ingest_module,
         'prepare_uploaded_source_from_file_refs',
         AsyncMock(side_effect=track_store_execution_module.TrackInputError("Can't process audio")),
     )
@@ -11316,9 +11328,9 @@ async def test_track_store_link_plus_audio_supports_url_text_first_with_explicit
     )
     monkeypatch.setattr(track_store_execution_module, 'to_opus', AsyncMock(return_value=b'opus-audio-1'))
     fetch_track_info = AsyncMock(return_value=SimpleNamespace(cover=b'url-cover-1', metadata=None))
-    monkeypatch.setattr(track_ingest_module, 'fetch_track_info', fetch_track_info)
+    monkeypatch.setattr(track_ingest_module, 'fetch_link_track_info', fetch_track_info)
     download_audio_as_opus = AsyncMock()
-    monkeypatch.setattr(track_ingest_module, 'download_audio_as_opus', download_audio_as_opus)
+    monkeypatch.setattr(track_ingest_module, 'download_link_audio_with_metadata', download_audio_as_opus)
 
     await on_track_intake_action(
         _fake_callback(menu_message),
@@ -11338,6 +11350,7 @@ async def test_track_store_link_plus_audio_supports_url_text_first_with_explicit
 
     fetch_track_info.assert_awaited_once_with(
         'https://www.youtube.com/watch?v=abc123',
+        cookie_store=services.youtube_cookie_store,
         with_cover=True,
         with_metadata=False,
     )
@@ -11382,9 +11395,9 @@ async def test_track_store_link_plus_audio_supports_audio_first_and_metadata_fal
             metadata=TrackMetadata(artists=('Fallback 1', 'Fallback 2'), title='Fallback Title'),
         )
     )
-    monkeypatch.setattr(track_ingest_module, 'fetch_track_info', fetch_track_info)
+    monkeypatch.setattr(track_ingest_module, 'fetch_link_track_info', fetch_track_info)
     download_audio_as_opus = AsyncMock()
-    monkeypatch.setattr(track_ingest_module, 'download_audio_as_opus', download_audio_as_opus)
+    monkeypatch.setattr(track_ingest_module, 'download_link_audio_with_metadata', download_audio_as_opus)
 
     await on_track_intake_action(
         _fake_callback(menu_message),
@@ -11404,6 +11417,7 @@ async def test_track_store_link_plus_audio_supports_audio_first_and_metadata_fal
 
     fetch_track_info.assert_awaited_once_with(
         'https://www.youtube.com/watch?v=abc123',
+        cookie_store=services.youtube_cookie_store,
         with_cover=True,
         with_metadata=True,
     )
@@ -11450,17 +11464,18 @@ async def test_track_store_link_plus_audio_with_user_metadata_ignores_metadata_f
     async def _fake_fetch_track_info(
         url: str,
         *,
+        cookie_store: object,
         with_cover: bool = True,
         with_metadata: bool = True,
         timeout: timedelta = timedelta(minutes=1),
     ) -> SimpleNamespace:
-        del url, timeout
+        del url, cookie_store, timeout
         assert with_cover is True
         if with_metadata:
             raise YtDlpMetadataError('yt-dlp produced incomplete metadata output')
         return SimpleNamespace(cover=b'url-cover-6', metadata=None)
 
-    monkeypatch.setattr(track_ingest_module, 'fetch_track_info', _fake_fetch_track_info)
+    monkeypatch.setattr(track_ingest_module, 'fetch_link_track_info', _fake_fetch_track_info)
 
     await on_track_intake_action(
         _fake_callback(menu_message),
@@ -11514,7 +11529,7 @@ async def test_track_store_link_plus_audio_with_metadata_failure_invalidates_whe
     monkeypatch.setattr(track_store_execution_module, 'to_opus', AsyncMock(return_value=b'opus-audio-3'))
     monkeypatch.setattr(
         track_ingest_module,
-        'fetch_track_info',
+        'fetch_link_track_info',
         AsyncMock(side_effect=YtDlpMetadataError('yt-dlp produced incomplete metadata output')),
     )
 
@@ -11564,7 +11579,7 @@ async def test_track_store_link_plus_audio_with_cover_failure_invalidates_downlo
         download_file=AsyncMock(return_value=BytesIO(b'audio-4')),
     )
     monkeypatch.setattr(track_store_execution_module, 'to_opus', AsyncMock(return_value=b'opus-audio-4'))
-    monkeypatch.setattr(track_ingest_module, 'fetch_track_info', AsyncMock(side_effect=RuntimeError('yt failed')))
+    monkeypatch.setattr(track_ingest_module, 'fetch_link_track_info', AsyncMock(side_effect=RuntimeError('yt failed')))
 
     await on_track_intake_action(
         _fake_callback(menu_message),
@@ -11725,7 +11740,7 @@ async def test_track_store_photo_caption_link_with_explicit_metadata_stores_with
     )
     monkeypatch.setattr(track_ingest_module, 'normalize_cover_to_jpg', Mock(return_value=b'user-cover-jpg'))
     download_audio_as_opus = AsyncMock(return_value=DownloadedAudio(audio=b'opus-bytes', cover=b'yt-cover-bytes'))
-    monkeypatch.setattr(track_ingest_module, 'download_audio_as_opus', download_audio_as_opus)
+    monkeypatch.setattr(track_ingest_module, 'download_link_audio_with_metadata', download_audio_as_opus)
 
     await on_track_intake_action(
         _fake_callback(menu_message),
@@ -11752,7 +11767,7 @@ async def test_track_store_photo_caption_link_with_explicit_metadata_stores_with
 
     download_audio_as_opus.assert_awaited_once_with(
         'https://www.youtube.com/watch?v=abc123',
-        with_cover=False,
+        cookie_store=services.youtube_cookie_store,
         with_metadata=False,
         max_duration=timedelta(
             seconds=math.ceil(settings.variant_max_duration.total_seconds() / settings.slowest_variant_speed)
@@ -11795,7 +11810,7 @@ async def test_track_store_cover_plus_link_url_only_metadata_error_invalidates_w
     monkeypatch.setattr(track_ingest_module, 'normalize_cover_to_jpg', Mock(return_value=b'user-cover-jpg'))
     monkeypatch.setattr(
         track_ingest_module,
-        'download_audio_as_opus',
+        'download_link_audio_with_metadata',
         AsyncMock(side_effect=YtDlpMetadataError('yt-dlp produced incomplete metadata output')),
     )
     log_exception = Mock()
@@ -11863,7 +11878,7 @@ async def test_track_store_photo_caption_link_url_only_derives_metadata_with_use
             metadata=TrackMetadata(artists=('Artist 1', 'Artist 2'), title='Derived Title'),
         )
     )
-    monkeypatch.setattr(track_ingest_module, 'download_audio_as_opus', download_audio_as_opus)
+    monkeypatch.setattr(track_ingest_module, 'download_link_audio_with_metadata', download_audio_as_opus)
 
     await on_track_intake_action(
         _fake_callback(menu_message),
@@ -11890,7 +11905,7 @@ async def test_track_store_photo_caption_link_url_only_derives_metadata_with_use
 
     download_audio_as_opus.assert_awaited_once_with(
         'https://www.youtube.com/watch?v=abc123',
-        with_cover=False,
+        cookie_store=services.youtube_cookie_store,
         with_metadata=True,
         max_duration=timedelta(
             seconds=math.ceil(settings.variant_max_duration.total_seconds() / settings.slowest_variant_speed)
@@ -11930,7 +11945,7 @@ async def test_track_store_photo_caption_link_with_explicit_metadata_uses_captio
     )
     monkeypatch.setattr(track_ingest_module, 'normalize_cover_to_jpg', Mock(return_value=b'user-cover-jpg'))
     download_audio_as_opus = AsyncMock(return_value=DownloadedAudio(audio=b'opus-bytes', cover=b'yt-cover-bytes'))
-    monkeypatch.setattr(track_ingest_module, 'download_audio_as_opus', download_audio_as_opus)
+    monkeypatch.setattr(track_ingest_module, 'download_link_audio_with_metadata', download_audio_as_opus)
 
     await on_track_intake_action(
         _fake_callback(menu_message),
@@ -11957,7 +11972,7 @@ async def test_track_store_photo_caption_link_with_explicit_metadata_uses_captio
 
     download_audio_as_opus.assert_awaited_once_with(
         'https://www.youtube.com/watch?v=abc123',
-        with_cover=False,
+        cookie_store=services.youtube_cookie_store,
         with_metadata=False,
         max_duration=timedelta(
             seconds=math.ceil(settings.variant_max_duration.total_seconds() / settings.slowest_variant_speed)
@@ -12314,6 +12329,7 @@ async def test_track_store_link_only_reuses_selected_album_cover(
     )
     download_audio_as_opus.assert_awaited_once_with(
         'https://www.youtube.com/watch?v=abc123',
+        cookie_file=Path('/tmp/timeline-hub-test/youtube-cookies.txt'),
         max_duration=timedelta(
             seconds=math.ceil(settings.variant_max_duration.total_seconds() / settings.slowest_variant_speed)
         ),
@@ -12423,11 +12439,134 @@ async def test_download_link_audio_preserves_upstream_error_text_for_classificat
     with pytest.raises(
         track_store_execution_module.TrackLinkDownloadError, match='--cookies-from-browser or --cookies'
     ):
-        await track_store_execution_module.download_link_audio('https://www.youtube.com/watch?v=abc123')
+        await track_store_execution_module.download_link_audio(
+            'https://www.youtube.com/watch?v=abc123',
+            cookie_store=_services(clip_store=SimpleNamespace()).youtube_cookie_store,
+        )
 
 
 @pytest.mark.asyncio
-async def test_track_store_link_download_cookies_required_invalidates_without_logging(
+async def test_download_link_audio_refreshes_after_clipped_authentication_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = SimpleNamespace(path=Path('/tmp/first-cookies.txt'))
+    refreshed = SimpleNamespace(path=Path('/tmp/refreshed-cookies.txt'))
+    cookie_store = SimpleNamespace(
+        current=Mock(return_value=first),
+        refresh_after_rejection=AsyncMock(return_value=refreshed),
+    )
+    download = AsyncMock(
+        side_effect=[
+            YtDlpAuthenticationError('yt-dlp clipped_audio_download authentication rejected'),
+            DownloadedAudio(audio=b'OggS-audio'),
+        ],
+    )
+    monkeypatch.setattr(track_store_execution_module, 'download_audio_as_opus', download)
+
+    result = await track_store_execution_module.download_link_audio(
+        'https://www.youtube.com/watch?v=abc123',
+        cookie_store=cookie_store,
+        max_duration=timedelta(seconds=30),
+    )
+
+    assert result.data == b'OggS-audio'
+    assert [await_call.kwargs['cookie_file'] for await_call in download.await_args_list] == [
+        first.path,
+        refreshed.path,
+    ]
+    cookie_store.refresh_after_rejection.assert_awaited_once_with(first)
+
+
+@pytest.mark.asyncio
+async def test_youtube_operation_refreshes_once_after_authentication_rejection() -> None:
+    first = SimpleNamespace(path=Path('/tmp/first-cookies.txt'))
+    refreshed = SimpleNamespace(path=Path('/tmp/refreshed-cookies.txt'))
+    cookie_store = SimpleNamespace(
+        current=Mock(return_value=first),
+        refresh_after_rejection=AsyncMock(return_value=refreshed),
+    )
+    operation = AsyncMock(side_effect=[YtDlpAuthenticationError('login required'), 'completed'])
+
+    with patch.object(track_store_execution_module.logger, 'warning') as warning_mock:
+        with patch.object(track_store_execution_module.logger, 'error') as error_mock:
+            result = await track_store_execution_module._run_youtube_operation_with_cookie_refresh(
+                cookie_store=cookie_store,
+                operation=operation,
+            )
+
+    assert result == 'completed'
+    assert operation.await_args_list == [call(first.path), call(refreshed.path)]
+    cookie_store.refresh_after_rejection.assert_awaited_once_with(first)
+    warning_mock.assert_called_once_with('yt-dlp authentication rejected; retrying with latest YouTube cookies')
+    error_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_youtube_operation_surfaces_exhausted_authentication_after_one_retry() -> None:
+    snapshot = SimpleNamespace(path=Path('/tmp/cookies.txt'))
+    cookie_store = SimpleNamespace(
+        current=Mock(return_value=snapshot),
+        refresh_after_rejection=AsyncMock(return_value=snapshot),
+    )
+    operation = AsyncMock(side_effect=YtDlpAuthenticationError('login required'))
+
+    with patch.object(track_store_execution_module.logger, 'warning') as warning_mock:
+        with patch.object(track_store_execution_module.logger, 'error') as error_mock:
+            with pytest.raises(track_store_execution_module.YoutubeCookieAuthenticationRetryExhaustedError):
+                await track_store_execution_module._run_youtube_operation_with_cookie_refresh(
+                    cookie_store=cookie_store,
+                    operation=operation,
+                )
+
+    assert operation.await_count == 2
+    warning_mock.assert_called_once()
+    error_mock.assert_called_once_with('yt-dlp authentication rejected after YouTube cookie refresh')
+
+
+@pytest.mark.asyncio
+async def test_youtube_operation_preserves_cookie_refresh_failure() -> None:
+    snapshot = SimpleNamespace(path=Path('/tmp/cookies.txt'))
+    refresh_error = YoutubeCookieStoreError('S3 unavailable')
+    cookie_store = SimpleNamespace(
+        current=Mock(return_value=snapshot),
+        refresh_after_rejection=AsyncMock(side_effect=refresh_error),
+    )
+    operation = AsyncMock(side_effect=YtDlpAuthenticationError('authentication rejected'))
+
+    with patch.object(track_store_execution_module.logger, 'warning') as warning_mock:
+        with patch.object(track_store_execution_module.logger, 'error') as error_mock:
+            with pytest.raises(YoutubeCookieStoreError) as exc_info:
+                await track_store_execution_module._run_youtube_operation_with_cookie_refresh(
+                    cookie_store=cookie_store,
+                    operation=operation,
+                )
+
+    assert exc_info.value is refresh_error
+    assert operation.await_count == 1
+    warning_mock.assert_called_once()
+    error_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_youtube_operation_does_not_refresh_for_unrelated_failure() -> None:
+    snapshot = SimpleNamespace(path=Path('/tmp/cookies.txt'))
+    cookie_store = SimpleNamespace(
+        current=Mock(return_value=snapshot),
+        refresh_after_rejection=AsyncMock(),
+    )
+    operation = AsyncMock(side_effect=RuntimeError('network unavailable'))
+
+    with pytest.raises(RuntimeError, match='network unavailable'):
+        await track_store_execution_module._run_youtube_operation_with_cookie_refresh(
+            cookie_store=cookie_store,
+            operation=operation,
+        )
+
+    cookie_store.refresh_after_rejection.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_track_store_link_download_exhausted_cookies_invalidates_without_logging(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     settings = _settings()
@@ -12464,9 +12603,14 @@ async def test_track_store_link_download_cookies_required_invalidates_without_lo
     state = _FakeState()
     bot = SimpleNamespace(get_file=AsyncMock(), download_file=AsyncMock())
     monkeypatch.setattr(
-        track_store_execution_module,
-        'download_audio_as_opus',
-        AsyncMock(side_effect=RuntimeError('Sign in to confirm your age')),
+        track_ingest_module,
+        'fetch_link_track_info',
+        AsyncMock(return_value=SimpleNamespace(cover=b'cover', metadata=None)),
+    )
+    monkeypatch.setattr(
+        track_ingest_module,
+        'download_link_audio_and_cover',
+        AsyncMock(side_effect=track_store_execution_module.YoutubeCookieAuthenticationRetryExhaustedError()),
     )
     log_exception = Mock()
     monkeypatch.setattr(track_ingest_module.logger, 'exception', log_exception)
@@ -12502,7 +12646,7 @@ async def test_track_store_link_download_cookies_required_invalidates_without_lo
         bot,
     )
 
-    menu_message.edit_text.assert_awaited_with('Cookies required', reply_markup=None)
+    menu_message.edit_text.assert_awaited_with('Cookies expired', reply_markup=None)
     assert state.current_state is None
     assert services.chat_message_buffer.peek_raw(42) == []
     track_store.store.assert_not_awaited()
@@ -12667,6 +12811,7 @@ async def test_track_store_link_only_cover_source_auto_stores_downloaded_cover(
     )
     download_audio_as_opus.assert_awaited_once_with(
         'https://www.youtube.com/watch?v=abc123',
+        cookie_file=Path('/tmp/timeline-hub-test/youtube-cookies.txt'),
         with_cover=True,
         with_metadata=False,
         max_duration=timedelta(
@@ -12741,6 +12886,7 @@ async def test_track_store_link_url_only_cover_source_auto_derives_metadata(
 
     download_audio_as_opus.assert_awaited_once_with(
         'https://www.youtube.com/watch?v=abc123',
+        cookie_file=Path('/tmp/timeline-hub-test/youtube-cookies.txt'),
         with_cover=True,
         with_metadata=True,
         max_duration=timedelta(
@@ -12905,7 +13051,11 @@ async def test_track_store_cover_plus_link_download_failure_invalidates_buffer(
         download_file=AsyncMock(return_value=BytesIO(b'raw-cover-1')),
     )
     monkeypatch.setattr(track_ingest_module, 'normalize_cover_to_jpg', Mock(return_value=b'user-cover-jpg'))
-    monkeypatch.setattr(track_ingest_module, 'download_audio_as_opus', AsyncMock(side_effect=RuntimeError('yt failed')))
+    monkeypatch.setattr(
+        track_ingest_module,
+        'download_link_audio_with_metadata',
+        AsyncMock(side_effect=RuntimeError('yt failed')),
+    )
     log_exception = Mock()
     monkeypatch.setattr(track_ingest_module.logger, 'exception', log_exception)
 
@@ -12940,7 +13090,7 @@ async def test_track_store_cover_plus_link_download_failure_invalidates_buffer(
 
 
 @pytest.mark.asyncio
-async def test_track_store_cover_plus_link_cookies_required_invalidates_without_logging(
+async def test_track_store_cover_plus_link_exhausted_cookies_invalidates_without_logging(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     settings = _settings()
@@ -12966,8 +13116,8 @@ async def test_track_store_cover_plus_link_cookies_required_invalidates_without_
     monkeypatch.setattr(track_ingest_module, 'normalize_cover_to_jpg', Mock(return_value=b'user-cover-jpg'))
     monkeypatch.setattr(
         track_ingest_module,
-        'download_audio_as_opus',
-        AsyncMock(side_effect=RuntimeError('Use --cookies-from-browser or --cookies')),
+        'download_link_audio_with_metadata',
+        AsyncMock(side_effect=track_store_execution_module.YoutubeCookieAuthenticationRetryExhaustedError()),
     )
     log_exception = Mock()
     monkeypatch.setattr(track_ingest_module.logger, 'exception', log_exception)
@@ -12995,7 +13145,7 @@ async def test_track_store_cover_plus_link_cookies_required_invalidates_without_
         bot,
     )
 
-    menu_message.edit_text.assert_awaited_with('Cookies required', reply_markup=None)
+    menu_message.edit_text.assert_awaited_with('Cookies expired', reply_markup=None)
     assert services.chat_message_buffer.peek_raw(42) == []
     assert state.current_state is None
     track_store.store.assert_not_awaited()
@@ -13093,7 +13243,7 @@ async def test_track_store_album_reuse_link_download_failure_invalidates_buffer(
 
 
 @pytest.mark.asyncio
-async def test_track_store_album_reuse_link_cookies_required_invalidates_without_logging(
+async def test_track_store_album_reuse_link_exhausted_cookies_invalidates_without_logging(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     settings = _settings()
@@ -13130,13 +13280,9 @@ async def test_track_store_album_reuse_link_cookies_required_invalidates_without
     state = _FakeState()
     bot = SimpleNamespace(get_file=AsyncMock(), download_file=AsyncMock())
     monkeypatch.setattr(
-        track_store_execution_module,
-        'download_audio_as_opus',
-        AsyncMock(
-            side_effect=RuntimeError(
-                'Sign in to confirm your age. Use --cookies-from-browser or --cookies for the authentication.'
-            )
-        ),
+        track_ingest_module,
+        'download_link_audio',
+        AsyncMock(side_effect=track_store_execution_module.YoutubeCookieAuthenticationRetryExhaustedError()),
     )
     log_exception = Mock()
     monkeypatch.setattr(track_ingest_module.logger, 'exception', log_exception)
@@ -13181,7 +13327,7 @@ async def test_track_store_album_reuse_link_cookies_required_invalidates_without
         bot,
     )
 
-    menu_message.edit_text.assert_awaited_with('Cookies required', reply_markup=None)
+    menu_message.edit_text.assert_awaited_with('Cookies expired', reply_markup=None)
     assert services.chat_message_buffer.peek_raw(42) == []
     assert state.current_state is None
     track_store.store.assert_not_awaited()
@@ -13539,6 +13685,7 @@ async def test_track_store_link_only_without_albums_executes_auto_immediately(
 
     download_audio_as_opus.assert_awaited_once_with(
         'https://www.youtube.com/watch?v=abc123',
+        cookie_file=Path('/tmp/timeline-hub-test/youtube-cookies.txt'),
         with_cover=True,
         with_metadata=False,
         max_duration=timedelta(
@@ -13614,6 +13761,7 @@ async def test_track_store_link_only_missing_group_executes_auto_immediately(
 
     download_audio_as_opus.assert_awaited_once_with(
         'https://www.youtube.com/watch?v=tDoVzwp-f_g&pp=ygUQYnJpbCBOb3cgaXQgZ29lcw%3D%3D',
+        cookie_file=Path('/tmp/timeline-hub-test/youtube-cookies.txt'),
         with_cover=True,
         with_metadata=False,
         max_duration=timedelta(

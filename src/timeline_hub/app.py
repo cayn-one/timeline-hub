@@ -15,6 +15,7 @@ from timeline_hub.services.clip_store import ClipStore
 from timeline_hub.services.container import Services
 from timeline_hub.services.message_buffer import ChatMessageBuffer
 from timeline_hub.services.track_store import Preset, PresetMode, PresetStore, TrackStore
+from timeline_hub.services.youtube_cookies import YoutubeCookieStore
 from timeline_hub.settings import Settings
 from timeline_hub.types import UserId
 
@@ -56,6 +57,8 @@ async def _main(settings: Settings) -> None:
             bootstrap_preset=_default_track_preset(),
             namespace=settings.track_namespace,
         )
+        youtube_cookie_store = YoutubeCookieStore(s3_client)
+        await youtube_cookie_store.refresh()
 
         dp['services'] = Services(
             chat_message_buffer=ChatMessageBuffer(),
@@ -74,6 +77,7 @@ async def _main(settings: Settings) -> None:
                 variant_max_duration=settings.variant_max_duration,
                 namespace=settings.track_namespace,
             ),
+            youtube_cookie_store=youtube_cookie_store,
         )
         dp['settings'] = settings
         dp['on_failure'] = on_failure_stop

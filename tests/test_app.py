@@ -86,9 +86,12 @@ async def test_main_wires_storage_namespaces_into_stores(monkeypatch: pytest.Mon
     clip_store = object()
     track_store = object()
     preset_store = object()
+    youtube_cookie_store = MagicMock()
+    youtube_cookie_store.refresh = AsyncMock()
     clip_store_ctor = Mock(return_value=clip_store)
     track_store_ctor = Mock(return_value=track_store)
     preset_store_ctor = Mock(return_value=preset_store)
+    youtube_cookie_store_ctor = Mock(return_value=youtube_cookie_store)
 
     class _FakeS3ClientContext:
         async def __aenter__(self) -> object:
@@ -103,7 +106,7 @@ async def test_main_wires_storage_namespaces_into_stores(monkeypatch: pytest.Mon
     monkeypatch.setattr(app_module, 'ClipStore', clip_store_ctor)
     monkeypatch.setattr(app_module, 'TrackStore', track_store_ctor)
     monkeypatch.setattr(app_module, 'PresetStore', preset_store_ctor)
-
+    monkeypatch.setattr(app_module, 'YoutubeCookieStore', youtube_cookie_store_ctor)
     await app_module._main(settings)
 
     clip_store_ctor.assert_called_once_with(
@@ -119,6 +122,8 @@ async def test_main_wires_storage_namespaces_into_stores(monkeypatch: pytest.Mon
     assert track_store_ctor.call_args.args == (s3_client,)
     assert track_store_ctor.call_args.kwargs['preset_store'] is preset_store
     assert track_store_ctor.call_args.kwargs['namespace'] == 'tracks-dev'
+    youtube_cookie_store_ctor.assert_called_once_with(s3_client)
+    youtube_cookie_store.refresh.assert_awaited_once()
 
 
 @pytest.mark.asyncio

@@ -1,17 +1,27 @@
 import math
 import re
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
+from typing import TypeVar
 from urllib.parse import parse_qs, urlparse
 
 from aiogram import Bot
 from aiogram.types import Message
+from loguru import logger
 
 from timeline_hub.infra.ffmpeg import probe_audio_sample_rate, to_opus
 from timeline_hub.infra.images import normalize_cover_to_jpg
-from timeline_hub.infra.ytdlp import TrackMetadata, YtDlpMetadataError, download_audio_as_opus
+from timeline_hub.infra.ytdlp import (
+    DownloadedAudio,
+    TrackMetadata,
+    UrlTrackInfo,
+    YtDlpAuthenticationError,
+    YtDlpMetadataError,
+    download_audio_as_opus,
+    fetch_track_info,
+)
 from timeline_hub.services.track_store import (
     Track,
     TrackGroup,
@@ -20,6 +30,7 @@ from timeline_hub.services.track_store import (
     TrackStore,
     UploadedVariant,
 )
+from timeline_hub.services.youtube_cookies import YoutubeCookieStore, YoutubeCookieStoreError
 from timeline_hub.types import Extension, FileBytes, InvalidExtensionError
 
 
@@ -29,6 +40,10 @@ class TrackInputError(ValueError):
 
 class TrackLinkDownloadError(RuntimeError):
     pass
+
+
+class YoutubeCookieAuthenticationRetryExhaustedError(YtDlpAuthenticationError):
+    """Raised when refreshed YouTube cookies are rejected by a second operation attempt."""
 
 
 class UploadedFileTooBigError(RuntimeError):
@@ -97,6 +112,7 @@ class ParsedUploadedVariant:
 _UPLOADED_PART_SUFFIX_PATTERN = re.compile(r'^(?P<logical_name>.+?)\.part(?P<part_index>[0-9])$', re.IGNORECASE)
 _SUPPORTED_DOCUMENT_AUDIO_EXTENSIONS = frozenset({'.wav', '.flac', '.opus'})
 _SUPPORTED_UPLOADED_LOGICAL_EXTENSIONS = frozenset({Extension.OPUS, Extension.MP3})
+_T = TypeVar('_T')
 
 
 def extract_track_audio_attachment(message: Message) -> TrackAudioAttachment | None:
@@ -613,9 +629,41 @@ def parse_cover_link_store_input(messages: Sequence[Message]) -> CoverLinkTrackI
     )
 
 
-async def download_link_audio(url: str, *, max_duration: timedelta | None = None) -> FileBytes:
+async def fetch_link_track_info(
+    url: str,
+    *,
+    cookie_store: YoutubeCookieStore,
+    with_cover: bool,
+    with_metadata: bool,
+) -> UrlTrackInfo:
+    return await _run_youtube_operation_with_cookie_refresh(
+        cookie_store=cookie_store,
+        operation=lambda cookie_file: fetch_track_info(
+            url,
+            cookie_file=cookie_file,
+            with_cover=with_cover,
+            with_metadata=with_metadata,
+        ),
+    )
+
+
+async def download_link_audio(
+    url: str,
+    *,
+    cookie_store: YoutubeCookieStore,
+    max_duration: timedelta | None = None,
+) -> FileBytes:
     try:
-        result = await download_audio_as_opus(url, max_duration=max_duration)
+        result = await _run_youtube_operation_with_cookie_refresh(
+            cookie_store=cookie_store,
+            operation=lambda cookie_file: download_audio_as_opus(
+                url,
+                cookie_file=cookie_file,
+                max_duration=max_duration,
+            ),
+        )
+    except YoutubeCookieAuthenticationRetryExhaustedError, YoutubeCookieStoreError:
+        raise
     except Exception as error:
         raise TrackLinkDownloadError(str(error)) from error
     return FileBytes(data=result.audio, extension=Extension.OPUS)
@@ -624,17 +672,22 @@ async def download_link_audio(url: str, *, max_duration: timedelta | None = None
 async def download_link_audio_and_cover(
     url: str,
     *,
+    cookie_store: YoutubeCookieStore,
     with_metadata: bool = False,
     max_duration: timedelta | None = None,
 ) -> DownloadedLinkAudioCover:
     try:
-        result = await download_audio_as_opus(
-            url,
-            with_cover=True,
-            with_metadata=with_metadata,
-            max_duration=max_duration,
+        result = await _run_youtube_operation_with_cookie_refresh(
+            cookie_store=cookie_store,
+            operation=lambda cookie_file: download_audio_as_opus(
+                url,
+                cookie_file=cookie_file,
+                with_cover=True,
+                with_metadata=with_metadata,
+                max_duration=max_duration,
+            ),
         )
-    except YtDlpMetadataError:
+    except YtDlpMetadataError, YoutubeCookieAuthenticationRetryExhaustedError, YoutubeCookieStoreError:
         raise
     except Exception as error:
         raise TrackLinkDownloadError(str(error)) from error
@@ -645,6 +698,43 @@ async def download_link_audio_and_cover(
         cover=FileBytes(data=result.cover, extension=Extension.JPG),
         metadata=result.metadata,
     )
+
+
+async def download_link_audio_with_metadata(
+    url: str,
+    *,
+    cookie_store: YoutubeCookieStore,
+    with_metadata: bool,
+    max_duration: timedelta | None,
+) -> DownloadedAudio:
+    return await _run_youtube_operation_with_cookie_refresh(
+        cookie_store=cookie_store,
+        operation=lambda cookie_file: download_audio_as_opus(
+            url,
+            cookie_file=cookie_file,
+            with_metadata=with_metadata,
+            max_duration=max_duration,
+        ),
+    )
+
+
+async def _run_youtube_operation_with_cookie_refresh(
+    *,
+    cookie_store: YoutubeCookieStore,
+    operation: Callable[[Path], Awaitable[_T]],
+) -> _T:
+    snapshot = cookie_store.current()
+    try:
+        return await operation(snapshot.path)
+    except YtDlpAuthenticationError:
+        logger.warning('yt-dlp authentication rejected; retrying with latest YouTube cookies')
+        refreshed_snapshot = await cookie_store.refresh_after_rejection(snapshot)
+
+    try:
+        return await operation(refreshed_snapshot.path)
+    except YtDlpAuthenticationError as error:
+        logger.error('yt-dlp authentication rejected after YouTube cookie refresh')
+        raise YoutubeCookieAuthenticationRetryExhaustedError('YouTube cookies were rejected after refresh') from error
 
 
 def validate_track_batch(messages: Sequence[Message]) -> list[tuple[tuple[str, ...], str]]:

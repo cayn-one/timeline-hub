@@ -1,0 +1,8 @@
+services:
+  timeline-hub:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - .env
+    command: ['--dev']
