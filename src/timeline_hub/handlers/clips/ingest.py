@@ -3,7 +3,7 @@ from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import date
 from enum import StrEnum, auto
-from typing import Any
+from typing import Any, Literal
 
 from aiogram import Bot, F, Router
 from aiogram.enums import ChatType
@@ -46,6 +46,9 @@ from timeline_hub.handlers.clips.flow import (
     year_option_universe,
 )
 from timeline_hub.handlers.clips.reconcile_input import (
+    ChronologicalClipRef,
+    InboxClipRef,
+    ParsedClipRef,
     clip_id_batch_count,
     parse_clip_identity_filename,
     prepare_reconcile_clip_id_batches,
@@ -65,9 +68,19 @@ from timeline_hub.handlers.clips.reorder_flow import (
     reordered_video_messages,
     show_reorder_selection_menu,
 )
-from timeline_hub.handlers.clips.route_planning import RouteBatch, parse_route_text, plan_route_batches
+from timeline_hub.handlers.clips.route_planning import (
+    InboxRouteBatch,
+    PlannedRouteBatch,
+    parse_inbox_route_text,
+    parse_route_text,
+    plan_route_batches,
+)
 from timeline_hub.handlers.clips.store_execution import _uses_dense_layout, execute_store_or_produce
-from timeline_hub.handlers.clips.transfer_planning import TransferBatch, plan_transfer_batches
+from timeline_hub.handlers.clips.transfer_planning import (
+    InboxTransferBatch,
+    PlannedTransferBatch,
+    plan_transfer_batches,
+)
 from timeline_hub.handlers.menu import (
     callback_message,
     create_padding_line,
@@ -86,6 +99,7 @@ from timeline_hub.services.clip_store import (
     ClipId,
     ClipSubGroup,
     DuplicateClipIdsError,
+    InboxTransferResult,
     InvalidClipIdentityError,
     ReconcileResult,
     Scope,
@@ -109,6 +123,7 @@ _BUFFER_VERSION_KEY = 'buffer_version'
 _PRODUCE_FLOW_MODE = 'produce'
 _MIXED_GROUPS = 'mixed_groups'
 type IntakeShowMenu = Callable[..., Awaitable[bool]]
+type RouteLogTarget = tuple[ClipGroup, ClipSubGroup] | tuple[Literal['inbox'], Universe]
 
 
 class IntakeAction(StrEnum):
@@ -157,6 +172,7 @@ class _TransferExecutionResult:
 class _BufferedRouteClip:
     message: Message
     kind: RouteRequestKind
+    source_ref: ParsedClipRef | None
 
 
 def _pack_intake_menu_callback(action: MenuAction, step: MenuStep, value: str) -> str:
@@ -364,17 +380,29 @@ async def on_intake_action(
                 return
 
             clip_group: ClipGroup | None = None
+            inbox_universe: Universe | None = None
             clip_ids: list[ClipId] = []
             clip_id_set: set[ClipId] = set()
             try:
                 for buffered_message in buffered_video_messages:
                     if buffered_message.video is None or not buffered_message.video.file_name:
                         raise InvalidClipIdentityError('clip filename is required')
-                    parsed_group, clip_id = parse_clip_identity_filename(buffered_message.video.file_name)
-                    if clip_group is None:
-                        clip_group = parsed_group
-                    elif parsed_group != clip_group:
-                        raise ValueError(_MIXED_GROUPS)
+                    parsed_ref = parse_clip_identity_filename(buffered_message.video.file_name)
+                    if isinstance(parsed_ref, ChronologicalClipRef):
+                        if inbox_universe is not None:
+                            raise ValueError(_MIXED_GROUPS)
+                        if clip_group is None:
+                            clip_group = parsed_ref.group
+                        elif parsed_ref.group != clip_group:
+                            raise ValueError(_MIXED_GROUPS)
+                    else:
+                        if clip_group is not None:
+                            raise ValueError(_MIXED_GROUPS)
+                        if inbox_universe is None:
+                            inbox_universe = parsed_ref.universe
+                        elif parsed_ref.universe is not inbox_universe:
+                            raise ValueError(_MIXED_GROUPS)
+                    clip_id = parsed_ref.clip_id
                     if clip_id in clip_id_set:
                         raise DuplicateClipIdsError(clip_ids=[*clip_ids, clip_id])
                     clip_ids.append(clip_id)
@@ -388,7 +416,7 @@ async def on_intake_action(
                 )
                 return
 
-            if clip_group is None:
+            if clip_group is None and inbox_universe is None:
                 await handle_stale_selection(message=message, state=state)
                 return
 
@@ -400,10 +428,18 @@ async def on_intake_action(
             )
 
             try:
-                affected_sub_groups = await services.clip_store.remove(
-                    clip_group,
-                    clip_ids=clip_ids,
-                )
+                if inbox_universe is not None:
+                    await services.clip_store.remove_from_inbox(
+                        inbox_universe,
+                        clip_ids=clip_ids,
+                    )
+                    affected_sub_groups = ()
+                else:
+                    assert clip_group is not None
+                    affected_sub_groups = await services.clip_store.remove(
+                        clip_group,
+                        clip_ids=clip_ids,
+                    )
             except ClipGroupNotFoundError, UnknownClipsError:
                 await _invalidate_intake_buffer(
                     message=message,
@@ -413,6 +449,9 @@ async def on_intake_action(
                 )
                 return
 
+            if clip_group is None:
+                await message.answer('Done')
+                return
             for sub_group in affected_sub_groups:
                 if not _uses_dense_layout(sub_group.scope):
                     continue
@@ -440,7 +479,10 @@ async def on_intake_action(
             # UI stateless and simple; users must resend clips if validation fails.
             route_message_groups = services.chat_message_buffer.peek_grouped(message.chat.id)
             services.chat_message_buffer.flush(message.chat.id)
-            route_kind, route_clip_messages = _classify_route_request(route_message_groups)
+            route_kind, route_clip_messages = await _classify_route_request(
+                services=services,
+                message_groups=route_message_groups,
+            )
             if route_kind is RouteRequestKind.MIXED:
                 await message.edit_text('Mixed clip types', reply_markup=None)
                 return
@@ -451,6 +493,11 @@ async def on_intake_action(
                     settings=settings,
                     state=state,
                     transfer_message_groups=route_message_groups,
+                    resolved_clip_refs={
+                        clip.message.message_id: clip.source_ref
+                        for clip in route_clip_messages
+                        if clip.source_ref is not None
+                    },
                 )
                 return
 
@@ -463,12 +510,18 @@ async def on_intake_action(
                 return
 
             await message.edit_text('Routing...', reply_markup=None)
+            last_route_progress_text = 'Routing...'
 
-            async def update_route_progress(selection_batches: Sequence[RouteBatch]) -> None:
+            async def update_route_progress(selection_batches: Sequence[PlannedRouteBatch]) -> None:
+                nonlocal last_route_progress_text
+                progress_kwargs = _route_progress_kwargs(selection_batches)
+                if progress_kwargs['text'] == last_route_progress_text:
+                    return
                 await message.edit_text(
-                    **_route_progress_kwargs(selection_batches),
+                    **progress_kwargs,
                     reply_markup=None,
                 )
+                last_route_progress_text = progress_kwargs['text']
 
             try:
                 route_result = await _store_route_batches(
@@ -1203,13 +1256,13 @@ async def _store_route_batches(
     *,
     bot: Bot,
     services: Services,
-    route_batches: Sequence[RouteBatch],
-    on_batch_stored: Callable[[Sequence[RouteBatch]], Awaitable[None]] | None = None,
+    route_batches: Sequence[PlannedRouteBatch],
+    on_batch_stored: Callable[[Sequence[PlannedRouteBatch]], Awaitable[None]] | None = None,
 ) -> _RouteResult:
     result = StoreResult(stored_count=0, duplicate_count=0)
     compact_targets: list[tuple[ClipGroup, SubSeason]] = []
     compact_target_set: set[tuple[ClipGroup, SubSeason]] = set()
-    completed_route_batches: list[RouteBatch] = []
+    completed_route_batches: list[PlannedRouteBatch] = []
     selection_groups: list[ClipGroup] = []
 
     for route_batch in route_batches:
@@ -1217,20 +1270,34 @@ async def _store_route_batches(
         for start in range(0, len(route_batch.messages), _ROUTE_STORE_CHUNK_SIZE):
             batch_messages = route_batch.messages[start : start + _ROUTE_STORE_CHUNK_SIZE]
             try:
-                batch_result = await services.clip_store.store(
-                    route_batch.clip_group,
-                    ClipSubGroup(sub_season=route_batch.sub_season, scope=Scope.SOURCE),
-                    clips=await _clip_messages_to_clip_files(
-                        bot=bot,
-                        messages=batch_messages,
-                    ),
+                clip_files = await _clip_messages_to_clip_files(
+                    bot=bot,
+                    messages=batch_messages,
                 )
+                if isinstance(route_batch, InboxRouteBatch):
+                    batch_result = await services.clip_store.store_inbox(
+                        route_batch.universe,
+                        clips=clip_files,
+                    )
+                else:
+                    batch_result = await services.clip_store.store(
+                        route_batch.clip_group,
+                        ClipSubGroup(sub_season=route_batch.sub_season, scope=Scope.SOURCE),
+                        clips=clip_files,
+                    )
             except UnsupportedVideoCodecError as error:
+                route_target: RouteLogTarget = (
+                    ('inbox', route_batch.universe)
+                    if isinstance(route_batch, InboxRouteBatch)
+                    else (
+                        route_batch.clip_group,
+                        ClipSubGroup(sub_season=route_batch.sub_season, scope=Scope.SOURCE),
+                    )
+                )
                 _log_route_unsupported_codec_warning(
                     error=error,
                     chat_id=batch_messages[0].chat.id,
-                    clip_group=route_batch.clip_group,
-                    sub_season=route_batch.sub_season,
+                    route_target=route_target,
                     messages=batch_messages,
                 )
                 raise
@@ -1239,9 +1306,11 @@ async def _store_route_batches(
                 stored_any = True
 
         completed_route_batches.append(route_batch)
-        selection_groups.append(route_batch.clip_group)
         if on_batch_stored is not None:
             await on_batch_stored(completed_route_batches)
+        if isinstance(route_batch, InboxRouteBatch):
+            continue
+        selection_groups.append(route_batch.clip_group)
         compact_target = (route_batch.clip_group, route_batch.sub_season)
         if stored_any and compact_target not in compact_target_set:
             compact_targets.append(compact_target)
@@ -1257,29 +1326,42 @@ async def _store_route_batches(
 async def _transfer_clip_batches(
     *,
     services: Services,
-    transfer_batches: Sequence[TransferBatch],
-    on_batch_transferred: Callable[[Sequence[TransferBatch]], Awaitable[None]] | None = None,
+    transfer_batches: Sequence[PlannedTransferBatch],
+    on_batch_transferred: Callable[[Sequence[PlannedTransferBatch]], Awaitable[None]] | None = None,
 ) -> _TransferExecutionResult:
     result = TransferResult(
         transferred_count=0,
         already_in_destination_group_count=0,
         duplicate_blocked_count=0,
     )
-    completed_transfer_batches: list[TransferBatch] = []
+    completed_transfer_batches: list[PlannedTransferBatch] = []
     affected_sub_groups: list[tuple[ClipGroup, ClipSubGroup]] = []
     affected_sub_group_set: set[tuple[ClipGroup, ClipSubGroup]] = set()
 
     for transfer_batch in transfer_batches:
-        batch_result = await services.clip_store.transfer(
-            destination_group=transfer_batch.destination_group,
-            clips=[
-                TransferClipRef(
-                    source_group=clip.source_group,
-                    clip_id=clip.clip_id,
-                )
-                for clip in transfer_batch.clips
-            ],
-        )
+        if isinstance(transfer_batch, InboxTransferBatch):
+            inbox_result: InboxTransferResult = await services.clip_store.transfer_from_inbox(
+                universe=transfer_batch.source_universe,
+                clip_ids=transfer_batch.clip_ids,
+                destination_group=transfer_batch.destination_group,
+                destination_sub_group=transfer_batch.destination_sub_group,
+            )
+            batch_result = TransferResult(
+                transferred_count=inbox_result.transferred_count,
+                already_in_destination_group_count=0,
+                duplicate_blocked_count=inbox_result.duplicate_blocked_count,
+            )
+        else:
+            batch_result = await services.clip_store.transfer(
+                destination_group=transfer_batch.destination_group,
+                clips=[
+                    TransferClipRef(
+                        source_group=clip.source_group,
+                        clip_id=clip.clip_id,
+                    )
+                    for clip in transfer_batch.clips
+                ],
+            )
         result = TransferResult(
             transferred_count=result.transferred_count + batch_result.transferred_count,
             already_in_destination_group_count=(
@@ -1306,19 +1388,28 @@ async def _transfer_clip_batches(
     )
 
 
-def _classify_route_request(
+async def _classify_route_request(
+    *,
+    services: Services,
     message_groups: Sequence[MessageGroup],
 ) -> tuple[RouteRequestKind, list[_BufferedRouteClip]]:
     buffered_clips: list[_BufferedRouteClip] = []
     seen_kinds: set[RouteRequestKind] = set()
+    known_group_clip_ids: dict[ClipGroup, set[ClipId]] = {}
+    known_inbox_clip_ids: dict[Universe, set[ClipId]] = {}
 
     for message_group in message_groups:
         for message in message_group:
             if extract_clip_file_id(message) is None:
                 continue
-            route_kind = _route_clip_kind(message)
+            route_kind, source_ref = await _route_clip_kind(
+                message,
+                services=services,
+                known_group_clip_ids=known_group_clip_ids,
+                known_inbox_clip_ids=known_inbox_clip_ids,
+            )
             seen_kinds.add(route_kind)
-            buffered_clips.append(_BufferedRouteClip(message=message, kind=route_kind))
+            buffered_clips.append(_BufferedRouteClip(message=message, kind=route_kind, source_ref=source_ref))
 
     if RouteRequestKind.EXTERNAL in seen_kinds and RouteRequestKind.INTERNAL in seen_kinds:
         return RouteRequestKind.MIXED, buffered_clips
@@ -1327,15 +1418,45 @@ def _classify_route_request(
     return RouteRequestKind.EXTERNAL, buffered_clips
 
 
-def _route_clip_kind(message: Message) -> RouteRequestKind:
+async def _route_clip_kind(
+    message: Message,
+    *,
+    services: Services,
+    known_group_clip_ids: dict[ClipGroup, set[ClipId]],
+    known_inbox_clip_ids: dict[Universe, set[ClipId]],
+) -> tuple[RouteRequestKind, ParsedClipRef | None]:
     file_name = _route_message_filename(message)
     if not file_name:
-        return RouteRequestKind.EXTERNAL
+        return RouteRequestKind.EXTERNAL, None
     try:
-        parse_clip_identity_filename(file_name)
+        source_ref = parse_clip_identity_filename(file_name)
     except ValueError:
-        return RouteRequestKind.EXTERNAL
-    return RouteRequestKind.INTERNAL
+        return RouteRequestKind.EXTERNAL, None
+
+    if isinstance(source_ref, InboxClipRef):
+        clip_ids = known_inbox_clip_ids.get(source_ref.universe)
+        if clip_ids is None:
+            clip_ids = {
+                clip.id for batch in await services.clip_store.list_inbox_clips(source_ref.universe) for clip in batch
+            }
+            known_inbox_clip_ids[source_ref.universe] = clip_ids
+        if source_ref.clip_id not in clip_ids:
+            return RouteRequestKind.EXTERNAL, None
+        return RouteRequestKind.INTERNAL, source_ref
+
+    clip_ids = known_group_clip_ids.get(source_ref.group)
+    if clip_ids is None:
+        try:
+            clips_by_sub_group = await services.clip_store.list_clips(source_ref.group)
+        except ClipGroupNotFoundError:
+            clip_ids = set()
+        else:
+            clip_ids = {clip.id for batches in clips_by_sub_group.values() for batch in batches for clip in batch}
+        known_group_clip_ids[source_ref.group] = clip_ids
+
+    if source_ref.clip_id not in clip_ids:
+        return RouteRequestKind.EXTERNAL, None
+    return RouteRequestKind.INTERNAL, source_ref
 
 
 async def _execute_internal_route_action(
@@ -1345,9 +1466,14 @@ async def _execute_internal_route_action(
     settings: Settings,
     state: FSMContext,
     transfer_message_groups: Sequence[MessageGroup],
+    resolved_clip_refs: dict[int, ParsedClipRef] | None = None,
 ) -> None:
     del state
-    transfer_batches, error_text = plan_transfer_batches(transfer_message_groups, settings=settings)
+    transfer_batches, error_text = plan_transfer_batches(
+        transfer_message_groups,
+        settings=settings,
+        resolved_clip_refs=resolved_clip_refs,
+    )
     if error_text is not None:
         await message.edit_text(error_text, reply_markup=None)
         return
@@ -1357,11 +1483,15 @@ async def _execute_internal_route_action(
 
     await message.edit_text('Routing...', reply_markup=None)
 
-    async def update_transfer_progress(selection_batches: Sequence[TransferBatch]) -> None:
-        await message.edit_text(
-            **_transfer_progress_kwargs(selection_batches),
-            reply_markup=None,
-        )
+    last_progress_destinations: tuple[tuple[ClipGroup, ClipSubGroup], ...] | None = None
+
+    async def update_transfer_progress(selection_batches: Sequence[PlannedTransferBatch]) -> None:
+        nonlocal last_progress_destinations
+        progress_destinations = _transfer_progress_destinations(selection_batches)
+        if progress_destinations == last_progress_destinations:
+            return
+        await message.edit_text(**_transfer_progress_kwargs(selection_batches), reply_markup=None)
+        last_progress_destinations = progress_destinations
 
     try:
         transfer_result = await _transfer_clip_batches(
@@ -1485,14 +1615,9 @@ def _log_route_unsupported_codec_warning(
     *,
     error: UnsupportedVideoCodecError,
     chat_id: ChatId,
-    clip_group: ClipGroup,
-    sub_season: SubSeason,
+    route_target: RouteLogTarget,
     messages: Sequence[Message],
 ) -> None:
-    route_target = (
-        clip_group,
-        ClipSubGroup(sub_season=sub_season, scope=Scope.SOURCE),
-    )
     logger.warning(
         (
             'unsupported clip codec during route execution '
@@ -1610,13 +1735,15 @@ def _intake_action_menu_kwargs(
 
 
 def _message_has_route_menu_signal(message: Message) -> bool:
-    if isinstance(message.text, str) and parse_route_text(message.text) is not None:
+    if isinstance(message.text, str) and (
+        parse_route_text(message.text) is not None or parse_inbox_route_text(message.text) is not None
+    ):
         return True
     if extract_clip_file_id(message) is None:
         return False
     if not isinstance(message.caption, str):
         return False
-    return parse_route_text(message.caption) is not None
+    return parse_route_text(message.caption) is not None or parse_inbox_route_text(message.caption) is not None
 
 
 async def try_dispatch_clip_intake(
@@ -1653,46 +1780,69 @@ async def try_dispatch_clip_intake(
     return True
 
 
-def _route_progress_kwargs(route_batches: Sequence[RouteBatch]) -> dict[str, Any]:
+def _route_progress_kwargs(route_batches: Sequence[PlannedRouteBatch]) -> dict[str, Any]:
     parts: list[object] = ['Routing...']
 
     for route_batch in route_batches:
+        if isinstance(route_batch, InboxRouteBatch):
+            route_labels = ('Inbox', route_batch.universe.title())
+        else:
+            route_labels = selection_labels(
+                universe=route_batch.clip_group.universe,
+                year=route_batch.clip_group.year,
+                season=route_batch.clip_group.season,
+                sub_season=route_batch.sub_season,
+                scope=Scope.SOURCE,
+            )
         parts.extend(
             [
                 '\n',
-                _route_progress_line(
-                    selection_labels(
-                        universe=route_batch.clip_group.universe,
-                        year=route_batch.clip_group.year,
-                        season=route_batch.clip_group.season,
-                        sub_season=route_batch.sub_season,
-                        scope=Scope.SOURCE,
-                    )
-                ),
+                _route_progress_line(route_labels),
             ]
         )
 
     return Text(*parts).as_kwargs()
 
 
-def _transfer_progress_kwargs(transfer_batches: Sequence[TransferBatch]) -> dict[str, Any]:
+def _transfer_progress_kwargs(transfer_batches: Sequence[PlannedTransferBatch]) -> dict[str, Any]:
     parts: list[object] = ['Routing...']
 
     for transfer_batch in transfer_batches:
+        route_labels_kwargs: dict[str, object] = {
+            'universe': transfer_batch.destination_group.universe,
+            'year': transfer_batch.destination_group.year,
+            'season': transfer_batch.destination_group.season,
+        }
+        if isinstance(transfer_batch, InboxTransferBatch):
+            route_labels_kwargs.update(
+                sub_season=transfer_batch.destination_sub_group.sub_season,
+                scope=Scope.SOURCE,
+            )
         parts.extend(
             [
                 '\n',
-                _route_progress_line(
-                    selection_labels(
-                        universe=transfer_batch.destination_group.universe,
-                        year=transfer_batch.destination_group.year,
-                        season=transfer_batch.destination_group.season,
-                    )
-                ),
+                _route_progress_line(selection_labels(**route_labels_kwargs)),
             ]
         )
 
     return Text(*parts).as_kwargs()
+
+
+def _transfer_progress_destinations(
+    transfer_batches: Sequence[PlannedTransferBatch],
+) -> tuple[tuple[ClipGroup, ClipSubGroup], ...]:
+    """Return the destination sequence currently visible in Route progress."""
+    destinations: list[tuple[ClipGroup, ClipSubGroup]] = []
+    for transfer_batch in transfer_batches:
+        destination_sub_group = (
+            transfer_batch.destination_sub_group
+            if isinstance(transfer_batch, InboxTransferBatch)
+            else ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.SOURCE)
+        )
+        destination = (transfer_batch.destination_group, destination_sub_group)
+        if not destinations or destination != destinations[-1]:
+            destinations.append(destination)
+    return tuple(destinations)
 
 
 def _route_progress_line(values: Sequence[str]) -> Text:

@@ -114,6 +114,7 @@ async def test_main_wires_storage_namespaces_into_stores(monkeypatch: pytest.Mon
         namespace='clips-dev',
         max_s3_concurrency=8,
         sampled_phash_mean_threshold=1.5,
+        inbox_batch_size=10,
     )
     preset_store_ctor.assert_called_once()
     assert preset_store_ctor.call_args.args == (s3_client,)

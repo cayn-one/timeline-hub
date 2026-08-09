@@ -1,20 +1,43 @@
 from collections.abc import Sequence
+from dataclasses import dataclass
 
-from timeline_hub.services.clip_store import ClipGroup, ClipId, ClipStore, DuplicateClipIdsError
+from timeline_hub.services.clip_store import ClipGroup, ClipId, ClipStore, DuplicateClipIdsError, Universe
 from timeline_hub.services.message_buffer import MessageGroup
 
 _MIXED_GROUPS = 'mixed_groups'
 _INVALID_IDENTITY = 'invalid_identity'
 
 
-def parse_clip_identity_filename(filename: str) -> tuple[ClipGroup, ClipId]:
-    """Parse one clip filename into its logical group and clip id.
+@dataclass(frozen=True, slots=True)
+class ChronologicalClipRef:
+    """Claimed identity of one chronological stored clip."""
 
-    The filename stem must already be the canonical logical clip identity
-    string produced by `ClipStore.clip_identity_to_string()`.
+    group: ClipGroup
+    clip_id: ClipId
+
+
+@dataclass(frozen=True, slots=True)
+class InboxClipRef:
+    """Claimed identity of one inbox stored clip."""
+
+    universe: Universe
+    clip_id: ClipId
+
+
+type ParsedClipRef = ChronologicalClipRef | InboxClipRef
+
+
+def parse_clip_identity_filename(filename: str) -> ParsedClipRef:
+    """Parse one retrieved clip filename into its claimed stored identity.
+
+    The filename stem must be a strict chronological or inbox logical identity.
     """
     identity_str = filename.rsplit('.', 1)[0] if '.' in filename else filename
-    return ClipStore.string_to_clip_identity(identity_str)
+    if identity_str.startswith('inbox-'):
+        universe, clip_id = ClipStore.string_to_inbox_clip_identity(identity_str)
+        return InboxClipRef(universe=universe, clip_id=clip_id)
+    group, clip_id = ClipStore.string_to_clip_identity(identity_str)
+    return ChronologicalClipRef(group=group, clip_id=clip_id)
 
 
 def prepare_reconcile_clip_id_batches(
@@ -52,7 +75,10 @@ def _parse_reconcile_filename_batches(
     for batch in filename_batches:
         clip_id_batch: list[ClipId] = []
         for filename in batch:
-            parsed_group, clip_id = parse_clip_identity_filename(filename)
+            parsed_ref = parse_clip_identity_filename(filename)
+            if not isinstance(parsed_ref, ChronologicalClipRef):
+                raise ValueError(_INVALID_IDENTITY)
+            parsed_group, clip_id = parsed_ref.group, parsed_ref.clip_id
             if clip_group is None:
                 clip_group = parsed_group
             elif parsed_group != clip_group:

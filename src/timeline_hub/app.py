@@ -70,6 +70,7 @@ async def _main(settings: Settings) -> None:
                 namespace=settings.clip_namespace,
                 max_s3_concurrency=settings.max_s3_concurrency,
                 sampled_phash_mean_threshold=settings.sampled_phash_mean_threshold,
+                inbox_batch_size=10,
             ),
             track_store=TrackStore(
                 s3_client,

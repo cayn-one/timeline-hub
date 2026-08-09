@@ -18,13 +18,24 @@ class RouteBatch:
     messages: list[Message]
 
 
+@dataclass(slots=True)
+class InboxRouteBatch:
+    universe: Universe
+    messages: list[Message]
+
+
+type PlannedRouteBatch = RouteBatch | InboxRouteBatch
+type RouteTarget = tuple[ClipGroup, SubSeason] | Universe
+
+
 def plan_route_batches(
     message_groups: Sequence[MessageGroup],
     *,
     settings: Settings,
-) -> tuple[list[RouteBatch], str | None]:
-    batches: list[RouteBatch] = []
-    current_route: tuple[ClipGroup, SubSeason] | None = None
+) -> tuple[list[PlannedRouteBatch], str | None]:
+    """Plan external clips into ordered chronological or inbox route sections."""
+    batches: list[PlannedRouteBatch] = []
+    current_route: RouteTarget | None = None
     today = date.today()
     allowed_years = set(
         year_option_universe(
@@ -40,7 +51,7 @@ def plan_route_batches(
                 if message.text is None:
                     continue
 
-                parsed_route = _parse_and_validate_route(
+                parsed_route = _parse_and_validate_route_target(
                     message.text,
                     today=today,
                     allowed_years=allowed_years,
@@ -56,7 +67,7 @@ def plan_route_batches(
                     return [], 'Missing route text'
                 next_route = current_route
             else:
-                next_route = _parse_and_validate_route(
+                next_route = _parse_and_validate_route_target(
                     route_text,
                     today=today,
                     allowed_years=allowed_years,
@@ -64,17 +75,32 @@ def plan_route_batches(
                 if next_route is None:
                     return [], 'Invalid route text'
 
-            next_group, next_sub_season = next_route
-            if not batches or batches[-1].clip_group != next_group or batches[-1].sub_season != next_sub_season:
-                batches.append(
-                    RouteBatch(
-                        clip_group=next_group,
-                        sub_season=next_sub_season,
-                        messages=[message],
-                    )
-                )
+            if isinstance(next_route, Universe):
+                if (
+                    not batches
+                    or not isinstance(batches[-1], InboxRouteBatch)
+                    or batches[-1].universe is not next_route
+                ):
+                    batches.append(InboxRouteBatch(universe=next_route, messages=[message]))
+                else:
+                    batches[-1].messages.append(message)
             else:
-                batches[-1].messages.append(message)
+                next_group, next_sub_season = next_route
+                if (
+                    not batches
+                    or not isinstance(batches[-1], RouteBatch)
+                    or batches[-1].clip_group != next_group
+                    or batches[-1].sub_season != next_sub_season
+                ):
+                    batches.append(
+                        RouteBatch(
+                            clip_group=next_group,
+                            sub_season=next_sub_season,
+                            messages=[message],
+                        )
+                    )
+                else:
+                    batches[-1].messages.append(message)
             current_route = next_route
 
     return batches, None
@@ -82,6 +108,17 @@ def plan_route_batches(
 
 def parse_route_text(text: str) -> tuple[ClipGroup, SubSeason] | None:
     return parse_group_selector_text(text, allow_sub_season_suffix=True)
+
+
+def parse_inbox_route_text(text: str) -> Universe | None:
+    """Parse an exact inbox route selector without affecting chronological routes."""
+    match text.strip().lower():
+        case 'iw':
+            return Universe.WEST
+        case 'ie':
+            return Universe.EAST
+        case _:
+            return None
 
 
 def parse_group_selector_text(
@@ -142,3 +179,19 @@ def _parse_and_validate_route(
     if parsed_group.season not in store_allowed_seasons(year=parsed_group.year, today=today):
         return None
     return parsed_route
+
+
+def _parse_and_validate_route_target(
+    text: str,
+    *,
+    today: date,
+    allowed_years: set[int],
+) -> RouteTarget | None:
+    inbox_universe = parse_inbox_route_text(text)
+    if inbox_universe is not None:
+        return inbox_universe
+    return _parse_and_validate_route(
+        text,
+        today=today,
+        allowed_years=allowed_years,
+    )

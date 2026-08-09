@@ -12,6 +12,7 @@ from aiogram.utils.formatting import Text
 from timeline_hub.handlers.clips.common import (
     ALL_SCOPES_CALLBACK_VALUE,
     FLOW_GET,
+    FLOW_INBOX,
     FLOW_PULL,
     RETRIEVE_STATE_BY_STEP,
     MenuAction,
@@ -24,7 +25,11 @@ from timeline_hub.handlers.clips.common import (
     parse_year,
     set_flow_context,
 )
-from timeline_hub.handlers.clips.delivery import audio_normalization_from_settings, send_fetched_clip_batches
+from timeline_hub.handlers.clips.delivery import (
+    audio_normalization_from_settings,
+    send_fetched_clip_batches,
+    send_fetched_inbox_clip_batches,
+)
 from timeline_hub.handlers.clips.flow import (
     FlowMenuDefinition,
     available_group_seasons,
@@ -49,8 +54,8 @@ from timeline_hub.handlers.menu import (
     create_padding_line,
     handle_stale_selection,
     selected_text,
+    selection_keyboard,
     selection_text,
-    stacked_keyboard,
 )
 from timeline_hub.handlers.retrieve_common import StepOutcome
 from timeline_hub.services.clip_store import (
@@ -73,6 +78,7 @@ type BackStep = Callable[[], Awaitable[StepOutcome]]
 class RetrieveEntryAction(StrEnum):
     GET = auto()
     PULL = auto()
+    INBOX = auto()
     CANCEL = auto()
 
 
@@ -108,6 +114,13 @@ _GET_FLOW = FlowMenuDefinition(
 _PULL_FLOW = FlowMenuDefinition(
     mode=FLOW_PULL,
     flow_label='Pull',
+    state_by_step=RETRIEVE_STATE_BY_STEP,
+    pack_callback=_pack_retrieve_menu_callback,
+)
+
+_INBOX_FLOW = FlowMenuDefinition(
+    mode=FLOW_INBOX,
+    flow_label='Inbox',
     state_by_step=RETRIEVE_STATE_BY_STEP,
     pack_callback=_pack_retrieve_menu_callback,
 )
@@ -155,6 +168,20 @@ async def on_retrieve_entry(
     flow = _flow_for_entry_action(callback_data.action)
     if flow is None:
         await state.clear()
+        return
+
+    if flow is _INBOX_FLOW:
+        available_universes = []
+        for universe in Universe:
+            if await services.clip_store.list_inbox_clips(universe):
+                available_universes.append(universe)
+        await state.update_data(available_inbox_universes=available_universes)
+        await _show_inbox_universe_menu(
+            message=message,
+            state=state,
+            settings=settings,
+            flow=flow,
+        )
         return
 
     groups = await services.clip_store.list_groups()
@@ -235,6 +262,13 @@ async def _on_retrieve_back(
     flow: FlowMenuDefinition,
 ) -> None:
     data = await state.get_data()
+    if flow is _INBOX_FLOW:
+        if step is MenuStep.UNIVERSE:
+            await _show_retrieve_entry_menu(message=message, state=state, settings=settings)
+        else:
+            await handle_stale_selection(message=message, state=state)
+        return
+
     groups = data.get('groups')
     if not isinstance(groups, list):
         await handle_stale_selection(message=message, state=state)
@@ -427,6 +461,31 @@ async def _on_retrieve_select(
     flow: FlowMenuDefinition,
 ) -> None:
     data = await state.get_data()
+    if flow is _INBOX_FLOW:
+        available_universes = data.get('available_inbox_universes')
+        universe = parse_universe(callback_data.value)
+        if (
+            callback_data.step is not MenuStep.UNIVERSE
+            or not isinstance(available_universes, list)
+            or universe is None
+            or universe not in available_universes
+        ):
+            await handle_stale_selection(message=message, state=state)
+            return
+
+        await message.edit_text(
+            **selection_text(selected=flow_selection_labels(flow, universe=universe)),
+            reply_markup=None,
+        )
+        await send_fetched_inbox_clip_batches(
+            bot=bot,
+            chat_id=message.chat.id,
+            universe=universe,
+            clip_batches=services.clip_store.fetch_inbox(universe),
+        )
+        await state.clear()
+        return
+
     groups = data.get('groups')
     if not isinstance(groups, list):
         await handle_stale_selection(message=message, state=state)
@@ -751,6 +810,36 @@ async def _show_retrieve_universe_menu(
     return StepOutcome.SHOWN
 
 
+async def _show_inbox_universe_menu(
+    *,
+    message: Message,
+    state: FSMContext,
+    settings: Settings,
+    flow: FlowMenuDefinition = _INBOX_FLOW,
+) -> None:
+    data = await state.get_data()
+    available_universes = data.get('available_inbox_universes')
+    if not isinstance(available_universes, list):
+        await handle_stale_selection(message=message, state=state)
+        return
+
+    await show_fixed_option_menu(
+        flow=flow,
+        message=message,
+        state=state,
+        message_width=settings.message_width,
+        step=MenuStep.UNIVERSE,
+        prompt='Select universe:',
+        option_universe=tuple(Universe),
+        available_options=available_universes,
+        option_value=lambda universe: universe.value,
+        option_text=lambda universe: universe.value.title(),
+    )
+    # `show_fixed_option_menu()` resets the shared flow context. Preserve the
+    # manifest-derived availability needed to validate the eventual choice.
+    await state.update_data(available_inbox_universes=available_universes)
+
+
 async def _show_retrieve_sub_season_menu(
     *,
     message: Message,
@@ -954,7 +1043,7 @@ async def _retrieve_sub_groups(
 
 
 def _retrieve_entry_reply_markup():
-    return stacked_keyboard(
+    return selection_keyboard(
         buttons=[
             InlineKeyboardButton(
                 text='Get',
@@ -965,10 +1054,14 @@ def _retrieve_entry_reply_markup():
                 callback_data=RetrieveEntryCallbackData(action=RetrieveEntryAction.PULL).pack(),
             ),
             InlineKeyboardButton(
-                text='Cancel',
-                callback_data=RetrieveEntryCallbackData(action=RetrieveEntryAction.CANCEL).pack(),
+                text='Inbox',
+                callback_data=RetrieveEntryCallbackData(action=RetrieveEntryAction.INBOX).pack(),
             ),
-        ]
+        ],
+        back_button=InlineKeyboardButton(
+            text='Cancel',
+            callback_data=RetrieveEntryCallbackData(action=RetrieveEntryAction.CANCEL).pack(),
+        ),
     )
 
 
@@ -990,6 +1083,8 @@ def _flow_for_entry_action(action: RetrieveEntryAction) -> FlowMenuDefinition | 
             return _GET_FLOW
         case RetrieveEntryAction.PULL:
             return _PULL_FLOW
+        case RetrieveEntryAction.INBOX:
+            return _INBOX_FLOW
         case RetrieveEntryAction.CANCEL:
             return None
 
@@ -999,6 +1094,8 @@ def _flow_for_mode(mode: object) -> FlowMenuDefinition | None:
         return _GET_FLOW
     if mode == _PULL_FLOW.mode:
         return _PULL_FLOW
+    if mode == _INBOX_FLOW.mode:
+        return _INBOX_FLOW
     return None
 
 

@@ -13,6 +13,7 @@ from timeline_hub.services.clip_store import Scope, Season, StoreResult, SubSeas
 from timeline_hub.types import Extension
 
 FLOW_GET = 'get'
+FLOW_INBOX = 'inbox'
 FLOW_PULL = 'pull'
 FLOW_RECONCILE = 'reconcile'
 FLOW_STORE = 'store'

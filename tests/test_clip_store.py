@@ -2,6 +2,7 @@ import asyncio
 import json
 import re
 import uuid
+from dataclasses import FrozenInstanceError
 
 import pytest
 from async_s3 import S3Client, S3ObjectNotFoundError
@@ -21,6 +22,7 @@ from timeline_hub.services.clip_store import (
     ClipTransferSyncError,
     DuplicateClipIdsError,
     FetchedClip,
+    InboxTransferResult,
     InvalidClipIdentityError,
     Manifest,
     ManifestCorruptedError,
@@ -151,6 +153,14 @@ def test_clip_identity_string_round_trips() -> None:
     identity = ClipStore.clip_identity_to_string(group, _UUID_1)
 
     assert ClipStore.string_to_clip_identity(identity) == (group, _UUID_1)
+
+
+@pytest.mark.parametrize('universe', [Universe.WEST, Universe.EAST])
+def test_inbox_clip_identity_string_round_trips(universe: Universe) -> None:
+    identity = ClipStore.inbox_clip_identity_to_string(universe, _UUID_1)
+
+    assert identity == f'inbox-{universe.value}--{_UUID_1}'
+    assert ClipStore.string_to_inbox_clip_identity(identity) == (universe, _UUID_1)
 
 
 @pytest.mark.parametrize(
@@ -286,6 +296,18 @@ def _normalized_clip_key(*, year: int, season: Season, universe: Universe, clip_
     return S3Client.join(_CLIP_NAMESPACE, f'{universe}-{year}-{season}', clip_id + '-normalized' + Extension.MP4.suffix)
 
 
+def _inbox_prefix(*, universe: Universe) -> str:
+    return S3Client.join(_CLIP_NAMESPACE, 'inbox', universe.value)
+
+
+def _inbox_manifest_key(*, universe: Universe) -> str:
+    return S3Client.join(_inbox_prefix(universe=universe), 'manifest.json')
+
+
+def _inbox_clip_key(*, universe: Universe, clip_id: str) -> str:
+    return S3Client.join(_inbox_prefix(universe=universe), clip_id + Extension.MP4.suffix)
+
+
 def _patch_hashes(monkeypatch: pytest.MonkeyPatch, hashes: dict[bytes, str]) -> None:
     async def _fake_hash(video_bytes: bytes) -> str:
         return hashes[video_bytes]
@@ -337,12 +359,18 @@ def _mp4_file(data: bytes) -> FileBytes:
     return FileBytes(data=data, extension=Extension.MP4)
 
 
-def _store(s3_client: _FakeS3Client, *, max_s3_concurrency: int = 8) -> ClipStore:
+def _store(
+    s3_client: _FakeS3Client,
+    *,
+    max_s3_concurrency: int = 8,
+    inbox_batch_size: int = 10,
+) -> ClipStore:
     return ClipStore(
         s3_client,
         namespace=_CLIP_NAMESPACE,
         max_s3_concurrency=max_s3_concurrency,
         sampled_phash_mean_threshold=1.5,
+        inbox_batch_size=inbox_batch_size,
     )
 
 
@@ -6517,3 +6545,1177 @@ async def test_compact_with_batch_size_ten_creates_dense_batches_with_final_part
         (2, 1),
         (2, 2),
     ]
+
+
+@pytest.mark.parametrize('inbox_batch_size', [0, -1, True, 1.5])
+def test_clip_store_rejects_invalid_inbox_batch_size(inbox_batch_size: object) -> None:
+    with pytest.raises(ValueError, match='inbox_batch_size'):
+        ClipStore(
+            _FakeS3Client(),
+            namespace=_CLIP_NAMESPACE,
+            max_s3_concurrency=8,
+            sampled_phash_mean_threshold=1.5,
+            inbox_batch_size=inbox_batch_size,  # type: ignore[arg-type]
+        )
+
+
+@pytest.mark.asyncio
+async def test_list_groups_skips_only_reserved_inbox_prefix() -> None:
+    store = _store(_FakeS3Client(prefixes=[S3Client.join(_CLIP_NAMESPACE, 'inbox')]))
+
+    assert await store.list_groups() == []
+
+    malformed_store = _store(
+        _FakeS3Client(prefixes=[S3Client.join(_CLIP_NAMESPACE, 'inbox'), S3Client.join(_CLIP_NAMESPACE, 'bad')])
+    )
+    with pytest.raises(ValueError, match='malformed clip group segment'):
+        await malformed_store.list_groups()
+
+
+@pytest.mark.asyncio
+async def test_store_inbox_compacts_accepted_clips_with_configured_batch_size(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_hashes(monkeypatch, {b'one': _HASH_A, b'two': _HASH_B, b'three': _HASH_C})
+    _patch_uuid7(monkeypatch, _UUID_1, _UUID_2, _UUID_3)
+    s3_client = _FakeS3Client()
+    store = _store(s3_client, inbox_batch_size=2)
+
+    result = await store.store_inbox(
+        Universe.WEST,
+        clips=[_mp4_file(b'one'), _mp4_file(b'two'), _mp4_file(b'three')],
+    )
+
+    assert result == StoreResult(
+        stored_count=3,
+        duplicate_count=0,
+        clip_ids=(_UUID_1, _UUID_2, _UUID_3),
+    )
+    manifest_key = _inbox_manifest_key(universe=Universe.WEST)
+    manifest = Manifest.from_dict(json.loads(s3_client.objects[manifest_key].decode('utf-8')))
+    assert [(entry.id, entry.batch, entry.order) for entry in manifest] == [
+        (_UUID_1, 1, 1),
+        (_UUID_2, 1, 2),
+        (_UUID_3, 2, 1),
+    ]
+    assert [key for key, _data, _content_type in s3_client.put_calls].count(manifest_key) == 1
+
+
+@pytest.mark.asyncio
+async def test_store_inbox_deduplicates_all_same_universe_groups_but_not_other_universe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_hashes(monkeypatch, {b'west-duplicate': _HASH_A, b'east-eligible': _HASH_B})
+    _patch_uuid7(monkeypatch, _UUID_1)
+    west_group = ClipGroup(universe=Universe.WEST, year=2020, season=Season.S1)
+    east_group = ClipGroup(universe=Universe.EAST, year=2020, season=Season.S1)
+    west_manifest_key = _manifest_key(year=2020, season=Season.S1, universe=Universe.WEST)
+    east_manifest_key = _manifest_key(year=2020, season=Season.S1, universe=Universe.EAST)
+    s3_client = _FakeS3Client(
+        {
+            west_manifest_key: _manifest_bytes(
+                [_entry(id=_UUID_2, video_hash=_HASH_A, sub_season=SubSeason.A, scope=Scope.SOURCE, batch=1, order=1)]
+            ),
+            east_manifest_key: _manifest_bytes(
+                [_entry(id=_UUID_3, video_hash=_HASH_B, sub_season=SubSeason.A, scope=Scope.SOURCE, batch=1, order=1)]
+            ),
+        },
+        prefixes=[
+            store_prefix
+            for store_prefix in (
+                S3Client.join(_CLIP_NAMESPACE, 'west-2020-1'),
+                S3Client.join(_CLIP_NAMESPACE, 'east-2020-1'),
+            )
+        ],
+    )
+    store = _store(s3_client)
+
+    result = await store.store_inbox(
+        Universe.WEST,
+        clips=[_mp4_file(b'west-duplicate'), _mp4_file(b'east-eligible')],
+    )
+
+    assert result == StoreResult(stored_count=1, duplicate_count=1, clip_ids=(_UUID_1,))
+    assert east_manifest_key not in s3_client.get_calls
+    assert west_manifest_key in s3_client.get_calls
+    assert west_group.universe is Universe.WEST
+    assert east_group.universe is Universe.EAST
+
+
+@pytest.mark.asyncio
+async def test_fetch_inbox_yields_configured_persisted_batches_without_prefetch() -> None:
+    manifest_key = _inbox_manifest_key(universe=Universe.WEST)
+    entries = [
+        _entry(
+            id=clip_id,
+            video_hash=video_hash,
+            sub_season=SubSeason.NONE,
+            scope=Scope.SOURCE,
+            batch=batch,
+            order=order,
+        )
+        for clip_id, video_hash, batch, order in (
+            (_UUID_1, _HASH_A, 1, 1),
+            (_UUID_2, _HASH_B, 1, 2),
+            (_UUID_3, _HASH_C, 2, 1),
+        )
+    ]
+    s3_client = _FakeS3Client(
+        {
+            manifest_key: _manifest_bytes(entries),
+            _inbox_clip_key(universe=Universe.WEST, clip_id=_UUID_1): b'one',
+            _inbox_clip_key(universe=Universe.WEST, clip_id=_UUID_2): b'two',
+            _inbox_clip_key(universe=Universe.WEST, clip_id=_UUID_3): b'three',
+        }
+    )
+    iterator = store_iterator = _store(s3_client, inbox_batch_size=2).fetch_inbox(Universe.WEST).__aiter__()
+
+    first_batch = await anext(iterator)
+    assert [clip.id for clip in first_batch] == [_UUID_1, _UUID_2]
+    assert _inbox_clip_key(universe=Universe.WEST, clip_id=_UUID_3) not in s3_client.get_calls
+
+    second_batch = await anext(store_iterator)
+    assert [clip.id for clip in second_batch] == [_UUID_3]
+    with pytest.raises(StopAsyncIteration):
+        await anext(iterator)
+
+
+@pytest.mark.asyncio
+async def test_list_inbox_clips_returns_cached_manifest_batches_without_fetching_media() -> None:
+    manifest_key = _inbox_manifest_key(universe=Universe.WEST)
+    entries = [
+        _entry(
+            id=clip_id,
+            video_hash=video_hash,
+            sub_season=SubSeason.NONE,
+            scope=Scope.SOURCE,
+            batch=batch,
+            order=order,
+        )
+        for clip_id, video_hash, batch, order in (
+            (_UUID_1, _HASH_A, 1, 1),
+            (_UUID_2, _HASH_B, 1, 2),
+            (_UUID_3, _HASH_C, 2, 1),
+        )
+    ]
+    raw_clip_keys = {_inbox_clip_key(universe=Universe.WEST, clip_id=entry.id): entry.id.encode() for entry in entries}
+    s3_client = _FakeS3Client({manifest_key: _manifest_bytes(entries), **raw_clip_keys})
+    store = _store(s3_client, inbox_batch_size=2)
+
+    expected = [
+        (ClipInfo(id=_UUID_1), ClipInfo(id=_UUID_2)),
+        (ClipInfo(id=_UUID_3),),
+    ]
+    assert await store.list_inbox_clips(Universe.WEST) == expected
+    assert await store.list_inbox_clips(Universe.WEST) == expected
+    assert s3_client.get_calls == [manifest_key]
+
+
+@pytest.mark.asyncio
+async def test_list_inbox_clips_returns_empty_for_missing_inbox() -> None:
+    assert await _store(_FakeS3Client()).list_inbox_clips(Universe.EAST) == []
+
+
+@pytest.mark.asyncio
+async def test_store_inbox_refreshes_inbox_listing_after_missing_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_hashes(monkeypatch, {b'one': _HASH_A})
+    _patch_uuid7(monkeypatch, _UUID_1)
+    store = _store(_FakeS3Client())
+
+    assert await store.list_inbox_clips(Universe.WEST) == []
+    await store.store_inbox(Universe.WEST, clips=[_mp4_file(b'one')])
+
+    assert await store.list_inbox_clips(Universe.WEST) == [(ClipInfo(id=_UUID_1),)]
+
+
+@pytest.mark.asyncio
+async def test_inbox_layout_incompatible_with_configured_batch_size_fails_before_media_fetch() -> None:
+    manifest_key = _inbox_manifest_key(universe=Universe.WEST)
+    entries = [
+        _entry(
+            id=clip_id,
+            video_hash=video_hash,
+            sub_season=SubSeason.NONE,
+            scope=Scope.SOURCE,
+            batch=1,
+            order=index,
+        )
+        for index, (clip_id, video_hash) in enumerate(
+            ((_UUID_1, _HASH_A), (_UUID_2, _HASH_B), (_UUID_3, _HASH_C)), start=1
+        )
+    ]
+    s3_client = _FakeS3Client({manifest_key: _manifest_bytes(entries)})
+    iterator = _store(s3_client, inbox_batch_size=2).fetch_inbox(Universe.WEST).__aiter__()
+
+    with pytest.raises(ManifestCorruptedError, match='inbox_batch_size=2'):
+        await anext(iterator)
+    assert s3_client.get_calls == [manifest_key]
+
+
+@pytest.mark.asyncio
+async def test_remove_from_inbox_recompacts_survivors_and_deletes_last_manifest() -> None:
+    manifest_key = _inbox_manifest_key(universe=Universe.WEST)
+    entries = [
+        _entry(
+            id=clip_id,
+            video_hash=video_hash,
+            sub_season=SubSeason.NONE,
+            scope=Scope.SOURCE,
+            batch=batch,
+            order=order,
+        )
+        for clip_id, video_hash, batch, order in (
+            (_UUID_1, _HASH_A, 1, 1),
+            (_UUID_2, _HASH_B, 1, 2),
+            (_UUID_3, _HASH_C, 2, 1),
+        )
+    ]
+    s3_client = _FakeS3Client(
+        {
+            manifest_key: _manifest_bytes(entries),
+            **{_inbox_clip_key(universe=Universe.WEST, clip_id=entry.id): entry.id.encode() for entry in entries},
+        }
+    )
+    store = _store(s3_client, inbox_batch_size=2)
+
+    assert await store.list_inbox_clips(Universe.WEST) == [
+        (ClipInfo(id=_UUID_1), ClipInfo(id=_UUID_2)),
+        (ClipInfo(id=_UUID_3),),
+    ]
+    await store.remove_from_inbox(Universe.WEST, clip_ids=[_UUID_1])
+
+    surviving = Manifest.from_dict(json.loads(s3_client.objects[manifest_key].decode('utf-8')))
+    assert [(entry.id, entry.batch, entry.order) for entry in surviving] == [
+        (_UUID_2, 1, 1),
+        (_UUID_3, 1, 2),
+    ]
+    await store.remove_from_inbox(Universe.WEST, clip_ids=[_UUID_2, _UUID_3])
+    assert manifest_key not in s3_client.objects
+    assert await store.list_inbox_clips(Universe.WEST) == []
+
+
+@pytest.mark.asyncio
+async def test_remove_from_inbox_replaces_cached_nonempty_manifest() -> None:
+    manifest_key = _inbox_manifest_key(universe=Universe.WEST)
+    entries = [
+        _entry(
+            id=clip_id,
+            video_hash=video_hash,
+            sub_season=SubSeason.NONE,
+            scope=Scope.SOURCE,
+            batch=1,
+            order=order,
+        )
+        for clip_id, video_hash, order in ((_UUID_1, _HASH_A, 1), (_UUID_2, _HASH_B, 2))
+    ]
+    s3_client = _FakeS3Client(
+        {
+            manifest_key: _manifest_bytes(entries),
+            **{_inbox_clip_key(universe=Universe.WEST, clip_id=entry.id): entry.id.encode() for entry in entries},
+        }
+    )
+    store = _store(s3_client)
+
+    assert await store.list_inbox_clips(Universe.WEST) == [(ClipInfo(id=_UUID_1), ClipInfo(id=_UUID_2))]
+    await store.remove_from_inbox(Universe.WEST, clip_ids=[_UUID_1])
+
+    assert await store.list_inbox_clips(Universe.WEST) == [(ClipInfo(id=_UUID_2),)]
+
+
+@pytest.mark.asyncio
+async def test_transfer_from_inbox_refreshes_listing_after_last_clip_is_transferred() -> None:
+    inbox_manifest_key = _inbox_manifest_key(universe=Universe.WEST)
+    destination_group = ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1)
+    inbox_entry = _entry(
+        id=_UUID_1,
+        video_hash=_HASH_A,
+        sub_season=SubSeason.NONE,
+        scope=Scope.SOURCE,
+        batch=1,
+        order=1,
+    )
+    s3_client = _FakeS3Client(
+        {
+            inbox_manifest_key: _manifest_bytes([inbox_entry]),
+            _inbox_clip_key(universe=Universe.WEST, clip_id=_UUID_1): b'one',
+        }
+    )
+    store = _store(s3_client)
+
+    assert await store.list_inbox_clips(Universe.WEST) == [(ClipInfo(id=_UUID_1),)]
+    result = await store.transfer_from_inbox(
+        universe=Universe.WEST,
+        clip_ids=[_UUID_1],
+        destination_group=destination_group,
+        destination_sub_group=ClipSubGroup(sub_season=SubSeason.A, scope=Scope.COLLECTION),
+    )
+
+    assert result == InboxTransferResult(transferred_count=1, duplicate_blocked_count=0)
+    assert await store.list_inbox_clips(Universe.WEST) == []
+
+
+@pytest.mark.asyncio
+async def test_transfer_from_inbox_replaces_cached_nonempty_manifest() -> None:
+    inbox_manifest_key = _inbox_manifest_key(universe=Universe.WEST)
+    destination_group = ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1)
+    entries = [
+        _entry(
+            id=clip_id,
+            video_hash=video_hash,
+            sub_season=SubSeason.NONE,
+            scope=Scope.SOURCE,
+            batch=1,
+            order=order,
+        )
+        for clip_id, video_hash, order in ((_UUID_1, _HASH_A, 1), (_UUID_2, _HASH_B, 2))
+    ]
+    s3_client = _FakeS3Client(
+        {
+            inbox_manifest_key: _manifest_bytes(entries),
+            **{_inbox_clip_key(universe=Universe.WEST, clip_id=entry.id): entry.id.encode() for entry in entries},
+        }
+    )
+    store = _store(s3_client)
+
+    assert await store.list_inbox_clips(Universe.WEST) == [(ClipInfo(id=_UUID_1), ClipInfo(id=_UUID_2))]
+    result = await store.transfer_from_inbox(
+        universe=Universe.WEST,
+        clip_ids=[_UUID_1],
+        destination_group=destination_group,
+        destination_sub_group=ClipSubGroup(sub_season=SubSeason.A, scope=Scope.COLLECTION),
+    )
+
+    assert result == InboxTransferResult(transferred_count=1, duplicate_blocked_count=0)
+    assert await store.list_inbox_clips(Universe.WEST) == [(ClipInfo(id=_UUID_2),)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ('source_universe', 'destination_universe'),
+    [(Universe.EAST, Universe.WEST), (Universe.WEST, Universe.EAST)],
+)
+async def test_transfer_from_inbox_moves_clip_across_universes_and_updates_source_cache(
+    source_universe: Universe,
+    destination_universe: Universe,
+) -> None:
+    inbox_manifest_key = _inbox_manifest_key(universe=source_universe)
+    destination_group = ClipGroup(universe=destination_universe, year=2024, season=Season.S1)
+    destination_manifest_key = _manifest_key(year=2024, season=Season.S1, universe=destination_universe)
+    inbox_entry = _entry(
+        id=_UUID_1,
+        video_hash=_HASH_A,
+        sub_season=SubSeason.NONE,
+        scope=Scope.SOURCE,
+        batch=1,
+        order=1,
+    )
+    s3_client = _FakeS3Client(
+        {
+            inbox_manifest_key: _manifest_bytes([inbox_entry]),
+            _inbox_clip_key(universe=source_universe, clip_id=_UUID_1): b'one',
+        }
+    )
+    store = _store(s3_client)
+
+    assert await store.list_inbox_clips(source_universe) == [(ClipInfo(id=_UUID_1),)]
+    result = await store.transfer_from_inbox(
+        universe=source_universe,
+        clip_ids=[_UUID_1],
+        destination_group=destination_group,
+        destination_sub_group=ClipSubGroup(sub_season=SubSeason.A, scope=Scope.COLLECTION),
+    )
+
+    assert result == InboxTransferResult(transferred_count=1, duplicate_blocked_count=0)
+    assert await store.list_inbox_clips(source_universe) == []
+    destination_manifest = Manifest.from_dict(json.loads(s3_client.objects[destination_manifest_key].decode('utf-8')))
+    assert [entry.id for entry in destination_manifest] == [_UUID_1]
+    assert _inbox_clip_key(universe=source_universe, clip_id=_UUID_1) not in s3_client.objects
+    assert (
+        _clip_key(
+            universe=destination_universe,
+            year=destination_group.year,
+            season=destination_group.season,
+            clip_id=_UUID_1,
+        )
+        in s3_client.objects
+    )
+
+
+@pytest.mark.asyncio
+async def test_transfer_from_inbox_cross_universe_ignores_source_universe_history_for_dedup() -> None:
+    source_universe = Universe.EAST
+    destination_universe = Universe.WEST
+    inbox_manifest_key = _inbox_manifest_key(universe=source_universe)
+    source_history_key = _manifest_key(year=2020, season=Season.S1, universe=source_universe)
+    destination_group = ClipGroup(universe=destination_universe, year=2024, season=Season.S1)
+    destination_manifest_key = _manifest_key(year=2024, season=Season.S1, universe=destination_universe)
+    inbox_entry = _entry(
+        id=_UUID_1,
+        video_hash=_HASH_A,
+        sub_season=SubSeason.NONE,
+        scope=Scope.SOURCE,
+        batch=1,
+        order=1,
+    )
+    s3_client = _FakeS3Client(
+        {
+            inbox_manifest_key: _manifest_bytes([inbox_entry]),
+            _inbox_clip_key(universe=source_universe, clip_id=_UUID_1): b'one',
+            source_history_key: _manifest_bytes(
+                [_entry(id=_UUID_2, video_hash=_HASH_A, sub_season=SubSeason.A, scope=Scope.SOURCE, batch=1, order=1)]
+            ),
+        },
+        prefixes=[S3Client.join(_CLIP_NAMESPACE, 'east-2020-1')],
+    )
+    store = _store(s3_client)
+
+    result = await store.transfer_from_inbox(
+        universe=source_universe,
+        clip_ids=[_UUID_1],
+        destination_group=destination_group,
+        destination_sub_group=ClipSubGroup(sub_season=SubSeason.A, scope=Scope.COLLECTION),
+    )
+
+    assert result == InboxTransferResult(transferred_count=1, duplicate_blocked_count=0)
+    assert source_history_key not in s3_client.get_calls
+    destination_manifest = Manifest.from_dict(json.loads(s3_client.objects[destination_manifest_key].decode('utf-8')))
+    assert [entry.id for entry in destination_manifest] == [_UUID_1]
+
+
+@pytest.mark.asyncio
+async def test_transfer_from_inbox_cross_universe_blocks_destination_universe_history_duplicate() -> None:
+    source_universe = Universe.EAST
+    destination_universe = Universe.WEST
+    inbox_manifest_key = _inbox_manifest_key(universe=source_universe)
+    destination_history_key = _manifest_key(year=2020, season=Season.S1, universe=destination_universe)
+    destination_group = ClipGroup(universe=destination_universe, year=2024, season=Season.S1)
+    inbox_entry = _entry(
+        id=_UUID_1,
+        video_hash=_HASH_A,
+        sub_season=SubSeason.NONE,
+        scope=Scope.SOURCE,
+        batch=1,
+        order=1,
+    )
+    s3_client = _FakeS3Client(
+        {
+            inbox_manifest_key: _manifest_bytes([inbox_entry]),
+            _inbox_clip_key(universe=source_universe, clip_id=_UUID_1): b'one',
+            destination_history_key: _manifest_bytes(
+                [_entry(id=_UUID_2, video_hash=_HASH_A, sub_season=SubSeason.A, scope=Scope.SOURCE, batch=1, order=1)]
+            ),
+        },
+        prefixes=[S3Client.join(_CLIP_NAMESPACE, 'west-2020-1')],
+    )
+    store = _store(s3_client)
+
+    result = await store.transfer_from_inbox(
+        universe=source_universe,
+        clip_ids=[_UUID_1],
+        destination_group=destination_group,
+        destination_sub_group=ClipSubGroup(sub_season=SubSeason.A, scope=Scope.COLLECTION),
+    )
+
+    assert result == InboxTransferResult(transferred_count=0, duplicate_blocked_count=1)
+    assert s3_client.moved_keys == []
+    assert await store.list_inbox_clips(source_universe) == [(ClipInfo(id=_UUID_1),)]
+
+
+@pytest.mark.asyncio
+async def test_transfer_from_inbox_blocks_destination_duplicates_without_mutation() -> None:
+    inbox_manifest_key = _inbox_manifest_key(universe=Universe.WEST)
+    destination_group = ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1)
+    destination_manifest_key = _manifest_key(year=2024, season=Season.S1, universe=Universe.WEST)
+    inbox_entry = _entry(
+        id=_UUID_1,
+        video_hash=_HASH_A,
+        sub_season=SubSeason.NONE,
+        scope=Scope.SOURCE,
+        batch=1,
+        order=1,
+    )
+    destination_entry = _entry(
+        id=_UUID_2,
+        video_hash=_HASH_A,
+        sub_season=SubSeason.A,
+        scope=Scope.SOURCE,
+        batch=1,
+        order=1,
+    )
+    s3_client = _FakeS3Client(
+        {
+            inbox_manifest_key: _manifest_bytes([inbox_entry]),
+            _inbox_clip_key(universe=Universe.WEST, clip_id=_UUID_1): b'one',
+            destination_manifest_key: _manifest_bytes([destination_entry]),
+        }
+    )
+    store = _store(s3_client)
+
+    result = await store.transfer_from_inbox(
+        universe=Universe.WEST,
+        clip_ids=[_UUID_1],
+        destination_group=destination_group,
+        destination_sub_group=ClipSubGroup(sub_season=SubSeason.B, scope=Scope.COLLECTION),
+    )
+
+    assert result == InboxTransferResult(transferred_count=0, duplicate_blocked_count=1)
+    assert s3_client.moved_keys == []
+    assert s3_client.put_calls == []
+
+
+@pytest.mark.asyncio
+async def test_transfer_from_inbox_preserves_metadata_and_compacts_survivors() -> None:
+    inbox_manifest_key = _inbox_manifest_key(universe=Universe.WEST)
+    destination_group = ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1)
+    destination_manifest_key = _manifest_key(year=2024, season=Season.S1, universe=Universe.WEST)
+    entries = [
+        _entry(
+            id=clip_id,
+            video_hash=video_hash,
+            sub_season=SubSeason.NONE,
+            scope=Scope.SOURCE,
+            batch=batch,
+            order=order,
+        )
+        for clip_id, video_hash, batch, order in (
+            (_UUID_1, _HASH_A, 1, 1),
+            (_UUID_2, _HASH_B, 1, 2),
+            (_UUID_3, _HASH_C, 2, 1),
+        )
+    ]
+    s3_client = _FakeS3Client(
+        {
+            inbox_manifest_key: _manifest_bytes(entries),
+            **{_inbox_clip_key(universe=Universe.WEST, clip_id=entry.id): entry.id.encode() for entry in entries},
+        }
+    )
+    store = _store(s3_client, inbox_batch_size=2)
+
+    result = await store.transfer_from_inbox(
+        universe=Universe.WEST,
+        clip_ids=[_UUID_3, _UUID_1],
+        destination_group=destination_group,
+        destination_sub_group=ClipSubGroup(sub_season=SubSeason.A, scope=Scope.COLLECTION),
+    )
+
+    assert result == InboxTransferResult(transferred_count=2, duplicate_blocked_count=0)
+    destination_manifest = Manifest.from_dict(json.loads(s3_client.objects[destination_manifest_key].decode('utf-8')))
+    assert [(entry.id, entry.batch, entry.order) for entry in destination_manifest] == [
+        (_UUID_3, 1, 1),
+        (_UUID_1, 1, 2),
+    ]
+    assert all(entry.sub_season is SubSeason.A and entry.scope is Scope.COLLECTION for entry in destination_manifest)
+    inbox_manifest = Manifest.from_dict(json.loads(s3_client.objects[inbox_manifest_key].decode('utf-8')))
+    assert [(entry.id, entry.batch, entry.order) for entry in inbox_manifest] == [(_UUID_2, 1, 1)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'entry',
+    [
+        _entry(
+            id=_UUID_1,
+            video_hash=_HASH_A,
+            sub_season=SubSeason.A,
+            scope=Scope.SOURCE,
+            batch=1,
+            order=1,
+        ),
+        _entry(
+            id=_UUID_1,
+            video_hash=_HASH_A,
+            sub_season=SubSeason.NONE,
+            scope=Scope.EXTRA,
+            batch=1,
+            order=1,
+        ),
+        _entry(
+            id=_UUID_1,
+            video_hash=_HASH_A,
+            sub_season=SubSeason.NONE,
+            scope=Scope.SOURCE,
+            batch=1,
+            order=1,
+            audio_normalization=AudioNormalization(loudness=-14, bitrate=128),
+        ),
+    ],
+)
+async def test_inbox_manifest_fixed_field_validation_happens_before_cache(entry: ManifestEntry) -> None:
+    manifest_key = _inbox_manifest_key(universe=Universe.WEST)
+    store = _store(_FakeS3Client({manifest_key: _manifest_bytes([entry])}))
+    inbox_prefix = store._inbox_prefix(Universe.WEST)
+
+    iterator = store.fetch_inbox(Universe.WEST).__aiter__()
+    with pytest.raises(ManifestCorruptedError):
+        await anext(iterator)
+    assert inbox_prefix not in store._manifest_cache
+
+
+@pytest.mark.asyncio
+async def test_store_inbox_same_call_perceptual_duplicates_are_not_persisted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_hashes(monkeypatch, {b'first': _HASH_A, b'second': _HASH_B})
+    _patch_perceptual_metadata(
+        monkeypatch,
+        {
+            b'first': (_FRAME_COUNT, _SAMPLED_PHASHES),
+            b'second': (_FRAME_COUNT, _SAMPLED_PHASHES),
+        },
+    )
+    _patch_uuid7(monkeypatch, _UUID_1)
+    store = _store(_FakeS3Client())
+
+    result = await store.store_inbox(
+        Universe.WEST,
+        clips=[_mp4_file(b'first'), _mp4_file(b'second')],
+    )
+
+    assert result == StoreResult(stored_count=1, duplicate_count=1, clip_ids=(_UUID_1,))
+
+
+@pytest.mark.asyncio
+async def test_store_inbox_aborts_when_same_universe_manifest_is_corrupted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_hashes(monkeypatch, {b'clip': _HASH_A})
+    corrupted_manifest_key = _manifest_key(year=2024, season=Season.S1, universe=Universe.WEST)
+    s3_client = _FakeS3Client(
+        {corrupted_manifest_key: b'{"data":"invalid"}'},
+        prefixes=[S3Client.join(_CLIP_NAMESPACE, 'west-2024-1')],
+    )
+
+    with pytest.raises(ManifestCorruptedError):
+        await _store(s3_client).store_inbox(Universe.WEST, clips=[_mp4_file(b'clip')])
+    assert s3_client.put_calls == []
+
+
+@pytest.mark.asyncio
+async def test_store_inbox_all_duplicates_does_not_rewrite_manifest(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_hashes(monkeypatch, {b'clip': _HASH_A})
+    _patch_uuid7(monkeypatch, _UUID_1)
+    s3_client = _FakeS3Client()
+    store = _store(s3_client)
+    await store.store_inbox(Universe.WEST, clips=[_mp4_file(b'clip')])
+    put_call_count = len(s3_client.put_calls)
+
+    result = await store.store_inbox(Universe.WEST, clips=[_mp4_file(b'clip')])
+
+    assert result == StoreResult(stored_count=0, duplicate_count=1)
+    assert len(s3_client.put_calls) == put_call_count
+
+
+@pytest.mark.asyncio
+async def test_remove_from_inbox_cleanup_failure_keeps_compacted_manifest_authoritative() -> None:
+    manifest_key = _inbox_manifest_key(universe=Universe.WEST)
+    entries = [
+        _entry(
+            id=_UUID_1,
+            video_hash=_HASH_A,
+            sub_season=SubSeason.NONE,
+            scope=Scope.SOURCE,
+            batch=1,
+            order=1,
+        ),
+        _entry(
+            id=_UUID_2,
+            video_hash=_HASH_B,
+            sub_season=SubSeason.NONE,
+            scope=Scope.SOURCE,
+            batch=1,
+            order=2,
+        ),
+    ]
+    removed_key = _inbox_clip_key(universe=Universe.WEST, clip_id=_UUID_1)
+    s3_client = _FakeS3Client(
+        {
+            manifest_key: _manifest_bytes(entries),
+            removed_key: b'one',
+            _inbox_clip_key(universe=Universe.WEST, clip_id=_UUID_2): b'two',
+        },
+        delete_failures={removed_key},
+    )
+
+    with pytest.raises(ClipRemoveManifestSyncError, match='raw_clip_delete') as excinfo:
+        await _store(s3_client).remove_from_inbox(Universe.WEST, clip_ids=[_UUID_1, _UUID_2])
+
+    error = excinfo.value
+    diagnostics = error.inbox_removal_diagnostics
+    assert isinstance(error.__cause__, RuntimeError)
+    assert diagnostics is not None
+    outcomes = {deletion.clip_id: deletion for deletion in diagnostics.deletions}
+    assert outcomes[_UUID_1].key == removed_key
+    assert outcomes[_UUID_1].status == 'failed'
+    assert outcomes[_UUID_1].failure_detail == repr(error.__cause__)
+    assert outcomes[_UUID_2].status == 'completed'
+    assert manifest_key not in s3_client.objects
+
+
+@pytest.mark.asyncio
+async def test_remove_from_inbox_cleanup_cancellation_reports_completed_unknown_and_not_attempted_deletions() -> None:
+    second_delete_started = asyncio.Event()
+    second_delete_gate = asyncio.Event()
+    manifest_key = _inbox_manifest_key(universe=Universe.WEST)
+    second_key = _inbox_clip_key(universe=Universe.WEST, clip_id=_UUID_2)
+    entries = [
+        _inbox_entry(clip_id=_UUID_1, video_hash=_HASH_A),
+        _inbox_entry(clip_id=_UUID_2, video_hash=_HASH_B, order=2),
+        _inbox_entry(clip_id=_UUID_3, video_hash=_HASH_C, order=3),
+    ]
+
+    class _SelectiveDeleteGateS3Client(_FakeS3Client):
+        async def delete_key(self, key: str) -> None:
+            if key == second_key:
+                second_delete_started.set()
+                await second_delete_gate.wait()
+            await super().delete_key(key)
+
+    s3_client = _SelectiveDeleteGateS3Client(
+        {
+            manifest_key: _manifest_bytes(entries),
+            _inbox_clip_key(universe=Universe.WEST, clip_id=_UUID_1): b'one',
+            second_key: b'two',
+            _inbox_clip_key(universe=Universe.WEST, clip_id=_UUID_3): b'three',
+        }
+    )
+    task = asyncio.create_task(
+        _store(s3_client, max_s3_concurrency=1).remove_from_inbox(
+            Universe.WEST,
+            clip_ids=[_UUID_1, _UUID_2, _UUID_3],
+        )
+    )
+    await second_delete_started.wait()
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError) as excinfo:
+        await task
+
+    diagnostics = getattr(excinfo.value, 'inbox_removal_diagnostics', None)
+    assert diagnostics is not None
+    statuses = {deletion.clip_id: deletion.status for deletion in diagnostics.deletions}
+    assert statuses == {_UUID_1: 'completed', _UUID_2: 'unknown', _UUID_3: 'not_attempted'}
+    with pytest.raises(FrozenInstanceError):
+        diagnostics.deletions[0].status = 'failed'
+
+
+@pytest.mark.asyncio
+async def test_remove_from_inbox_cleanup_deletions_respect_configured_concurrency() -> None:
+    two_deletions_started = asyncio.Event()
+    release_deletions = asyncio.Event()
+    manifest_key = _inbox_manifest_key(universe=Universe.WEST)
+    entries = [
+        _inbox_entry(clip_id=_UUID_1, video_hash=_HASH_A),
+        _inbox_entry(clip_id=_UUID_2, video_hash=_HASH_B, order=2),
+        _inbox_entry(clip_id=_UUID_3, video_hash=_HASH_C, order=3),
+    ]
+
+    class _ConcurrentDeleteS3Client(_FakeS3Client):
+        def __init__(self) -> None:
+            super().__init__(
+                {
+                    manifest_key: _manifest_bytes(entries),
+                    _inbox_clip_key(universe=Universe.WEST, clip_id=_UUID_1): b'one',
+                    _inbox_clip_key(universe=Universe.WEST, clip_id=_UUID_2): b'two',
+                    _inbox_clip_key(universe=Universe.WEST, clip_id=_UUID_3): b'three',
+                }
+            )
+            self.active_deletions = 0
+            self.max_active_deletions = 0
+
+        async def delete_key(self, key: str) -> None:
+            if key == manifest_key:
+                await super().delete_key(key)
+                return
+            self.active_deletions += 1
+            self.max_active_deletions = max(self.max_active_deletions, self.active_deletions)
+            if self.active_deletions == 2:
+                two_deletions_started.set()
+            try:
+                await release_deletions.wait()
+                await super().delete_key(key)
+            finally:
+                self.active_deletions -= 1
+
+    s3_client = _ConcurrentDeleteS3Client()
+    task = asyncio.create_task(
+        _store(s3_client, max_s3_concurrency=2).remove_from_inbox(
+            Universe.WEST,
+            clip_ids=[_UUID_1, _UUID_2, _UUID_3],
+        )
+    )
+    await asyncio.wait_for(two_deletions_started.wait(), timeout=1)
+    assert s3_client.max_active_deletions == 2
+    release_deletions.set()
+    await task
+
+    assert s3_client.max_active_deletions == 2
+
+
+def _inbox_entry(*, clip_id: str, video_hash: str, batch: int = 1, order: int = 1) -> ManifestEntry:
+    return _entry(
+        id=clip_id,
+        video_hash=video_hash,
+        sub_season=SubSeason.NONE,
+        scope=Scope.SOURCE,
+        batch=batch,
+        order=order,
+    )
+
+
+@pytest.mark.asyncio
+async def test_transfer_from_inbox_destination_manifest_failure_reports_manual_recovery_progress() -> None:
+    destination_group = ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1)
+    destination_manifest_key = _manifest_key(year=2024, season=Season.S1, universe=Universe.WEST)
+    inbox_manifest_key = _inbox_manifest_key(universe=Universe.WEST)
+    source_key = _inbox_clip_key(universe=Universe.WEST, clip_id=_UUID_1)
+    destination_key = _clip_key(year=2024, season=Season.S1, universe=Universe.WEST, clip_id=_UUID_1)
+    s3_client = _FakeS3Client(
+        {
+            inbox_manifest_key: _manifest_bytes([_inbox_entry(clip_id=_UUID_1, video_hash=_HASH_A)]),
+            source_key: b'one',
+        },
+        put_failures={destination_manifest_key},
+    )
+
+    with pytest.raises(ClipTransferSyncError, match='destination_manifest_write') as excinfo:
+        await _store(s3_client).transfer_from_inbox(
+            universe=Universe.WEST,
+            clip_ids=[_UUID_1],
+            destination_group=destination_group,
+            destination_sub_group=ClipSubGroup(sub_season=SubSeason.A, scope=Scope.SOURCE),
+        )
+
+    error = excinfo.value
+    diagnostics = error.inbox_transfer_diagnostics
+    assert error.manifest_keys == (destination_manifest_key,)
+    assert diagnostics is not None
+    assert diagnostics.destination_manifest.status == 'failed'
+    assert diagnostics.inbox_manifest.status == 'not_attempted'
+    assert diagnostics.moves[0].clip_id == _UUID_1
+    assert diagnostics.moves[0].source_key == source_key
+    assert diagnostics.moves[0].destination_key == destination_key
+    assert diagnostics.moves[0].status == 'completed'
+
+
+@pytest.mark.asyncio
+async def test_transfer_from_inbox_inbox_manifest_failure_reports_completed_destination_commit() -> None:
+    destination_group = ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1)
+    destination_manifest_key = _manifest_key(year=2024, season=Season.S1, universe=Universe.WEST)
+    inbox_manifest_key = _inbox_manifest_key(universe=Universe.WEST)
+    s3_client = _FakeS3Client(
+        {
+            inbox_manifest_key: _manifest_bytes(
+                [
+                    _inbox_entry(clip_id=_UUID_1, video_hash=_HASH_A),
+                    _inbox_entry(clip_id=_UUID_2, video_hash=_HASH_B, order=2),
+                ]
+            ),
+            _inbox_clip_key(universe=Universe.WEST, clip_id=_UUID_1): b'one',
+            _inbox_clip_key(universe=Universe.WEST, clip_id=_UUID_2): b'two',
+        },
+        put_failures={inbox_manifest_key},
+    )
+
+    with pytest.raises(ClipTransferSyncError, match='inbox_manifest_write') as excinfo:
+        await _store(s3_client).transfer_from_inbox(
+            universe=Universe.WEST,
+            clip_ids=[_UUID_1],
+            destination_group=destination_group,
+            destination_sub_group=ClipSubGroup(sub_season=SubSeason.A, scope=Scope.SOURCE),
+        )
+
+    error = excinfo.value
+    diagnostics = error.inbox_transfer_diagnostics
+    assert error.manifest_keys == (destination_manifest_key, inbox_manifest_key)
+    assert diagnostics is not None
+    assert diagnostics.destination_manifest.status == 'completed'
+    assert diagnostics.inbox_manifest.status == 'failed'
+
+
+@pytest.mark.asyncio
+async def test_transfer_from_inbox_move_cancellation_reports_completed_and_unknown_moves() -> None:
+    second_move_started = asyncio.Event()
+    second_move_gate = asyncio.Event()
+
+    class _SelectiveMoveGateS3Client(_FakeS3Client):
+        async def move(self, source_key: str, target_key: str, *, overwrite: bool = False) -> None:
+            if source_key.endswith(_UUID_2 + Extension.MP4.suffix):
+                second_move_started.set()
+                await second_move_gate.wait()
+            await super().move(source_key, target_key, overwrite=overwrite)
+
+    destination_group = ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1)
+    inbox_manifest_key = _inbox_manifest_key(universe=Universe.WEST)
+    s3_client = _SelectiveMoveGateS3Client(
+        {
+            inbox_manifest_key: _manifest_bytes(
+                [
+                    _inbox_entry(clip_id=_UUID_1, video_hash=_HASH_A),
+                    _inbox_entry(clip_id=_UUID_2, video_hash=_HASH_B, order=2),
+                ]
+            ),
+            _inbox_clip_key(universe=Universe.WEST, clip_id=_UUID_1): b'one',
+            _inbox_clip_key(universe=Universe.WEST, clip_id=_UUID_2): b'two',
+        }
+    )
+    task = asyncio.create_task(
+        _store(s3_client, max_s3_concurrency=2).transfer_from_inbox(
+            universe=Universe.WEST,
+            clip_ids=[_UUID_1, _UUID_2],
+            destination_group=destination_group,
+            destination_sub_group=ClipSubGroup(sub_season=SubSeason.A, scope=Scope.SOURCE),
+        )
+    )
+    await second_move_started.wait()
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError) as excinfo:
+        await task
+
+    diagnostics = getattr(excinfo.value, 'inbox_transfer_diagnostics', None)
+    assert diagnostics is not None
+    statuses = {progress.clip_id: progress.status for progress in diagnostics.moves}
+    assert statuses == {_UUID_1: 'completed', _UUID_2: 'unknown'}
+    assert diagnostics.destination_manifest.status == 'not_attempted'
+    assert diagnostics.inbox_manifest.status == 'not_attempted'
+    with pytest.raises(FrozenInstanceError):
+        diagnostics.moves[0].status = 'failed'
+
+
+@pytest.mark.asyncio
+async def test_transfer_from_inbox_destination_manifest_cancellation_reports_only_attempted_destination_write() -> None:
+    destination_put_started = asyncio.Event()
+    destination_put_gate = asyncio.Event()
+    destination_group = ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1)
+    destination_manifest_key = _manifest_key(year=2024, season=Season.S1, universe=Universe.WEST)
+    inbox_manifest_key = _inbox_manifest_key(universe=Universe.WEST)
+
+    class _DestinationManifestGateS3Client(_FakeS3Client):
+        async def put_bytes(self, key: str, data: bytes, *, content_type: str | None = None) -> None:
+            if key == destination_manifest_key:
+                destination_put_started.set()
+                await destination_put_gate.wait()
+            await super().put_bytes(key, data, content_type=content_type)
+
+    s3_client = _DestinationManifestGateS3Client(
+        {
+            inbox_manifest_key: _manifest_bytes([_inbox_entry(clip_id=_UUID_1, video_hash=_HASH_A)]),
+            _inbox_clip_key(universe=Universe.WEST, clip_id=_UUID_1): b'one',
+        }
+    )
+    task = asyncio.create_task(
+        _store(s3_client).transfer_from_inbox(
+            universe=Universe.WEST,
+            clip_ids=[_UUID_1],
+            destination_group=destination_group,
+            destination_sub_group=ClipSubGroup(sub_season=SubSeason.A, scope=Scope.SOURCE),
+        )
+    )
+    await destination_put_started.wait()
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError) as excinfo:
+        await task
+
+    diagnostics = getattr(excinfo.value, 'inbox_transfer_diagnostics', None)
+    assert diagnostics is not None
+    assert diagnostics.moves[0].status == 'completed'
+    assert diagnostics.destination_manifest.operation == 'destination_manifest_write'
+    assert diagnostics.destination_manifest.status == 'unknown'
+    assert diagnostics.inbox_manifest.operation == 'inbox_manifest_delete'
+    assert diagnostics.inbox_manifest.status == 'not_attempted'
+
+
+@pytest.mark.asyncio
+async def test_transfer_from_inbox_final_manifest_delete_failure_reports_distinct_commit_progress() -> None:
+    destination_group = ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1)
+    destination_manifest_key = _manifest_key(year=2024, season=Season.S1, universe=Universe.WEST)
+    inbox_manifest_key = _inbox_manifest_key(universe=Universe.WEST)
+    s3_client = _FakeS3Client(
+        {
+            inbox_manifest_key: _manifest_bytes([_inbox_entry(clip_id=_UUID_1, video_hash=_HASH_A)]),
+            _inbox_clip_key(universe=Universe.WEST, clip_id=_UUID_1): b'one',
+        },
+        delete_failures={inbox_manifest_key},
+    )
+
+    with pytest.raises(ClipTransferSyncError, match='inbox_manifest_delete') as excinfo:
+        await _store(s3_client).transfer_from_inbox(
+            universe=Universe.WEST,
+            clip_ids=[_UUID_1],
+            destination_group=destination_group,
+            destination_sub_group=ClipSubGroup(sub_season=SubSeason.A, scope=Scope.SOURCE),
+        )
+
+    error = excinfo.value
+    diagnostics = error.inbox_transfer_diagnostics
+    assert error.manifest_keys == (destination_manifest_key, inbox_manifest_key)
+    assert diagnostics is not None
+    assert diagnostics.destination_manifest.operation == 'destination_manifest_write'
+    assert diagnostics.destination_manifest.status == 'completed'
+    assert diagnostics.inbox_manifest.operation == 'inbox_manifest_delete'
+    assert diagnostics.inbox_manifest.status == 'failed'
+
+
+@pytest.mark.asyncio
+async def test_transfer_from_inbox_final_manifest_delete_cancellation_reports_unknown_delete() -> None:
+    inbox_delete_started = asyncio.Event()
+    inbox_delete_gate = asyncio.Event()
+    inbox_manifest_key = _inbox_manifest_key(universe=Universe.WEST)
+
+    class _InboxManifestDeleteGateS3Client(_FakeS3Client):
+        async def delete_key(self, key: str) -> None:
+            if key == inbox_manifest_key:
+                inbox_delete_started.set()
+                await inbox_delete_gate.wait()
+            await super().delete_key(key)
+
+    destination_group = ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1)
+    s3_client = _InboxManifestDeleteGateS3Client(
+        {
+            inbox_manifest_key: _manifest_bytes([_inbox_entry(clip_id=_UUID_1, video_hash=_HASH_A)]),
+            _inbox_clip_key(universe=Universe.WEST, clip_id=_UUID_1): b'one',
+        }
+    )
+    task = asyncio.create_task(
+        _store(s3_client).transfer_from_inbox(
+            universe=Universe.WEST,
+            clip_ids=[_UUID_1],
+            destination_group=destination_group,
+            destination_sub_group=ClipSubGroup(sub_season=SubSeason.A, scope=Scope.SOURCE),
+        )
+    )
+    await inbox_delete_started.wait()
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError) as excinfo:
+        await task
+
+    diagnostics = getattr(excinfo.value, 'inbox_transfer_diagnostics', None)
+    assert diagnostics is not None
+    assert diagnostics.moves[0].status == 'completed'
+    assert diagnostics.destination_manifest.operation == 'destination_manifest_write'
+    assert diagnostics.destination_manifest.status == 'completed'
+    assert diagnostics.inbox_manifest.operation == 'inbox_manifest_delete'
+    assert diagnostics.inbox_manifest.status == 'unknown'
+
+
+@pytest.mark.asyncio
+async def test_transfer_from_inbox_manifest_cancellation_reports_unknown_inbox_commit() -> None:
+    inbox_put_started = asyncio.Event()
+    inbox_put_gate = asyncio.Event()
+    inbox_manifest_key = _inbox_manifest_key(universe=Universe.WEST)
+
+    class _InboxManifestGateS3Client(_FakeS3Client):
+        async def put_bytes(self, key: str, data: bytes, *, content_type: str | None = None) -> None:
+            if key == inbox_manifest_key:
+                inbox_put_started.set()
+                await inbox_put_gate.wait()
+            await super().put_bytes(key, data, content_type=content_type)
+
+    destination_group = ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1)
+    s3_client = _InboxManifestGateS3Client(
+        {
+            inbox_manifest_key: _manifest_bytes(
+                [
+                    _inbox_entry(clip_id=_UUID_1, video_hash=_HASH_A),
+                    _inbox_entry(clip_id=_UUID_2, video_hash=_HASH_B, order=2),
+                ]
+            ),
+            _inbox_clip_key(universe=Universe.WEST, clip_id=_UUID_1): b'one',
+            _inbox_clip_key(universe=Universe.WEST, clip_id=_UUID_2): b'two',
+        }
+    )
+    task = asyncio.create_task(
+        _store(s3_client).transfer_from_inbox(
+            universe=Universe.WEST,
+            clip_ids=[_UUID_1],
+            destination_group=destination_group,
+            destination_sub_group=ClipSubGroup(sub_season=SubSeason.A, scope=Scope.SOURCE),
+        )
+    )
+    await inbox_put_started.wait()
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError) as excinfo:
+        await task
+
+    diagnostics = getattr(excinfo.value, 'inbox_transfer_diagnostics', None)
+    assert diagnostics is not None
+    assert diagnostics.moves[0].status == 'completed'
+    assert diagnostics.destination_manifest.status == 'completed'
+    assert diagnostics.inbox_manifest.status == 'unknown'
+
+
+@pytest.mark.asyncio
+async def test_store_inbox_loads_same_universe_manifests_concurrently_with_configured_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_hashes(monkeypatch, {b'clip': _HASH_A})
+    first_manifest_key = _manifest_key(year=2024, season=Season.S1, universe=Universe.WEST)
+    second_manifest_key = _manifest_key(year=2024, season=Season.S2, universe=Universe.WEST)
+    two_reads_started = asyncio.Event()
+    release_reads = asyncio.Event()
+
+    class _ConcurrentGetS3Client(_FakeS3Client):
+        def __init__(self) -> None:
+            super().__init__(
+                {
+                    first_manifest_key: _manifest_bytes(
+                        [
+                            _entry(
+                                id=_UUID_1,
+                                video_hash=_HASH_B,
+                                sub_season=SubSeason.A,
+                                scope=Scope.SOURCE,
+                                batch=1,
+                                order=1,
+                            )
+                        ]
+                    ),
+                    second_manifest_key: _manifest_bytes(
+                        [
+                            _entry(
+                                id=_UUID_2,
+                                video_hash=_HASH_C,
+                                sub_season=SubSeason.A,
+                                scope=Scope.SOURCE,
+                                batch=1,
+                                order=1,
+                            )
+                        ]
+                    ),
+                },
+                prefixes=[
+                    S3Client.join(_CLIP_NAMESPACE, 'west-2024-1'),
+                    S3Client.join(_CLIP_NAMESPACE, 'west-2024-2'),
+                ],
+            )
+            self.active_manifest_gets = 0
+            self.max_active_manifest_gets = 0
+
+        async def get_bytes(self, key: str) -> bytes:
+            if key in {first_manifest_key, second_manifest_key}:
+                self.active_manifest_gets += 1
+                self.max_active_manifest_gets = max(self.max_active_manifest_gets, self.active_manifest_gets)
+                if self.active_manifest_gets == 2:
+                    two_reads_started.set()
+                try:
+                    await release_reads.wait()
+                finally:
+                    self.active_manifest_gets -= 1
+            return await super().get_bytes(key)
+
+    s3_client = _ConcurrentGetS3Client()
+    task = asyncio.create_task(
+        _store(s3_client, max_s3_concurrency=2).store_inbox(Universe.WEST, clips=[_mp4_file(b'clip')])
+    )
+    await asyncio.wait_for(two_reads_started.wait(), timeout=1)
+    release_reads.set()
+    await task
+
+    assert s3_client.max_active_manifest_gets == 2

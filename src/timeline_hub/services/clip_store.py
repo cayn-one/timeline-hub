@@ -4,7 +4,7 @@ import json
 import math
 import uuid
 from collections.abc import AsyncIterator, Iterable, Iterator, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from dataclasses import replace as dataclass_replace
 from enum import IntEnum, StrEnum
 from typing import Any, Self, TypeVar
@@ -26,6 +26,7 @@ from timeline_hub.types import Extension, FileBytes, InvalidExtensionError
 _MANIFEST_FILENAME = 'manifest.json'
 _CLIP_GROUP_SEPARATOR = '-'
 _NORMALIZED_SUFFIX = '-normalized'
+_INBOX_DIRECTORY = 'inbox'
 
 type ClipId = str
 
@@ -121,6 +122,12 @@ class ClipSubGroup:
 
     sub_season: SubSeason
     scope: Scope
+
+
+_INBOX_SUB_GROUP = ClipSubGroup(
+    sub_season=SubSeason.NONE,
+    scope=Scope.SOURCE,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -354,15 +361,12 @@ class Manifest:
 class StoreResult:
     """Result summary for a `store()` call.
 
-    `clip_ids` contains only the ids of clips stored within a single
-    `store()` call for the specific `(clip_group, clip_sub_group)` used by
-    that call. These ids are subgroup-local identifiers and must not be
-    interpreted outside that subgroup.
+    `clip_ids` contains only the ids of clips stored within one store call.
+    Their ordering follows accepted input order and is meaningful only within
+    that call's target location.
 
     Concatenating results via `__add__` preserves per-call ordering, but is
-    semantically meaningful only when combining results from the same clip
-    subgroup. The concatenated ids must not be treated as a globally
-    meaningful ordered sequence across independent store calls.
+    not a globally meaningful ordered sequence across independent store calls.
     """
 
     stored_count: int
@@ -395,6 +399,14 @@ class TransferResult:
     already_in_destination_group_count: int
     duplicate_blocked_count: int
     affected_sub_groups: tuple[tuple[ClipGroup, ClipSubGroup], ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class InboxTransferResult:
+    """Result summary for an inbox-to-clip-group transfer."""
+
+    transferred_count: int
+    duplicate_blocked_count: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -560,6 +572,7 @@ class ClipRemoveManifestSyncError(RuntimeError):
         manifest_committed: bool,
         logical_state: str,
         failure_detail: str | None = None,
+        inbox_removal_diagnostics: _InboxRemovalDiagnostics | None = None,
     ) -> None:
         self.operation = operation
         self.stage = stage
@@ -569,16 +582,22 @@ class ClipRemoveManifestSyncError(RuntimeError):
         self.manifest_committed = manifest_committed
         self.logical_state = logical_state
         self.failure_detail = failure_detail
+        self.inbox_removal_diagnostics = inbox_removal_diagnostics
         manifest_status = (
             'manifest has already been committed'
             if self.manifest_committed
             else 'manifest commit failed before cleanup started'
         )
         detail_suffix = f'; original error: {self.failure_detail}' if self.failure_detail is not None else ''
+        diagnostics_suffix = (
+            f'; inbox removal diagnostics: {self.inbox_removal_diagnostics}'
+            if self.inbox_removal_diagnostics is not None
+            else ''
+        )
         super().__init__(
             f'Clip {self.operation} failed at stage={self.stage} for clip ids {list(self.clip_ids)}; '
             f'{manifest_status}; manifest key: {self.manifest_key}; {self.logical_state}; '
-            f'touched/failed keys: {list(self.touched_keys)}{detail_suffix}. '
+            f'touched/failed keys: {list(self.touched_keys)}{detail_suffix}{diagnostics_suffix}. '
             'Manual cleanup or inspection may be required for the listed keys.'
         )
 
@@ -595,6 +614,7 @@ class ClipTransferSyncError(RuntimeError):
         manifest_keys: Sequence[Key],
         logical_state: str,
         failure_detail: str | None = None,
+        inbox_transfer_diagnostics: _InboxTransferDiagnostics | None = None,
     ) -> None:
         self.stage = stage
         self.moved_keys = tuple(moved_keys)
@@ -602,11 +622,17 @@ class ClipTransferSyncError(RuntimeError):
         self.manifest_keys = tuple(manifest_keys)
         self.logical_state = logical_state
         self.failure_detail = failure_detail
+        self.inbox_transfer_diagnostics = inbox_transfer_diagnostics
         detail_suffix = f'; original error: {self.failure_detail}' if self.failure_detail is not None else ''
+        diagnostics_suffix = (
+            f'; inbox transfer diagnostics: {self.inbox_transfer_diagnostics}'
+            if self.inbox_transfer_diagnostics is not None
+            else ''
+        )
         super().__init__(
             f'Clip transfer failed at stage={self.stage} for clip ids {list(self.affected_clip_ids)}; '
             f'moved keys: {list(self.moved_keys)}; manifest keys: {list(self.manifest_keys)}; '
-            f'{self.logical_state}{detail_suffix}. Manual cleanup or inspection may be required.'
+            f'{self.logical_state}{detail_suffix}{diagnostics_suffix}. Manual cleanup or inspection may be required.'
         )
 
 
@@ -617,9 +643,87 @@ class _TransferCancellationDiagnostics:
     manifest_keys: tuple[Key, ...]
 
 
+@dataclass(slots=True)
+class _InboxMoveProgress:
+    clip_id: ClipId
+    source_key: Key
+    destination_key: Key
+    status: str = 'not_attempted'
+    failure_detail: str | None = None
+    failure: BaseException | None = field(default=None, repr=False, compare=False)
+
+
+@dataclass(slots=True)
+class _InboxManifestProgress:
+    operation: str
+    key: Key
+    attempted: bool = False
+    completed: bool = False
+    status: str = 'not_attempted'
+    failure_detail: str | None = None
+
+
+@dataclass(slots=True)
+class _InboxDeletionProgress:
+    clip_id: ClipId
+    key: Key
+    status: str = 'not_attempted'
+    failure_detail: str | None = None
+    failure: BaseException | None = field(default=None, repr=False, compare=False)
+
+
+@dataclass(frozen=True, slots=True)
+class _InboxMoveSnapshot:
+    """Immutable manual-recovery state for one raw object move."""
+
+    clip_id: ClipId
+    source_key: Key
+    destination_key: Key
+    status: str
+    failure_detail: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class _InboxManifestSnapshot:
+    """Immutable manual-recovery state for one manifest commit operation."""
+
+    operation: str
+    key: Key
+    attempted: bool
+    completed: bool
+    status: str
+    failure_detail: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class _InboxDeletionSnapshot:
+    """Immutable manual-recovery state for one raw inbox object deletion."""
+
+    clip_id: ClipId
+    key: Key
+    status: str
+    failure_detail: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class _InboxRemovalDiagnostics:
+    """Final immutable state snapshot for interrupted inbox raw-object cleanup."""
+
+    deletions: tuple[_InboxDeletionSnapshot, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _InboxTransferDiagnostics:
+    """Final immutable state snapshot for an interrupted inbox transfer."""
+
+    moves: tuple[_InboxMoveSnapshot, ...]
+    destination_manifest: _InboxManifestSnapshot
+    inbox_manifest: _InboxManifestSnapshot
+
+
 @dataclass(frozen=True, slots=True)
 class _ComparisonManifest:
-    group: ClipGroup
+    group: ClipGroup | None
     manifest: Manifest
 
 
@@ -671,6 +775,12 @@ class ClipStore:
     Clips are stored as `.mp4` objects with MIME type `video/mp4`.
     `ClipStore` validates MP4 `FileBytes` at the public boundary, then keeps
     internal processing byte-based. All returned clip files are MP4.
+
+    Inbox manifests live under a reserved namespace prefix and are also
+    authoritative clip state. Every inbox uses one configured dense batch
+    layout whose size must remain unchanged while either inbox is populated.
+    Inbox ingest uses global same-universe manifest deduplication; normal
+    chronological ingest retains its bounded neighboring-group scope.
     """
 
     def __init__(
@@ -680,22 +790,31 @@ class ClipStore:
         namespace: Prefix,
         max_s3_concurrency: int,
         sampled_phash_mean_threshold: float,
+        inbox_batch_size: int,
     ) -> None:
         """Initialize the store with an opened generic S3 client."""
+        if isinstance(inbox_batch_size, bool) or not isinstance(inbox_batch_size, int):
+            raise ValueError('`inbox_batch_size` must be an integer')
+        if inbox_batch_size < 1:
+            raise ValueError('`inbox_batch_size` must be >= 1')
         self._s3_client = s3_client
         self._namespace = namespace
         self._max_s3_concurrency = max_s3_concurrency
         self._sampled_phash_mean_threshold = sampled_phash_mean_threshold
+        self._inbox_batch_size = inbox_batch_size
         self._manifest_cache: dict[Prefix, Manifest] = {}
 
     async def list_groups(self) -> list[ClipGroup]:
-        """List discovered clip groups from stored S3 prefixes.
+        """List discovered chronological clip groups from stored S3 prefixes.
 
         This is prefix-based storage discovery, not a manifest-authoritative
         existence check. After failed first writes, orphaned prefixes may
-        appear temporarily until manual cleanup removes them.
+        appear temporarily until manual cleanup removes them. The reserved
+        inbox prefix is excluded; any other malformed prefix remains an error.
         """
+        inbox_root_prefix = self._inbox_root_prefix()
         clip_group_prefixes = await self._s3_client.list_prefixes(prefix=self._namespace)
+        clip_group_prefixes = [prefix for prefix in clip_group_prefixes if prefix != inbox_root_prefix]
         clip_groups = [self._parse_clip_group_prefix(prefix) for prefix in clip_group_prefixes]
         return sorted(clip_groups, key=lambda group: (group.universe.order(), group.year, int(group.season)))
 
@@ -742,6 +861,24 @@ class ClipStore:
             clips_by_sub_group[sub_group] = batches
 
         return clips_by_sub_group
+
+    async def list_inbox_clips(self, universe: Universe) -> list[tuple[ClipInfo, ...]]:
+        """List inbox clip metadata in validated persisted batch order.
+
+        Missing and empty inboxes return an empty list. This reads only the
+        authoritative manifest through the lifetime cache and never fetches
+        media payloads.
+        """
+        inbox_prefix = self._inbox_prefix(universe)
+        manifest = await self._load_inbox_manifest_for_read(inbox_prefix)
+        if manifest is None or len(manifest) == 0:
+            return []
+
+        batches: list[tuple[ClipInfo, ...]] = []
+        entries = self._sorted_sub_group_entries(manifest, _INBOX_SUB_GROUP)
+        for _, grouped_entries in itertools.groupby(entries, key=lambda entry: entry.batch):
+            batches.append(tuple(ClipInfo(id=entry.id) for entry in grouped_entries))
+        return batches
 
     async def fetch(
         self,
@@ -849,6 +986,422 @@ class ClipStore:
             )
             yield tuple(clip_batch)
 
+    async def fetch_inbox(
+        self,
+        universe: Universe,
+    ) -> AsyncIterator[tuple[FetchedClip, ...]]:
+        """Fetch every raw inbox clip in configured dense batch order.
+
+        Missing and empty inboxes yield no batches. The inbox manifest is
+        validated before any media object is fetched, so each yielded batch has
+        at most the configured inbox batch size.
+        """
+        inbox_prefix = self._inbox_prefix(universe)
+        manifest = await self._load_inbox_manifest_for_read(inbox_prefix)
+        if manifest is None or len(manifest) == 0:
+            return
+
+        entries = self._sorted_sub_group_entries(manifest, _INBOX_SUB_GROUP)
+        for _, grouped_entries in itertools.groupby(entries, key=lambda entry: entry.batch):
+            batch = await self._fetch_raw_batch(inbox_prefix, list(grouped_entries))
+            yield batch
+            # The consumer has resumed, so do not retain the prior media
+            # payload while beginning the next batch download.
+            del batch
+
+    async def store_inbox(
+        self,
+        universe: Universe,
+        *,
+        clips: Sequence[FileBytes],
+    ) -> StoreResult:
+        """Store clips in one universe inbox with global same-universe deduplication."""
+        inbox_prefix = self._inbox_prefix(universe)
+        manifest = await self._load_inbox_manifest_for_store(inbox_prefix)
+        comparison_manifests = (
+            _ComparisonManifest(group=None, manifest=manifest),
+            *await self._load_same_universe_manifests_for_inbox_dedup(universe),
+        )
+        seen_video_hashes: set[str] = set()
+        seen_ids: set[ClipId] = set()
+        duplicate_count = 0
+        accepted_candidates: list[_DedupCandidate] = []
+        accepted_clips: list[tuple[ClipId, str, int | None, tuple[int, ...] | None, bytes]] = []
+
+        for clip_file in clips:
+            if not isinstance(clip_file, FileBytes):
+                raise ValueError('clips entries must be FileBytes instances')
+            _require_extension(clip_file, Extension.MP4, 'clips entries')
+            clip_bytes = clip_file.data
+            video_hash = await hash_video_content(clip_bytes)
+            if self._has_video_hash_duplicate(
+                comparison_manifests=comparison_manifests,
+                accepted_candidates=accepted_candidates,
+                video_hash=video_hash,
+                excluded_identities=set(),
+                seen_video_hashes=seen_video_hashes,
+            ):
+                seen_video_hashes.add(video_hash)
+                duplicate_count += 1
+                continue
+
+            try:
+                frame_count = await compute_video_frame_count(clip_bytes)
+            except PerceptualMetadataUnavailableError:
+                frame_count = None
+                sampled_phashes = None
+            else:
+                sampled_phashes = await self._compute_store_candidate_sampled_phashes(
+                    clip_bytes=clip_bytes,
+                    comparison_manifests=comparison_manifests,
+                    accepted_candidates=accepted_candidates,
+                    frame_count=frame_count,
+                )
+
+            if self._is_duplicate_candidate(
+                video_hash=video_hash,
+                frame_count=frame_count,
+                sampled_phashes=sampled_phashes,
+                comparison_manifests=comparison_manifests,
+                accepted_candidates=accepted_candidates,
+                seen_video_hashes=seen_video_hashes,
+            ):
+                seen_video_hashes.add(video_hash)
+                duplicate_count += 1
+                continue
+
+            clip_id = self._new_clip_id(manifest=manifest, seen_ids=seen_ids)
+            accepted_candidates.append(
+                _DedupCandidate(
+                    identity=None,
+                    video_hash=video_hash,
+                    frame_count=frame_count,
+                    sampled_phashes=sampled_phashes,
+                )
+            )
+            accepted_clips.append((clip_id, video_hash, frame_count, sampled_phashes, clip_bytes))
+            seen_video_hashes.add(video_hash)
+            seen_ids.add(clip_id)
+
+        if not accepted_clips:
+            return StoreResult(stored_count=0, duplicate_count=duplicate_count)
+
+        temporary_batch = manifest.next_batch(
+            sub_season=_INBOX_SUB_GROUP.sub_season,
+            scope=_INBOX_SUB_GROUP.scope,
+        )
+        new_entries: list[tuple[ManifestEntry, bytes]] = []
+        for order, (clip_id, video_hash, frame_count, sampled_phashes, clip_bytes) in enumerate(
+            accepted_clips, start=1
+        ):
+            entry = ManifestEntry(
+                id=clip_id,
+                video_hash=video_hash,
+                frame_count=frame_count,
+                sampled_phashes=sampled_phashes,
+                audio_normalization=None,
+                sub_season=_INBOX_SUB_GROUP.sub_season,
+                scope=_INBOX_SUB_GROUP.scope,
+                batch=temporary_batch,
+                order=order,
+            )
+            new_entries.append((entry, clip_bytes))
+
+        final_manifest = Manifest(
+            self._compact_entries(
+                [*manifest, *(entry for entry, _clip_bytes in new_entries)],
+                batch_size=self._inbox_batch_size,
+            )
+        )
+        self._validate_inbox_manifest(final_manifest, inbox_prefix)
+
+        uploaded_keys = await self._upload_new_clips(
+            clip_group_prefix=inbox_prefix,
+            entries_and_bytes=new_entries,
+        )
+        try:
+            await self._write_inbox_manifest_and_update_cache(
+                inbox_prefix=inbox_prefix,
+                manifest=final_manifest,
+            )
+        except Exception as error:
+            sync_error = ClipManifestSyncError(
+                stage='manifest_write',
+                written_keys=uploaded_keys,
+                affected_clip_ids=[entry.id for entry, _clip_bytes in new_entries],
+                manifest_key=self._manifest_key(inbox_prefix),
+            )
+            sync_error.add_note(f'Original manifest write error: {error!r}')
+            raise sync_error from error
+
+        return StoreResult(
+            stored_count=len(new_entries),
+            duplicate_count=duplicate_count,
+            clip_ids=tuple(entry.id for entry, _clip_bytes in new_entries),
+        )
+
+    async def remove_from_inbox(
+        self,
+        universe: Universe,
+        *,
+        clip_ids: Sequence[ClipId],
+    ) -> None:
+        """Remove inbox clips and compact the remaining authoritative layout."""
+        if not clip_ids:
+            raise ValueError('remove_from_inbox() requires at least one clip id')
+        if len(set(clip_ids)) != len(clip_ids):
+            raise DuplicateClipIdsError(clip_ids=clip_ids)
+
+        inbox_prefix = self._inbox_prefix(universe)
+        manifest = await self._load_inbox_manifest_for_read(inbox_prefix)
+        entries_by_id = {} if manifest is None else {entry.id: entry for entry in manifest}
+        unknown_ids = [clip_id for clip_id in clip_ids if clip_id not in entries_by_id]
+        if unknown_ids:
+            raise UnknownClipsError(clip_ids=unknown_ids)
+        assert manifest is not None
+
+        removed_entries = [entries_by_id[clip_id] for clip_id in clip_ids]
+        removed_ids = set(clip_ids)
+        remaining_entries = [entry for entry in manifest if entry.id not in removed_ids]
+        final_manifest = Manifest(self._compact_entries(remaining_entries, batch_size=self._inbox_batch_size))
+        self._validate_inbox_manifest(final_manifest, inbox_prefix)
+        manifest_key = self._manifest_key(inbox_prefix)
+        try:
+            await self._commit_inbox_manifest_state(
+                inbox_prefix=inbox_prefix,
+                manifest=final_manifest,
+            )
+        except Exception as error:
+            sync_error = ClipRemoveManifestSyncError(
+                operation='remove from inbox',
+                stage='manifest_delete' if not remaining_entries else 'manifest_write',
+                clip_ids=clip_ids,
+                touched_keys=[manifest_key],
+                manifest_key=manifest_key,
+                manifest_committed=False,
+                logical_state='Logical state remains unchanged because authoritative object cleanup did not start.',
+            )
+            sync_error.add_note(f'Inbox manifest commit error: {error!r}')
+            raise sync_error from error
+
+        deletion_progress = [
+            _InboxDeletionProgress(
+                clip_id=entry.id,
+                key=self._clip_key(inbox_prefix, entry.id),
+            )
+            for entry in removed_entries
+        ]
+        semaphore = asyncio.Semaphore(self._max_s3_concurrency)
+
+        async def delete_raw_clip(progress: _InboxDeletionProgress) -> None:
+            try:
+                async with semaphore:
+                    progress.status = 'unknown'
+                    await self._s3_client.delete_key(progress.key)
+            except asyncio.CancelledError:
+                if progress.status != 'not_attempted':
+                    progress.status = 'unknown'
+                raise
+            except Exception as error:
+                progress.status = 'failed'
+                progress.failure_detail = repr(error)
+                progress.failure = error
+            else:
+                progress.status = 'completed'
+
+        deletion_tasks = [asyncio.create_task(delete_raw_clip(progress)) for progress in deletion_progress]
+        try:
+            await asyncio.gather(*deletion_tasks)
+        except asyncio.CancelledError as error:
+            for deletion_task in deletion_tasks:
+                if not deletion_task.done():
+                    deletion_task.cancel()
+            await asyncio.gather(*deletion_tasks, return_exceptions=True)
+            diagnostics = self._snapshot_inbox_removal_diagnostics(deletion_progress)
+            self._attach_inbox_removal_cancellation_diagnostics(error, diagnostics=diagnostics)
+            raise
+
+        failures = [progress for progress in deletion_progress if progress.status == 'failed']
+        if failures:
+            diagnostics = self._snapshot_inbox_removal_diagnostics(deletion_progress)
+            assert failures[0].failure is not None
+            raise ClipRemoveManifestSyncError(
+                operation='remove from inbox cleanup',
+                stage='raw_clip_delete',
+                clip_ids=clip_ids,
+                touched_keys=[progress.key for progress in deletion_progress],
+                manifest_key=manifest_key,
+                manifest_committed=True,
+                logical_state='Manifest commit already succeeded, so the removed clips are already removed logically.',
+                failure_detail=failures[0].failure_detail,
+                inbox_removal_diagnostics=diagnostics,
+            ) from failures[0].failure
+
+    async def transfer_from_inbox(
+        self,
+        *,
+        universe: Universe,
+        clip_ids: Sequence[ClipId],
+        destination_group: ClipGroup,
+        destination_sub_group: ClipSubGroup,
+    ) -> InboxTransferResult:
+        """Transfer selected inbox clips into one chronological clip sub-group."""
+        if not clip_ids:
+            raise ValueError('transfer_from_inbox() requires at least one clip id')
+        if len(set(clip_ids)) != len(clip_ids):
+            raise DuplicateClipIdsError(clip_ids=clip_ids)
+
+        source_universe = universe
+        destination_universe = destination_group.universe
+        inbox_prefix = self._inbox_prefix(source_universe)
+        inbox_manifest = await self._load_inbox_manifest_for_read(inbox_prefix)
+        inbox_entries_by_id = {} if inbox_manifest is None else {entry.id: entry for entry in inbox_manifest}
+        unknown_ids = [clip_id for clip_id in clip_ids if clip_id not in inbox_entries_by_id]
+        if unknown_ids:
+            raise UnknownClipsError(clip_ids=unknown_ids)
+        assert inbox_manifest is not None
+        selected_entries = [inbox_entries_by_id[clip_id] for clip_id in clip_ids]
+
+        destination_prefix = self._clip_group_prefix(
+            universe=destination_group.universe,
+            year=destination_group.year,
+            season=destination_group.season,
+        )
+        destination_manifest = await self._load_manifest_for_store(destination_prefix)
+        comparison_manifests = (
+            _ComparisonManifest(group=destination_group, manifest=destination_manifest),
+            *await self._load_same_universe_manifests_for_inbox_dedup(destination_universe),
+        )
+        destination_ids = {entry.id for entry in destination_manifest}
+        for clip_id in clip_ids:
+            if clip_id in destination_ids:
+                raise RuntimeError(
+                    f'Transfer destination manifest already contains clip id {clip_id} for group {destination_group}'
+                )
+
+        moved_entries: list[ManifestEntry] = []
+        duplicate_blocked_count = 0
+        for entry in selected_entries:
+            if self._is_duplicate_candidate(
+                video_hash=entry.video_hash,
+                frame_count=entry.frame_count,
+                sampled_phashes=entry.sampled_phashes,
+                comparison_manifests=comparison_manifests,
+                accepted_candidates=(),
+                excluded_identities=set(),
+            ):
+                duplicate_blocked_count += 1
+                continue
+            moved_entries.append(entry)
+
+        if not moved_entries:
+            return InboxTransferResult(
+                transferred_count=0,
+                duplicate_blocked_count=duplicate_blocked_count,
+            )
+
+        destination_batch = destination_manifest.next_batch(
+            sub_season=destination_sub_group.sub_season,
+            scope=destination_sub_group.scope,
+        )
+        destination_entries = [
+            dataclass_replace(
+                entry,
+                sub_season=destination_sub_group.sub_season,
+                scope=destination_sub_group.scope,
+                batch=destination_batch,
+                order=order,
+            )
+            for order, entry in enumerate(moved_entries, start=1)
+        ]
+        final_destination_manifest = Manifest([*destination_manifest, *destination_entries])
+        moved_ids = {entry.id for entry in moved_entries}
+        surviving_inbox_entries = [entry for entry in inbox_manifest if entry.id not in moved_ids]
+        final_inbox_manifest = Manifest(
+            self._compact_entries(surviving_inbox_entries, batch_size=self._inbox_batch_size)
+        )
+        self._validate_inbox_manifest(final_inbox_manifest, inbox_prefix)
+
+        destination_manifest_progress = _InboxManifestProgress(
+            operation='destination_manifest_write',
+            key=self._manifest_key(destination_prefix),
+        )
+        inbox_manifest_progress = _InboxManifestProgress(
+            operation='inbox_manifest_delete' if len(final_inbox_manifest) == 0 else 'inbox_manifest_write',
+            key=self._manifest_key(inbox_prefix),
+        )
+        moved_keys, move_progress = await self._move_inbox_raw_clips(
+            inbox_prefix=inbox_prefix,
+            destination_prefix=destination_prefix,
+            entries=moved_entries,
+            destination_manifest_progress=destination_manifest_progress,
+            inbox_manifest_progress=inbox_manifest_progress,
+        )
+        try:
+            destination_manifest_progress.attempted = True
+            destination_manifest_progress.status = 'unknown'
+            await self._write_manifest_and_update_cache(
+                clip_group_prefix=destination_prefix,
+                manifest=final_destination_manifest,
+            )
+            destination_manifest_progress.completed = True
+            destination_manifest_progress.status = 'completed'
+            inbox_manifest_progress.attempted = True
+            inbox_manifest_progress.status = 'unknown'
+            await self._commit_inbox_manifest_state(
+                inbox_prefix=inbox_prefix,
+                manifest=final_inbox_manifest,
+            )
+            inbox_manifest_progress.completed = True
+            inbox_manifest_progress.status = 'completed'
+        except asyncio.CancelledError as error:
+            diagnostics = self._snapshot_inbox_transfer_diagnostics(
+                move_progress=move_progress,
+                destination_manifest_progress=destination_manifest_progress,
+                inbox_manifest_progress=inbox_manifest_progress,
+            )
+            self._attach_inbox_transfer_cancellation_diagnostics(
+                error,
+                stage=(
+                    inbox_manifest_progress.operation
+                    if inbox_manifest_progress.attempted
+                    else destination_manifest_progress.operation
+                ),
+                diagnostics=diagnostics,
+            )
+            raise
+        except Exception as error:
+            failed_manifest = (
+                inbox_manifest_progress
+                if inbox_manifest_progress.attempted and not inbox_manifest_progress.completed
+                else destination_manifest_progress
+            )
+            failed_manifest.status = 'failed'
+            failed_manifest.failure_detail = repr(error)
+            diagnostics = self._snapshot_inbox_transfer_diagnostics(
+                move_progress=move_progress,
+                destination_manifest_progress=destination_manifest_progress,
+                inbox_manifest_progress=inbox_manifest_progress,
+            )
+            raise ClipTransferSyncError(
+                stage=failed_manifest.operation,
+                moved_keys=moved_keys,
+                affected_clip_ids=[entry.id for entry in moved_entries],
+                manifest_keys=[
+                    progress.key
+                    for progress in (destination_manifest_progress, inbox_manifest_progress)
+                    if progress.attempted
+                ],
+                logical_state='One or more clip objects already moved, but manifest state did not fully synchronize.',
+                failure_detail=repr(error),
+                inbox_transfer_diagnostics=diagnostics,
+            ) from error
+
+        return InboxTransferResult(
+            transferred_count=len(moved_entries),
+            duplicate_blocked_count=duplicate_blocked_count,
+        )
+
     async def store(
         self,
         group: ClipGroup,
@@ -907,7 +1460,6 @@ class ClipStore:
         duplicate_count = 0
         accepted_candidates: list[_DedupCandidate] = []
         accepted_clips: list[tuple[ClipId, str, int | None, tuple[int, ...] | None, bytes]] = []
-        uploaded_keys: list[Key] = []
         for clip_file in clips:
             if not isinstance(clip_file, FileBytes):
                 raise ValueError('clips entries must be FileBytes instances')
@@ -989,63 +1541,10 @@ class ClipStore:
             new_entries.append((entry, clip_bytes))
 
         manifest_key = self._manifest_key(clip_group_prefix)
-
-        upload_keys = [self._clip_key(clip_group_prefix, entry.id) for entry, _ in new_entries]
-        clip_ids = [entry.id for entry, _ in new_entries]
-        clip_bytes_list = [clip_bytes for _, clip_bytes in new_entries]
-
-        async def upload_clip(
-            semaphore: asyncio.Semaphore,
-            clip_key: Key,
-            clip_bytes: bytes,
-        ) -> None:
-            async with semaphore:
-                await self._s3_client.put_bytes(
-                    clip_key,
-                    clip_bytes,
-                    content_type=S3ContentType.MP4,
-                )
-
-        semaphore = asyncio.Semaphore(self._max_s3_concurrency)
-        upload_results = await asyncio.gather(
-            *(
-                upload_clip(
-                    semaphore,
-                    clip_key,
-                    clip_bytes,
-                )
-                for clip_key, clip_bytes in zip(upload_keys, clip_bytes_list, strict=True)
-            ),
-            return_exceptions=True,
+        uploaded_keys = await self._upload_new_clips(
+            clip_group_prefix=clip_group_prefix,
+            entries_and_bytes=new_entries,
         )
-
-        failures: list[BaseException] = []
-        for clip_key, result in zip(upload_keys, upload_results, strict=True):
-            if isinstance(result, BaseException):
-                failures.append(result)
-                continue
-            uploaded_keys.append(clip_key)
-
-        if failures:
-            if not uploaded_keys:
-                raise failures[0]
-            uploaded_keys_set = set(uploaded_keys)
-            successful_ids = [
-                clip_id
-                for clip_id, clip_key in zip(clip_ids, upload_keys, strict=True)
-                if clip_key in uploaded_keys_set
-            ]
-            sync_error = ClipManifestSyncError(
-                stage='clip_upload',
-                written_keys=uploaded_keys,
-                affected_clip_ids=successful_ids,
-                manifest_key=manifest_key,
-            )
-            if len(failures) == 1:
-                sync_error.add_note(f'Original clip upload error: {failures[0]!r}')
-            else:
-                sync_error.add_note(f'Original clip upload errors: {[repr(error) for error in failures]}')
-            raise sync_error from failures[0]
 
         try:
             await self._write_manifest_and_update_cache(
@@ -1460,14 +1959,13 @@ class ClipStore:
                 scope=sub_group.scope,
             )
 
-        compacted_positions: dict[str, tuple[int, int]] = {}
-        changed = False
-        for index, entry in enumerate(target_entries, start=1):
-            compacted_batch = ((index - 1) // batch_size) + 1
-            compacted_order = ((index - 1) % batch_size) + 1
-            compacted_positions[entry.id] = (compacted_batch, compacted_order)
-            if (entry.batch, entry.order) != (compacted_batch, compacted_order):
-                changed = True
+        compacted_entries = self._compact_entries(target_entries, batch_size=batch_size)
+        compacted_entries_by_id = {entry.id: entry for entry in compacted_entries}
+        changed = any(
+            (entry.batch, entry.order)
+            != (compacted_entries_by_id[entry.id].batch, compacted_entries_by_id[entry.id].order)
+            for entry in target_entries
+        )
 
         if not changed:
             return
@@ -1475,20 +1973,7 @@ class ClipStore:
         rewritten_entries: list[ManifestEntry] = []
         for entry in manifest:
             if entry.scope is sub_group.scope and entry.sub_season is sub_group.sub_season:
-                compacted_batch, compacted_order = compacted_positions[entry.id]
-                rewritten_entries.append(
-                    ManifestEntry(
-                        id=entry.id,
-                        video_hash=entry.video_hash,
-                        frame_count=entry.frame_count,
-                        sampled_phashes=entry.sampled_phashes,
-                        audio_normalization=entry.audio_normalization,
-                        sub_season=entry.sub_season,
-                        scope=entry.scope,
-                        batch=compacted_batch,
-                        order=compacted_order,
-                    )
-                )
+                rewritten_entries.append(compacted_entries_by_id[entry.id])
             else:
                 rewritten_entries.append(entry)
 
@@ -1921,6 +2406,15 @@ class ClipStore:
         return '--'.join((clip_group, clip_id))
 
     @staticmethod
+    def inbox_clip_identity_to_string(
+        universe: Universe,
+        clip_id: ClipId,
+    ) -> str:
+        """Encode an inbox clip identity as a strict flat string."""
+        clip_id = _parse_uuid7(clip_id, field='id')
+        return '--'.join((f'{_INBOX_DIRECTORY}{_CLIP_GROUP_SEPARATOR}{universe.value}', clip_id))
+
+    @staticmethod
     def string_to_clip_identity(
         value: str,
     ) -> tuple[ClipGroup, ClipId]:
@@ -1979,6 +2473,36 @@ class ClipStore:
         )
 
     @staticmethod
+    def string_to_inbox_clip_identity(
+        value: str,
+    ) -> tuple[Universe, ClipId]:
+        """Decode a strict logical inbox clip identity string."""
+        if not isinstance(value, str):
+            raise InvalidClipIdentityError('inbox clip identity `value` must be a string')
+        if '/' in value:
+            raise InvalidClipIdentityError('inbox clip identity `value` must not contain path separators')
+        if '.' in value:
+            raise InvalidClipIdentityError('inbox clip identity `value` must not contain extensions')
+
+        parts = value.split('--')
+        if len(parts) != 2:
+            raise InvalidClipIdentityError("inbox clip identity `value` must contain exactly one '--' separator")
+        inbox_text, clip_id_text = parts
+        prefix = f'{_INBOX_DIRECTORY}{_CLIP_GROUP_SEPARATOR}'
+        if not inbox_text.startswith(prefix) or not clip_id_text:
+            raise InvalidClipIdentityError('inbox clip identity `value` has malformed inbox segment')
+        try:
+            universe = Universe(inbox_text.removeprefix(prefix))
+        except ValueError as error:
+            raise InvalidClipIdentityError('inbox clip identity `value` has unsupported universe') from error
+        try:
+            clip_id = _parse_uuid7(clip_id_text, field='id')
+        except ValueError as error:
+            message = str(error).replace('manifest `id`', 'inbox clip identity `value`')
+            raise InvalidClipIdentityError(message) from error
+        return universe, clip_id
+
+    @staticmethod
     def _sorted_sub_group_entries(manifest: Manifest, clip_sub_group: ClipSubGroup) -> list[ManifestEntry]:
         """Return sub-group entries in canonical `(batch, order)` order."""
         return sorted(
@@ -1989,6 +2513,30 @@ class ClipStore:
             ),
             key=lambda entry: (entry.batch, entry.order),
         )
+
+    @staticmethod
+    def _compact_entries(
+        entries: Sequence[ManifestEntry],
+        *,
+        batch_size: int,
+    ) -> tuple[ManifestEntry, ...]:
+        """Return entries in canonical order with dense batch coordinates."""
+        if batch_size < 1:
+            raise ValueError('`batch_size` must be >= 1')
+        return tuple(
+            dataclass_replace(
+                entry,
+                batch=((index - 1) // batch_size) + 1,
+                order=((index - 1) % batch_size) + 1,
+            )
+            for index, entry in enumerate(sorted(entries, key=lambda entry: (entry.batch, entry.order)), start=1)
+        )
+
+    def _inbox_root_prefix(self) -> Prefix:
+        return S3Client.join(self._namespace, _INBOX_DIRECTORY)
+
+    def _inbox_prefix(self, universe: Universe) -> Prefix:
+        return S3Client.join(self._inbox_root_prefix(), universe.value)
 
     def _clip_group_prefix(self, *, universe: Universe, year: int, season: Season) -> Prefix:
         clip_group = _CLIP_GROUP_SEPARATOR.join((universe.value, str(year), str(int(season))))
@@ -2349,11 +2897,11 @@ class ClipStore:
     @staticmethod
     def _is_excluded_manifest_entry(
         *,
-        group: ClipGroup,
+        group: ClipGroup | None,
         entry: ManifestEntry,
         excluded_identities: set[tuple[ClipGroup, ClipId]],
     ) -> bool:
-        return (group, entry.id) in excluded_identities
+        return group is not None and (group, entry.id) in excluded_identities
 
     def _find_internal_transfer_conflicts(
         self,
@@ -2490,6 +3038,121 @@ class ClipStore:
         self._manifest_cache[clip_group_prefix] = manifest
         return manifest
 
+    async def _load_inbox_manifest_for_store(self, inbox_prefix: Prefix) -> Manifest:
+        if (cached_manifest := self._manifest_cache.get(inbox_prefix)) is not None:
+            self._validate_inbox_manifest(cached_manifest, inbox_prefix)
+            return cached_manifest.copy()
+
+        try:
+            manifest = await self._fetch_manifest(inbox_prefix)
+        except S3ObjectNotFoundError:
+            return Manifest()
+
+        self._validate_inbox_manifest(manifest, inbox_prefix)
+        self._manifest_cache[inbox_prefix] = manifest
+        return manifest.copy()
+
+    async def _load_inbox_manifest_for_read(self, inbox_prefix: Prefix) -> Manifest | None:
+        if (cached_manifest := self._manifest_cache.get(inbox_prefix)) is not None:
+            self._validate_inbox_manifest(cached_manifest, inbox_prefix)
+            return cached_manifest
+
+        try:
+            manifest = await self._fetch_manifest(inbox_prefix)
+        except S3ObjectNotFoundError:
+            return None
+
+        self._validate_inbox_manifest(manifest, inbox_prefix)
+        self._manifest_cache[inbox_prefix] = manifest
+        return manifest
+
+    def _validate_inbox_manifest(self, manifest: Manifest, inbox_prefix: Prefix) -> None:
+        """Validate the fixed fields and configured dense layout of one inbox."""
+        manifest_key = self._manifest_key(inbox_prefix)
+        entries = tuple(manifest)
+        for entry in entries:
+            if entry.sub_season is not _INBOX_SUB_GROUP.sub_season:
+                raise ManifestCorruptedError(
+                    manifest_key,
+                    f'inbox entry {entry.id} must use sub_season={_INBOX_SUB_GROUP.sub_season.value}',
+                )
+            if entry.scope is not _INBOX_SUB_GROUP.scope:
+                raise ManifestCorruptedError(
+                    manifest_key,
+                    f'inbox entry {entry.id} must use scope={_INBOX_SUB_GROUP.scope.value}',
+                )
+            if entry.audio_normalization is not None:
+                raise ManifestCorruptedError(
+                    manifest_key,
+                    f'inbox entry {entry.id} must not track audio normalization',
+                )
+
+        for index, entry in enumerate(sorted(entries, key=lambda entry: (entry.batch, entry.order)), start=1):
+            expected_batch = ((index - 1) // self._inbox_batch_size) + 1
+            expected_order = ((index - 1) % self._inbox_batch_size) + 1
+            if (entry.batch, entry.order) != (expected_batch, expected_order):
+                raise ManifestCorruptedError(
+                    manifest_key,
+                    'inbox manifest layout is incompatible with configured '
+                    f'inbox_batch_size={self._inbox_batch_size}: expected position '
+                    f'({expected_batch}, {expected_order}) for clip {entry.id}, '
+                    f'found ({entry.batch}, {entry.order})',
+                )
+
+    async def _write_inbox_manifest_and_update_cache(
+        self,
+        *,
+        inbox_prefix: Prefix,
+        manifest: Manifest,
+    ) -> None:
+        self._validate_inbox_manifest(manifest, inbox_prefix)
+        await self._write_manifest_and_update_cache(
+            clip_group_prefix=inbox_prefix,
+            manifest=manifest,
+        )
+
+    async def _commit_inbox_manifest_state(
+        self,
+        *,
+        inbox_prefix: Prefix,
+        manifest: Manifest,
+    ) -> None:
+        self._validate_inbox_manifest(manifest, inbox_prefix)
+        if len(manifest) == 0:
+            await self._s3_client.delete_key(self._manifest_key(inbox_prefix))
+            self._manifest_cache.pop(inbox_prefix, None)
+            return
+        await self._write_inbox_manifest_and_update_cache(
+            inbox_prefix=inbox_prefix,
+            manifest=manifest,
+        )
+
+    async def _load_same_universe_manifests_for_inbox_dedup(
+        self,
+        universe: Universe,
+    ) -> tuple[_ComparisonManifest, ...]:
+        """Load every authoritative chronological manifest in one universe."""
+        groups = [group for group in await self.list_groups() if group.universe is universe]
+        semaphore = asyncio.Semaphore(self._max_s3_concurrency)
+
+        async def load_group_manifest(group: ClipGroup) -> _ComparisonManifest | None:
+            group_prefix = self._clip_group_prefix(
+                universe=group.universe,
+                year=group.year,
+                season=group.season,
+            )
+            try:
+                async with semaphore:
+                    manifest = await self._load_manifest_for_read(group_prefix)
+            except S3ObjectNotFoundError:
+                # Prefix discovery can observe orphaned objects from a failed
+                # first write. A missing manifest has no authoritative clips.
+                return None
+            return _ComparisonManifest(group=group, manifest=manifest)
+
+        manifests = await asyncio.gather(*(load_group_manifest(group) for group in groups))
+        return tuple(manifest for manifest in manifests if manifest is not None)
+
     async def _fetch_manifest(self, clip_group_prefix: Prefix) -> Manifest:
         manifest_key = self._manifest_key(clip_group_prefix)
         raw_manifest = await self._s3_client.get_bytes(manifest_key)
@@ -2514,6 +3177,237 @@ class ClipStore:
             content_type=S3ContentType.JSON,
         )
         self._manifest_cache[clip_group_prefix] = manifest.copy()
+
+    async def _upload_new_clips(
+        self,
+        *,
+        clip_group_prefix: Prefix,
+        entries_and_bytes: Sequence[tuple[ManifestEntry, bytes]],
+    ) -> list[Key]:
+        """Upload raw clips before their caller commits authoritative manifest state."""
+        upload_keys = [self._clip_key(clip_group_prefix, entry.id) for entry, _clip_bytes in entries_and_bytes]
+        clip_bytes_list = [clip_bytes for _entry, clip_bytes in entries_and_bytes]
+        manifest_key = self._manifest_key(clip_group_prefix)
+
+        async def upload_clip(semaphore: asyncio.Semaphore, clip_key: Key, clip_bytes: bytes) -> None:
+            async with semaphore:
+                await self._s3_client.put_bytes(
+                    clip_key,
+                    clip_bytes,
+                    content_type=S3ContentType.MP4,
+                )
+
+        semaphore = asyncio.Semaphore(self._max_s3_concurrency)
+        upload_results = await asyncio.gather(
+            *(
+                upload_clip(semaphore, clip_key, clip_bytes)
+                for clip_key, clip_bytes in zip(upload_keys, clip_bytes_list, strict=True)
+            ),
+            return_exceptions=True,
+        )
+        uploaded_keys: list[Key] = []
+        failures: list[BaseException] = []
+        for clip_key, result in zip(upload_keys, upload_results, strict=True):
+            if isinstance(result, BaseException):
+                failures.append(result)
+            else:
+                uploaded_keys.append(clip_key)
+
+        if not failures:
+            return uploaded_keys
+        if not uploaded_keys:
+            raise failures[0]
+
+        uploaded_keys_set = set(uploaded_keys)
+        successful_ids = [
+            entry.id
+            for entry, clip_key in zip((entry for entry, _clip_bytes in entries_and_bytes), upload_keys, strict=True)
+            if clip_key in uploaded_keys_set
+        ]
+        sync_error = ClipManifestSyncError(
+            stage='clip_upload',
+            written_keys=uploaded_keys,
+            affected_clip_ids=successful_ids,
+            manifest_key=manifest_key,
+        )
+        if len(failures) == 1:
+            sync_error.add_note(f'Original clip upload error: {failures[0]!r}')
+        else:
+            sync_error.add_note(f'Original clip upload errors: {[repr(error) for error in failures]}')
+        raise sync_error from failures[0]
+
+    async def _fetch_raw_batch(
+        self,
+        clip_group_prefix: Prefix,
+        entries: Sequence[ManifestEntry],
+    ) -> tuple[FetchedClip, ...]:
+        clip_keys = [self._clip_key(clip_group_prefix, entry.id) for entry in entries]
+        semaphore = asyncio.Semaphore(self._max_s3_concurrency)
+
+        async def fetch_clip(clip_key: Key) -> bytes:
+            async with semaphore:
+                return await self._s3_client.get_bytes(clip_key)
+
+        clip_bytes_list = await asyncio.gather(*(fetch_clip(clip_key) for clip_key in clip_keys))
+        return tuple(
+            FetchedClip(id=entry.id, file=FileBytes(data=clip_bytes, extension=Extension.MP4))
+            for entry, clip_bytes in zip(entries, clip_bytes_list, strict=True)
+        )
+
+    async def _move_inbox_raw_clips(
+        self,
+        *,
+        inbox_prefix: Prefix,
+        destination_prefix: Prefix,
+        entries: Sequence[ManifestEntry],
+        destination_manifest_progress: _InboxManifestProgress,
+        inbox_manifest_progress: _InboxManifestProgress,
+    ) -> tuple[list[Key], list[_InboxMoveProgress]]:
+        """Move raw inbox objects with bounded concurrency before manifest commits."""
+        move_progress = [
+            _InboxMoveProgress(
+                clip_id=entry.id,
+                source_key=self._clip_key(inbox_prefix, entry.id),
+                destination_key=self._clip_key(destination_prefix, entry.id),
+            )
+            for entry in entries
+        ]
+        semaphore = asyncio.Semaphore(self._max_s3_concurrency)
+
+        async def move_entry(progress: _InboxMoveProgress) -> None:
+            try:
+                async with semaphore:
+                    progress.status = 'unknown'
+                    await self._s3_client.move(progress.source_key, progress.destination_key)
+            except asyncio.CancelledError:
+                if progress.status == 'not_attempted':
+                    progress.status = 'not_attempted'
+                else:
+                    progress.status = 'unknown'
+                raise
+            except Exception as error:
+                progress.status = 'failed'
+                progress.failure_detail = repr(error)
+                progress.failure = error
+            else:
+                progress.status = 'completed'
+
+        move_tasks = [asyncio.create_task(move_entry(progress)) for progress in move_progress]
+        try:
+            await asyncio.gather(*move_tasks)
+        except asyncio.CancelledError as error:
+            for move_task in move_tasks:
+                if not move_task.done():
+                    move_task.cancel()
+            await asyncio.gather(*move_tasks, return_exceptions=True)
+            diagnostics = self._snapshot_inbox_transfer_diagnostics(
+                move_progress=move_progress,
+                destination_manifest_progress=destination_manifest_progress,
+                inbox_manifest_progress=inbox_manifest_progress,
+            )
+            self._attach_inbox_transfer_cancellation_diagnostics(
+                error,
+                stage='clip_move',
+                diagnostics=diagnostics,
+            )
+            raise
+
+        failures = [progress for progress in move_progress if progress.status == 'failed']
+        moved_keys = [progress.destination_key for progress in move_progress if progress.status == 'completed']
+        if failures:
+            diagnostics = self._snapshot_inbox_transfer_diagnostics(
+                move_progress=move_progress,
+                destination_manifest_progress=destination_manifest_progress,
+                inbox_manifest_progress=inbox_manifest_progress,
+            )
+            sync_error = ClipTransferSyncError(
+                stage='clip_move',
+                moved_keys=moved_keys,
+                affected_clip_ids=[progress.clip_id for progress in move_progress],
+                manifest_keys=[],
+                logical_state='Manifest state remains unchanged because transfer commit did not start.',
+                failure_detail=repr(RuntimeError('; '.join(progress.failure_detail or '' for progress in failures))),
+                inbox_transfer_diagnostics=diagnostics,
+            )
+            assert failures[0].failure is not None
+            raise sync_error from failures[0].failure
+        return moved_keys, move_progress
+
+    @staticmethod
+    def _snapshot_inbox_transfer_diagnostics(
+        *,
+        move_progress: Sequence[_InboxMoveProgress],
+        destination_manifest_progress: _InboxManifestProgress,
+        inbox_manifest_progress: _InboxManifestProgress,
+    ) -> _InboxTransferDiagnostics:
+        """Freeze all known transfer progress for manual recovery diagnostics."""
+
+        def snapshot_manifest(progress: _InboxManifestProgress) -> _InboxManifestSnapshot:
+            return _InboxManifestSnapshot(
+                operation=progress.operation,
+                key=progress.key,
+                attempted=progress.attempted,
+                completed=progress.completed,
+                status=progress.status,
+                failure_detail=progress.failure_detail,
+            )
+
+        return _InboxTransferDiagnostics(
+            moves=tuple(
+                _InboxMoveSnapshot(
+                    clip_id=progress.clip_id,
+                    source_key=progress.source_key,
+                    destination_key=progress.destination_key,
+                    status=progress.status,
+                    failure_detail=progress.failure_detail,
+                )
+                for progress in move_progress
+            ),
+            destination_manifest=snapshot_manifest(destination_manifest_progress),
+            inbox_manifest=snapshot_manifest(inbox_manifest_progress),
+        )
+
+    @staticmethod
+    def _snapshot_inbox_removal_diagnostics(
+        deletion_progress: Sequence[_InboxDeletionProgress],
+    ) -> _InboxRemovalDiagnostics:
+        """Freeze all known raw-object cleanup state for manual recovery."""
+        return _InboxRemovalDiagnostics(
+            deletions=tuple(
+                _InboxDeletionSnapshot(
+                    clip_id=progress.clip_id,
+                    key=progress.key,
+                    status=progress.status,
+                    failure_detail=progress.failure_detail,
+                )
+                for progress in deletion_progress
+            )
+        )
+
+    @staticmethod
+    def _attach_inbox_removal_cancellation_diagnostics(
+        error: asyncio.CancelledError,
+        *,
+        diagnostics: _InboxRemovalDiagnostics,
+    ) -> None:
+        error.__dict__['inbox_removal_diagnostics'] = diagnostics
+        error.add_note(
+            'Inbox removal raw-object cleanup was cancelled; '
+            f'diagnostics: {diagnostics}. No rollback or retry was attempted.'
+        )
+
+    @staticmethod
+    def _attach_inbox_transfer_cancellation_diagnostics(
+        error: asyncio.CancelledError,
+        *,
+        stage: str,
+        diagnostics: _InboxTransferDiagnostics,
+    ) -> None:
+        error.__dict__['inbox_transfer_diagnostics'] = diagnostics
+        error.add_note(
+            f'Inbox transfer was cancelled at stage={stage}; '
+            f'diagnostics: {diagnostics}. No rollback or retry was attempted.'
+        )
 
     async def _fetch_normalized_batch(
         self,
