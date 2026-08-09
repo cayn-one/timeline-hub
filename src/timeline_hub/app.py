@@ -8,6 +8,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from async_s3 import S3Client, S3Config
 from loguru import logger
 
+from timeline_hub.constants import TELEGRAM_MEDIA_GROUP_MAX_ITEMS
 from timeline_hub.handlers.router import router as handlers_router
 from timeline_hub.infra.tasks import TaskFailure, TaskScheduler, TaskSupervisor
 from timeline_hub.middleware import AllowlistMiddleware, TelegramRetryAfterMiddleware
@@ -70,7 +71,7 @@ async def _main(settings: Settings) -> None:
                 namespace=settings.clip_namespace,
                 max_s3_concurrency=settings.max_s3_concurrency,
                 sampled_phash_mean_threshold=settings.sampled_phash_mean_threshold,
-                inbox_batch_size=10,
+                inbox_batch_size=TELEGRAM_MEDIA_GROUP_MAX_ITEMS,
             ),
             track_store=TrackStore(
                 s3_client,

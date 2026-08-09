@@ -5,6 +5,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import Message
 from loguru import logger
 
+from timeline_hub.constants import TELEGRAM_MEDIA_GROUP_MAX_ITEMS
 from timeline_hub.handlers.clips.common import download_video_bytes, extract_clip_file_id, store_summary_kwargs
 from timeline_hub.handlers.clips.delivery import audio_normalization_from_settings, send_fetched_clip_batches
 from timeline_hub.infra.ffmpeg import UnsupportedVideoCodecError
@@ -13,8 +14,6 @@ from timeline_hub.services.container import Services
 from timeline_hub.services.message_buffer import MessageGroup
 from timeline_hub.settings import Settings
 from timeline_hub.types import ChatId, Extension, FileBytes
-
-_TELEGRAM_MEDIA_GROUP_LIMIT = 10
 
 
 async def execute_store_or_produce(
@@ -54,7 +53,7 @@ async def execute_store_or_produce(
             await services.clip_store.compact(
                 clip_group,
                 clip_sub_group,
-                batch_size=_TELEGRAM_MEDIA_GROUP_LIMIT,
+                batch_size=TELEGRAM_MEDIA_GROUP_MAX_ITEMS,
             )
         except Exception:
             logger.exception(

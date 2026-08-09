@@ -81,6 +81,7 @@ class _FileClipsConfig(BaseModel):
     normalization_loudness: float
     normalization_bitrate: int = Field(gt=0)
     max_s3_concurrency: int = Field(gt=0)
+    route_store_batch_size: int = Field(gt=0)
     sampled_phash_mean_threshold: float = Field(gt=0, le=63)
 
     model_config = ConfigDict(
@@ -94,6 +95,7 @@ class _FileClipsOverrides(BaseModel):
     normalization_loudness: float | None = None
     normalization_bitrate: int | None = Field(default=None, gt=0)
     max_s3_concurrency: int | None = Field(default=None, gt=0)
+    route_store_batch_size: int | None = Field(default=None, gt=0)
     sampled_phash_mean_threshold: float | None = Field(default=None, gt=0, le=63)
 
     model_config = ConfigDict(
@@ -168,6 +170,7 @@ class Settings(BaseModel):
     normalization_loudness: float
     normalization_bitrate: int
     max_s3_concurrency: int
+    route_store_batch_size: int
     sampled_phash_mean_threshold: float
 
     track_namespace: str
@@ -198,6 +201,7 @@ class Settings(BaseModel):
             normalization_loudness=file_settings.clips.normalization_loudness,
             normalization_bitrate=file_settings.clips.normalization_bitrate,
             max_s3_concurrency=file_settings.clips.max_s3_concurrency,
+            route_store_batch_size=file_settings.clips.route_store_batch_size,
             sampled_phash_mean_threshold=file_settings.clips.sampled_phash_mean_threshold,
             track_namespace=file_settings.tracks.namespace,
             variant_max_duration=timedelta(minutes=file_settings.tracks.variant_max_duration_minutes),
@@ -219,6 +223,8 @@ class Settings(BaseModel):
             raise ValueError('media_group_max_size must be > 0')
         if self.max_s3_concurrency <= 0:
             raise ValueError('max_s3_concurrency must be > 0')
+        if self.route_store_batch_size <= 0:
+            raise ValueError('route_store_batch_size must be > 0')
         if not math.isfinite(self.sampled_phash_mean_threshold):
             raise ValueError('sampled_phash_mean_threshold must be finite')
         return self

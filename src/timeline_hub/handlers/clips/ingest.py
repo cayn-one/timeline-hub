@@ -13,6 +13,7 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InputMediaVideo, 
 from aiogram.utils.formatting import Bold, Text
 from loguru import logger
 
+from timeline_hub.constants import TELEGRAM_MEDIA_GROUP_MAX_ITEMS
 from timeline_hub.handlers.clips.common import (
     ALL_SCOPES_CALLBACK_VALUE,
     FLOW_RECONCILE,
@@ -117,8 +118,6 @@ from timeline_hub.settings import Settings
 from timeline_hub.types import ChatId, Extension, FileBytes
 
 router = Router()
-_TELEGRAM_MEDIA_GROUP_LIMIT = 10
-_ROUTE_STORE_CHUNK_SIZE = 8
 _BUFFER_VERSION_KEY = 'buffer_version'
 _PRODUCE_FLOW_MODE = 'produce'
 _MIXED_GROUPS = 'mixed_groups'
@@ -459,7 +458,7 @@ async def on_intake_action(
                     await services.clip_store.compact(
                         clip_group,
                         sub_group,
-                        batch_size=_TELEGRAM_MEDIA_GROUP_LIMIT,
+                        batch_size=TELEGRAM_MEDIA_GROUP_MAX_ITEMS,
                         require_exists=False,
                     )
                 except Exception:
@@ -527,6 +526,7 @@ async def on_intake_action(
                 route_result = await _store_route_batches(
                     bot=bot,
                     services=services,
+                    settings=settings,
                     route_batches=route_batches,
                     on_batch_stored=update_route_progress,
                 )
@@ -542,7 +542,7 @@ async def on_intake_action(
                         await services.clip_store.compact(
                             clip_group,
                             clip_sub_group,
-                            batch_size=_TELEGRAM_MEDIA_GROUP_LIMIT,
+                            batch_size=TELEGRAM_MEDIA_GROUP_MAX_ITEMS,
                             require_exists=clip_sub_group.scope is Scope.SOURCE,
                         )
                     except Exception:
@@ -1256,6 +1256,7 @@ async def _store_route_batches(
     *,
     bot: Bot,
     services: Services,
+    settings: Settings,
     route_batches: Sequence[PlannedRouteBatch],
     on_batch_stored: Callable[[Sequence[PlannedRouteBatch]], Awaitable[None]] | None = None,
 ) -> _RouteResult:
@@ -1267,8 +1268,8 @@ async def _store_route_batches(
 
     for route_batch in route_batches:
         stored_any = False
-        for start in range(0, len(route_batch.messages), _ROUTE_STORE_CHUNK_SIZE):
-            batch_messages = route_batch.messages[start : start + _ROUTE_STORE_CHUNK_SIZE]
+        for start in range(0, len(route_batch.messages), settings.route_store_batch_size):
+            batch_messages = route_batch.messages[start : start + settings.route_store_batch_size]
             try:
                 clip_files = await _clip_messages_to_clip_files(
                     bot=bot,
@@ -1509,7 +1510,7 @@ async def _execute_internal_route_action(
             await services.clip_store.compact(
                 clip_group,
                 clip_sub_group,
-                batch_size=_TELEGRAM_MEDIA_GROUP_LIMIT,
+                batch_size=TELEGRAM_MEDIA_GROUP_MAX_ITEMS,
                 require_exists=False,
             )
         except Exception:
@@ -1591,8 +1592,8 @@ async def _send_reordered_video_messages(
     if not messages:
         raise ValueError('`messages` must not be empty')
 
-    for start in range(0, len(messages), _TELEGRAM_MEDIA_GROUP_LIMIT):
-        batch = messages[start : start + _TELEGRAM_MEDIA_GROUP_LIMIT]
+    for start in range(0, len(messages), TELEGRAM_MEDIA_GROUP_MAX_ITEMS):
+        batch = messages[start : start + TELEGRAM_MEDIA_GROUP_MAX_ITEMS]
         if len(batch) == 1:
             await bot.send_video(
                 chat_id=chat_id,

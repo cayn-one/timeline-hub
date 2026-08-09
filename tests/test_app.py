@@ -6,6 +6,7 @@ from pydantic import SecretStr
 
 import timeline_hub.app as app_module
 from timeline_hub.app import _notify_superusers_and_stop_polling
+from timeline_hub.constants import TELEGRAM_MEDIA_GROUP_MAX_ITEMS
 from timeline_hub.settings import S3Settings, Settings
 
 
@@ -61,6 +62,7 @@ async def test_main_wires_storage_namespaces_into_stores(monkeypatch: pytest.Mon
         normalization_loudness=-14,
         normalization_bitrate=128,
         max_s3_concurrency=8,
+        route_store_batch_size=8,
         sampled_phash_mean_threshold=1.5,
         track_namespace='tracks-dev',
         variant_max_duration=timedelta(minutes=30),
@@ -114,7 +116,7 @@ async def test_main_wires_storage_namespaces_into_stores(monkeypatch: pytest.Mon
         namespace='clips-dev',
         max_s3_concurrency=8,
         sampled_phash_mean_threshold=1.5,
-        inbox_batch_size=10,
+        inbox_batch_size=TELEGRAM_MEDIA_GROUP_MAX_ITEMS,
     )
     preset_store_ctor.assert_called_once()
     assert preset_store_ctor.call_args.args == (s3_client,)

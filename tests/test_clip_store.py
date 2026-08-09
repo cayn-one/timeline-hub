@@ -8,6 +8,7 @@ import pytest
 from async_s3 import S3Client, S3ObjectNotFoundError
 
 import timeline_hub.services.clip_store as clip_store_module
+from timeline_hub.constants import TELEGRAM_MEDIA_GROUP_MAX_ITEMS
 from timeline_hub.infra.ffmpeg import PerceptualMetadataUnavailableError, UnsupportedVideoCodecError
 from timeline_hub.services.clip_store import (
     AudioNormalization,
@@ -6599,6 +6600,30 @@ async def test_store_inbox_compacts_accepted_clips_with_configured_batch_size(
         (_UUID_3, 2, 1),
     ]
     assert [key for key, _data, _content_type in s3_client.put_calls].count(manifest_key) == 1
+
+
+@pytest.mark.asyncio
+async def test_store_inbox_compacts_one_call_larger_than_telegram_batch_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clip_data = [f'clip-{index}'.encode() for index in range(1, 13)]
+    clip_ids = [uuid.UUID(int=index).hex for index in range(1, 13)]
+    _patch_hashes(monkeypatch, {data: f'{index:064x}' for index, data in enumerate(clip_data, start=1)})
+    _patch_uuid7(monkeypatch, *clip_ids)
+
+    async def _raise_unavailable(video_bytes: bytes) -> int:
+        del video_bytes
+        raise PerceptualMetadataUnavailableError('unavailable')
+
+    monkeypatch.setattr(clip_store_module, 'compute_video_frame_count', _raise_unavailable)
+    store = _store(_FakeS3Client(), inbox_batch_size=TELEGRAM_MEDIA_GROUP_MAX_ITEMS)
+
+    result = await store.store_inbox(Universe.WEST, clips=[_mp4_file(data) for data in clip_data])
+
+    assert result == StoreResult(stored_count=12, duplicate_count=0, clip_ids=tuple(clip_ids))
+    assert [len(batch) for batch in await store.list_inbox_clips(Universe.WEST)] == [10, 2]
+    fetched_batches = [batch async for batch in store.fetch_inbox(Universe.WEST)]
+    assert [[clip.file.data for clip in batch] for batch in fetched_batches] == [clip_data[:10], clip_data[10:]]
 
 
 @pytest.mark.asyncio

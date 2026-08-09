@@ -11,6 +11,7 @@ from aiogram import Bot
 from aiogram.types import Message
 from loguru import logger
 
+from timeline_hub.constants import TELEGRAM_MEDIA_GROUP_MAX_ITEMS
 from timeline_hub.infra.ffmpeg import probe_audio_sample_rate, to_opus
 from timeline_hub.infra.images import normalize_cover_to_jpg
 from timeline_hub.infra.ytdlp import (
@@ -240,7 +241,7 @@ def _validate_and_order_uploaded_variant_file_refs(
             )
         )
 
-    if not parsed_variants or len(parsed_variants) > 10:
+    if not parsed_variants or len(parsed_variants) > TELEGRAM_MEDIA_GROUP_MAX_ITEMS:
         raise TrackInputError('Invalid input')
 
     ordered_variants = sorted(parsed_variants, key=lambda variant: variant.speed)
@@ -256,7 +257,7 @@ def _validate_and_order_uploaded_variant_file_refs(
 def _validate_and_order_uploaded_file_refs(
     uploaded_file_refs: Sequence[UploadedFileRef],
 ) -> tuple[UploadedFileRef, ...]:
-    if not uploaded_file_refs or len(uploaded_file_refs) > 10:
+    if not uploaded_file_refs or len(uploaded_file_refs) > TELEGRAM_MEDIA_GROUP_MAX_ITEMS:
         raise TrackInputError('Invalid input')
 
     part_indices = [uploaded_file_ref.part_index for uploaded_file_ref in uploaded_file_refs]

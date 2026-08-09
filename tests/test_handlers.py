@@ -22,6 +22,7 @@ import timeline_hub.handlers.tracks.ingest as track_ingest_module
 import timeline_hub.handlers.tracks.retrieve as track_retrieve_module
 import timeline_hub.handlers.tracks.store_execution as track_store_execution_module
 import timeline_hub.services.track_store as track_store_module
+from timeline_hub.constants import TELEGRAM_MEDIA_GROUP_MAX_ITEMS
 from timeline_hub.handlers.clips.common import (
     ALL_SCOPES_CALLBACK_VALUE,
     FLOW_PULL,
@@ -435,6 +436,7 @@ def _settings(**overrides: object) -> SimpleNamespace:
         'normalization_loudness': -14,
         'normalization_bitrate': 128,
         'max_s3_concurrency': 8,
+        'route_store_batch_size': 8,
         'message_width': 35,
         'variant_max_duration': timedelta(minutes=15),
         'slowest_variant_speed': 0.5,
@@ -2417,7 +2419,7 @@ async def test_remove_action_compacts_dense_sub_groups_after_success(scope: Scop
     clip_store.compact.assert_awaited_once_with(
         clip_group,
         clip_sub_group,
-        batch_size=intake_module._TELEGRAM_MEDIA_GROUP_LIMIT,
+        batch_size=TELEGRAM_MEDIA_GROUP_MAX_ITEMS,
         require_exists=False,
     )
     expected_remove_kwargs = {**selected_text(selected='Remove'), 'reply_markup': None}
@@ -2511,13 +2513,13 @@ async def test_remove_action_compacts_only_affected_dense_sub_groups() -> None:
         call(
             clip_group,
             extra_sub_group,
-            batch_size=intake_module._TELEGRAM_MEDIA_GROUP_LIMIT,
+            batch_size=TELEGRAM_MEDIA_GROUP_MAX_ITEMS,
             require_exists=False,
         ),
         call(
             clip_group,
             source_sub_group,
-            batch_size=intake_module._TELEGRAM_MEDIA_GROUP_LIMIT,
+            batch_size=TELEGRAM_MEDIA_GROUP_MAX_ITEMS,
             require_exists=False,
         ),
     ]
@@ -2612,7 +2614,7 @@ async def test_remove_action_propagates_compact_failure_after_successful_remove(
     clip_store.compact.assert_awaited_once_with(
         clip_group,
         clip_sub_group,
-        batch_size=intake_module._TELEGRAM_MEDIA_GROUP_LIMIT,
+        batch_size=TELEGRAM_MEDIA_GROUP_MAX_ITEMS,
         require_exists=False,
     )
     message.answer.assert_not_awaited()
@@ -15193,13 +15195,13 @@ async def test_route_action_stores_clips_in_caption_route_order_across_message_g
         call(
             ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1),
             ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.SOURCE),
-            batch_size=intake_module._TELEGRAM_MEDIA_GROUP_LIMIT,
+            batch_size=TELEGRAM_MEDIA_GROUP_MAX_ITEMS,
             require_exists=True,
         ),
         call(
             ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1),
             ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.EXTRA),
-            batch_size=intake_module._TELEGRAM_MEDIA_GROUP_LIMIT,
+            batch_size=TELEGRAM_MEDIA_GROUP_MAX_ITEMS,
             require_exists=False,
         ),
     ]
@@ -15338,13 +15340,13 @@ async def test_route_action_preserves_order_across_inbox_and_chronological_desti
         call(
             ClipGroup(universe=Universe.WEST, year=2025, season=Season.S5),
             ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.SOURCE),
-            batch_size=intake_module._TELEGRAM_MEDIA_GROUP_LIMIT,
+            batch_size=TELEGRAM_MEDIA_GROUP_MAX_ITEMS,
             require_exists=True,
         ),
         call(
             ClipGroup(universe=Universe.WEST, year=2025, season=Season.S5),
             ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.EXTRA),
-            batch_size=intake_module._TELEGRAM_MEDIA_GROUP_LIMIT,
+            batch_size=TELEGRAM_MEDIA_GROUP_MAX_ITEMS,
             require_exists=False,
         ),
     ]
@@ -15420,13 +15422,13 @@ async def test_route_action_can_switch_from_chronological_to_inbox_destination()
 
 
 @pytest.mark.asyncio
-async def test_route_action_chunks_large_inbox_batch_and_aggregates_store_results() -> None:
+async def test_route_action_uses_configured_batch_size_for_inbox_storage() -> None:
     message = _fake_message(text='Select action:', chat_id=77, message_id=70)
     callback = _fake_callback(message)
     state = _FakeState()
     buffer = ChatMessageBuffer()
     buffer.append(_fake_message(chat_id=77, message_id=1, text='iw'), chat_id=77)
-    for index in range(10):
+    for index in range(13):
         buffer.append(
             _fake_message(
                 chat_id=77,
@@ -15439,36 +15441,36 @@ async def test_route_action_chunks_large_inbox_batch_and_aggregates_store_result
         store=AsyncMock(),
         store_inbox=AsyncMock(
             side_effect=[
-                StoreResult(stored_count=7, duplicate_count=1),
-                StoreResult(stored_count=2, duplicate_count=1),
+                StoreResult(stored_count=11, duplicate_count=1),
+                StoreResult(stored_count=1, duplicate_count=0),
             ]
         ),
         compact=AsyncMock(),
     )
     services = _services(clip_store=clip_store, buffer=buffer)
     bot = AsyncMock()
-    bot.get_file.side_effect = [SimpleNamespace(file_path=f'path-{index}') for index in range(1, 11)]
-    bot.download_file.side_effect = [BytesIO(f'clip-{index}'.encode()) for index in range(1, 11)]
+    bot.get_file.side_effect = [SimpleNamespace(file_path=f'path-{index}') for index in range(1, 14)]
+    bot.download_file.side_effect = [BytesIO(f'clip-{index}'.encode()) for index in range(1, 14)]
 
     await on_intake_action(
         callback,
         SimpleNamespace(action=IntakeAction.ROUTE),
         bot,
         services,
-        _settings(),
+        _settings(route_store_batch_size=12),
         state,
     )
 
     assert clip_store.store_inbox.await_args_list == [
-        call(Universe.WEST, clips=[_mp4_file(f'clip-{index}'.encode()) for index in range(1, 9)]),
-        call(Universe.WEST, clips=[_mp4_file(b'clip-9'), _mp4_file(b'clip-10')]),
+        call(Universe.WEST, clips=[_mp4_file(f'clip-{index}'.encode()) for index in range(1, 13)]),
+        call(Universe.WEST, clips=[_mp4_file(b'clip-13')]),
     ]
     clip_store.store.assert_not_awaited()
     clip_store.compact.assert_not_awaited()
     assert message.edit_text.await_args_list[0] == call('Routing...', reply_markup=None)
     _assert_route_progress_edit(message.edit_text.await_args_list[1], ('Inbox', 'West'))
     message.answer.assert_awaited_once_with(
-        **Text('Stored: ', Bold('9'), '\n', 'Deduplicated: ', Bold('2')).as_kwargs()
+        **Text('Stored: ', Bold('12'), '\n', 'Deduplicated: ', Bold('1')).as_kwargs()
     )
 
 
@@ -15738,13 +15740,13 @@ async def test_route_action_stores_mp4_documents_in_caption_route_order_across_m
         call(
             ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1),
             ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.SOURCE),
-            batch_size=intake_module._TELEGRAM_MEDIA_GROUP_LIMIT,
+            batch_size=TELEGRAM_MEDIA_GROUP_MAX_ITEMS,
             require_exists=True,
         ),
         call(
             ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1),
             ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.EXTRA),
-            batch_size=intake_module._TELEGRAM_MEDIA_GROUP_LIMIT,
+            batch_size=TELEGRAM_MEDIA_GROUP_MAX_ITEMS,
             require_exists=False,
         ),
     ]
@@ -15806,13 +15808,13 @@ async def test_route_action_compacts_external_route_before_success_summary() -> 
         call(
             ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1),
             ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.SOURCE),
-            batch_size=intake_module._TELEGRAM_MEDIA_GROUP_LIMIT,
+            batch_size=TELEGRAM_MEDIA_GROUP_MAX_ITEMS,
             require_exists=True,
         ),
         call(
             ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1),
             ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.EXTRA),
-            batch_size=intake_module._TELEGRAM_MEDIA_GROUP_LIMIT,
+            batch_size=TELEGRAM_MEDIA_GROUP_MAX_ITEMS,
             require_exists=False,
         ),
     ]
@@ -16044,25 +16046,25 @@ async def test_route_action_batches_bare_and_suffixed_routes_separately() -> Non
         call(
             ClipGroup(universe=Universe.WEST, year=2025, season=Season.S5),
             ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.SOURCE),
-            batch_size=intake_module._TELEGRAM_MEDIA_GROUP_LIMIT,
+            batch_size=TELEGRAM_MEDIA_GROUP_MAX_ITEMS,
             require_exists=True,
         ),
         call(
             ClipGroup(universe=Universe.WEST, year=2025, season=Season.S5),
             ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.EXTRA),
-            batch_size=intake_module._TELEGRAM_MEDIA_GROUP_LIMIT,
+            batch_size=TELEGRAM_MEDIA_GROUP_MAX_ITEMS,
             require_exists=False,
         ),
         call(
             ClipGroup(universe=Universe.WEST, year=2025, season=Season.S5),
             ClipSubGroup(sub_season=SubSeason.A, scope=Scope.SOURCE),
-            batch_size=intake_module._TELEGRAM_MEDIA_GROUP_LIMIT,
+            batch_size=TELEGRAM_MEDIA_GROUP_MAX_ITEMS,
             require_exists=True,
         ),
         call(
             ClipGroup(universe=Universe.WEST, year=2025, season=Season.S5),
             ClipSubGroup(sub_season=SubSeason.A, scope=Scope.EXTRA),
-            batch_size=intake_module._TELEGRAM_MEDIA_GROUP_LIMIT,
+            batch_size=TELEGRAM_MEDIA_GROUP_MAX_ITEMS,
             require_exists=False,
         ),
     ]
@@ -16176,38 +16178,38 @@ async def test_route_action_splits_store_calls_when_caption_route_overrides() ->
         call(
             ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1),
             ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.SOURCE),
-            batch_size=intake_module._TELEGRAM_MEDIA_GROUP_LIMIT,
+            batch_size=TELEGRAM_MEDIA_GROUP_MAX_ITEMS,
             require_exists=True,
         ),
         call(
             ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1),
             ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.EXTRA),
-            batch_size=intake_module._TELEGRAM_MEDIA_GROUP_LIMIT,
+            batch_size=TELEGRAM_MEDIA_GROUP_MAX_ITEMS,
             require_exists=False,
         ),
         call(
             ClipGroup(universe=Universe.EAST, year=2024, season=Season.S2),
             ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.SOURCE),
-            batch_size=intake_module._TELEGRAM_MEDIA_GROUP_LIMIT,
+            batch_size=TELEGRAM_MEDIA_GROUP_MAX_ITEMS,
             require_exists=True,
         ),
         call(
             ClipGroup(universe=Universe.EAST, year=2024, season=Season.S2),
             ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.EXTRA),
-            batch_size=intake_module._TELEGRAM_MEDIA_GROUP_LIMIT,
+            batch_size=TELEGRAM_MEDIA_GROUP_MAX_ITEMS,
             require_exists=False,
         ),
     ]
 
 
 @pytest.mark.asyncio
-async def test_route_action_chunks_long_single_route_group_without_duplicate_progress_updates() -> None:
+async def test_route_action_uses_configured_batch_size_for_chronological_storage() -> None:
     message = _fake_message(text='Select action:', chat_id=77, message_id=71)
     callback = _fake_callback(message)
     state = _FakeState()
     buffer = ChatMessageBuffer()
 
-    for index in range(10):
+    for index in range(13):
         buffer.append(
             _fake_message(
                 chat_id=77,
@@ -16222,8 +16224,8 @@ async def test_route_action_chunks_long_single_route_group_without_duplicate_pro
     clip_store = SimpleNamespace(
         store=AsyncMock(
             side_effect=[
-                StoreResult(stored_count=8, duplicate_count=0),
-                StoreResult(stored_count=2, duplicate_count=0),
+                StoreResult(stored_count=12, duplicate_count=0),
+                StoreResult(stored_count=1, duplicate_count=0),
             ]
         ),
         compact=AsyncMock(),
@@ -16231,23 +16233,23 @@ async def test_route_action_chunks_long_single_route_group_without_duplicate_pro
     services = _services(clip_store=clip_store, buffer=buffer)
 
     bot = AsyncMock()
-    bot.get_file.side_effect = [SimpleNamespace(file_path=f'path-{index + 1}') for index in range(10)]
-    bot.download_file.side_effect = [BytesIO(f'clip-{index + 1}'.encode()) for index in range(10)]
+    bot.get_file.side_effect = [SimpleNamespace(file_path=f'path-{index + 1}') for index in range(13)]
+    bot.download_file.side_effect = [BytesIO(f'clip-{index + 1}'.encode()) for index in range(13)]
 
     await on_intake_action(
         callback,
         SimpleNamespace(action=IntakeAction.ROUTE),
         bot,
         services,
-        _settings(),
+        _settings(route_store_batch_size=12),
         state,
     )
 
     assert clip_store.store.await_count == 2
     assert clip_store.store.await_args_list[0].kwargs['clips'] == [
-        _mp4_file(f'clip-{index}'.encode()) for index in range(1, 9)
+        _mp4_file(f'clip-{index}'.encode()) for index in range(1, 13)
     ]
-    assert clip_store.store.await_args_list[1].kwargs['clips'] == [_mp4_file(b'clip-9'), _mp4_file(b'clip-10')]
+    assert clip_store.store.await_args_list[1].kwargs['clips'] == [_mp4_file(b'clip-13')]
     assert all(
         call.args[0] == ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1)
         for call in clip_store.store.await_args_list
@@ -16258,18 +16260,18 @@ async def test_route_action_chunks_long_single_route_group_without_duplicate_pro
         ('West', '2025', '1', 'Source'),
     )
     assert len(message.edit_text.await_args_list) == 2
-    message.answer.assert_awaited_once_with(**Text('Stored: ', Bold('10')).as_kwargs())
+    message.answer.assert_awaited_once_with(**Text('Stored: ', Bold('13')).as_kwargs())
     assert clip_store.compact.await_args_list == [
         call(
             ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1),
             ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.SOURCE),
-            batch_size=intake_module._TELEGRAM_MEDIA_GROUP_LIMIT,
+            batch_size=TELEGRAM_MEDIA_GROUP_MAX_ITEMS,
             require_exists=True,
         ),
         call(
             ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1),
             ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.EXTRA),
-            batch_size=intake_module._TELEGRAM_MEDIA_GROUP_LIMIT,
+            batch_size=TELEGRAM_MEDIA_GROUP_MAX_ITEMS,
             require_exists=False,
         ),
     ]
@@ -16363,25 +16365,25 @@ async def test_route_action_chunks_per_route_group_without_crossing_route_bounda
         call(
             ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1),
             ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.SOURCE),
-            batch_size=intake_module._TELEGRAM_MEDIA_GROUP_LIMIT,
+            batch_size=TELEGRAM_MEDIA_GROUP_MAX_ITEMS,
             require_exists=True,
         ),
         call(
             ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1),
             ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.EXTRA),
-            batch_size=intake_module._TELEGRAM_MEDIA_GROUP_LIMIT,
+            batch_size=TELEGRAM_MEDIA_GROUP_MAX_ITEMS,
             require_exists=False,
         ),
         call(
             ClipGroup(universe=Universe.EAST, year=2024, season=Season.S2),
             ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.SOURCE),
-            batch_size=intake_module._TELEGRAM_MEDIA_GROUP_LIMIT,
+            batch_size=TELEGRAM_MEDIA_GROUP_MAX_ITEMS,
             require_exists=True,
         ),
         call(
             ClipGroup(universe=Universe.EAST, year=2024, season=Season.S2),
             ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.EXTRA),
-            batch_size=intake_module._TELEGRAM_MEDIA_GROUP_LIMIT,
+            batch_size=TELEGRAM_MEDIA_GROUP_MAX_ITEMS,
             require_exists=False,
         ),
     ]
@@ -16480,37 +16482,37 @@ async def test_route_action_updates_active_route_from_standalone_text_and_clip_c
         call(
             ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1),
             ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.SOURCE),
-            batch_size=intake_module._TELEGRAM_MEDIA_GROUP_LIMIT,
+            batch_size=TELEGRAM_MEDIA_GROUP_MAX_ITEMS,
             require_exists=True,
         ),
         call(
             ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1),
             ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.EXTRA),
-            batch_size=intake_module._TELEGRAM_MEDIA_GROUP_LIMIT,
+            batch_size=TELEGRAM_MEDIA_GROUP_MAX_ITEMS,
             require_exists=False,
         ),
         call(
             ClipGroup(universe=Universe.EAST, year=2024, season=Season.S2),
             ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.SOURCE),
-            batch_size=intake_module._TELEGRAM_MEDIA_GROUP_LIMIT,
+            batch_size=TELEGRAM_MEDIA_GROUP_MAX_ITEMS,
             require_exists=True,
         ),
         call(
             ClipGroup(universe=Universe.EAST, year=2024, season=Season.S2),
             ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.EXTRA),
-            batch_size=intake_module._TELEGRAM_MEDIA_GROUP_LIMIT,
+            batch_size=TELEGRAM_MEDIA_GROUP_MAX_ITEMS,
             require_exists=False,
         ),
         call(
             ClipGroup(universe=Universe.WEST, year=2025, season=Season.S2),
             ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.SOURCE),
-            batch_size=intake_module._TELEGRAM_MEDIA_GROUP_LIMIT,
+            batch_size=TELEGRAM_MEDIA_GROUP_MAX_ITEMS,
             require_exists=True,
         ),
         call(
             ClipGroup(universe=Universe.WEST, year=2025, season=Season.S2),
             ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.EXTRA),
-            batch_size=intake_module._TELEGRAM_MEDIA_GROUP_LIMIT,
+            batch_size=TELEGRAM_MEDIA_GROUP_MAX_ITEMS,
             require_exists=False,
         ),
     ]
@@ -16629,13 +16631,13 @@ async def test_route_action_uses_latest_valid_pre_clip_text_before_first_video()
         call(
             ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1),
             ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.SOURCE),
-            batch_size=intake_module._TELEGRAM_MEDIA_GROUP_LIMIT,
+            batch_size=TELEGRAM_MEDIA_GROUP_MAX_ITEMS,
             require_exists=True,
         ),
         call(
             ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1),
             ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.EXTRA),
-            batch_size=intake_module._TELEGRAM_MEDIA_GROUP_LIMIT,
+            batch_size=TELEGRAM_MEDIA_GROUP_MAX_ITEMS,
             require_exists=False,
         ),
     ]
@@ -17000,13 +17002,13 @@ async def test_route_action_uses_internal_route_destination_from_caption_only_st
         call(
             source_group,
             source_sub_group,
-            batch_size=intake_module._TELEGRAM_MEDIA_GROUP_LIMIT,
+            batch_size=TELEGRAM_MEDIA_GROUP_MAX_ITEMS,
             require_exists=False,
         ),
         call(
             destination_group,
             source_sub_group,
-            batch_size=intake_module._TELEGRAM_MEDIA_GROUP_LIMIT,
+            batch_size=TELEGRAM_MEDIA_GROUP_MAX_ITEMS,
             require_exists=False,
         ),
     ]
@@ -17076,13 +17078,13 @@ async def test_route_action_internal_caption_destination_carries_forward_to_unca
         call(
             source_group,
             source_sub_group,
-            batch_size=intake_module._TELEGRAM_MEDIA_GROUP_LIMIT,
+            batch_size=TELEGRAM_MEDIA_GROUP_MAX_ITEMS,
             require_exists=False,
         ),
         call(
             destination_group,
             source_sub_group,
-            batch_size=intake_module._TELEGRAM_MEDIA_GROUP_LIMIT,
+            batch_size=TELEGRAM_MEDIA_GROUP_MAX_ITEMS,
             require_exists=False,
         ),
     ]
@@ -17265,13 +17267,13 @@ async def test_route_action_compacts_internal_route_before_success_summary() -> 
         call(
             source_group,
             source_sub_group,
-            batch_size=intake_module._TELEGRAM_MEDIA_GROUP_LIMIT,
+            batch_size=TELEGRAM_MEDIA_GROUP_MAX_ITEMS,
             require_exists=False,
         ),
         call(
             destination_group,
             source_sub_group,
-            batch_size=intake_module._TELEGRAM_MEDIA_GROUP_LIMIT,
+            batch_size=TELEGRAM_MEDIA_GROUP_MAX_ITEMS,
             require_exists=False,
         ),
     ]
@@ -19325,7 +19327,7 @@ async def test_store_scope_selection_compacts_extra_and_source_batches(scope: Sc
     clip_store.compact.assert_awaited_once_with(
         ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1),
         ClipSubGroup(sub_season=SubSeason.NONE, scope=scope),
-        batch_size=intake_module._TELEGRAM_MEDIA_GROUP_LIMIT,
+        batch_size=TELEGRAM_MEDIA_GROUP_MAX_ITEMS,
     )
 
 

@@ -11,6 +11,7 @@ from typing import Literal, Self, TypeVar
 
 from async_s3 import Key, Prefix, S3BatchDeleteError, S3Client, S3ContentType, S3ObjectNotFoundError
 
+from timeline_hub.constants import TELEGRAM_MEDIA_GROUP_MAX_ITEMS
 from timeline_hub.infra.ffmpeg import clip_mp3, create_audio_variant, probe_audio_sample_rate
 from timeline_hub.types import Extension, FileBytes, InvalidExtensionError
 
@@ -202,8 +203,10 @@ class UploadedVariantMetadata:
             raise ValueError(f'UploadedVariantMetadata.{field} must be a tuple')
         if not family:
             raise ValueError(f'UploadedVariantMetadata.{field} must not be empty')
-        if len(family) > 10:
-            raise ValueError(f'UploadedVariantMetadata.{field} must contain at most 10 items')
+        if len(family) > TELEGRAM_MEDIA_GROUP_MAX_ITEMS:
+            raise ValueError(
+                f'UploadedVariantMetadata.{field} must contain at most {TELEGRAM_MEDIA_GROUP_MAX_ITEMS} items'
+            )
         if any(not isinstance(spec, VariantSpec) for spec in family):
             raise ValueError(f'UploadedVariantMetadata.{field} entries must be VariantSpec')
 
@@ -3137,8 +3140,8 @@ class TrackStore:
             raise ValueError(f'{field} must be a sequence')
         if not variants:
             raise ValueError(f'{field} must not be empty')
-        if len(variants) > 10:
-            raise ValueError(f'{field} must contain at most 10 items')
+        if len(variants) > TELEGRAM_MEDIA_GROUP_MAX_ITEMS:
+            raise ValueError(f'{field} must contain at most {TELEGRAM_MEDIA_GROUP_MAX_ITEMS} items')
         if any(not isinstance(variant, UploadedVariant) for variant in variants):
             raise ValueError(f'{field} entries must be UploadedVariant')
 

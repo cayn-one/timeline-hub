@@ -180,6 +180,7 @@ async def test_app_registers_retry_middleware_on_bot_session(monkeypatch: pytest
         ),
         clip_namespace='clips',
         max_s3_concurrency=8,
+        route_store_batch_size=8,
         sampled_phash_mean_threshold=1.5,
         track_namespace='tracks',
         variant_max_duration=timedelta(minutes=15),

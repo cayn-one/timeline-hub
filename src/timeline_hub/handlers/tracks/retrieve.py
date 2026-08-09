@@ -18,6 +18,7 @@ from aiogram.types import (
 from aiogram.utils.formatting import Text, TextLink
 from loguru import logger
 
+from timeline_hub.constants import TELEGRAM_MEDIA_GROUP_MAX_ITEMS
 from timeline_hub.handlers.menu import (
     back_button,
     callback_message,
@@ -1144,8 +1145,8 @@ def _variant_filename(variant: FetchedVariant) -> str:
 def _validate_variant_count(variants: Sequence[FetchedVariant]) -> None:
     if not variants:
         raise ValueError('Fetched track variants must not be empty')
-    if len(variants) > 10:
-        raise ValueError('Fetched track variants must contain at most 10 items')
+    if len(variants) > TELEGRAM_MEDIA_GROUP_MAX_ITEMS:
+        raise ValueError(f'Fetched track variants must contain at most {TELEGRAM_MEDIA_GROUP_MAX_ITEMS} items')
 
 
 def _is_missing_track_error(error: ValueError) -> bool:
